@@ -48,13 +48,18 @@ class SQLiteTracer(TracingLogger):
     def _insert_span_sync(self, span: Span) -> None:
         self._spans[span.id] = span
 
-    def start_trace(self, name: str, metadata: dict[str, Any] | None = None) -> Span:
+    def start_trace(
+        self,
+        name: str,
+        metadata: dict[str, Any] | None = None,
+        kind: SpanKind = SpanKind.AGENT_RUN,
+    ) -> Span:
         span_id = str(uuid.uuid4())
         trace_id = str(uuid.uuid4())
         span = Span(
             id=span_id,
             trace_id=trace_id,
-            kind=SpanKind.AGENT_RUN,
+            kind=kind,
             name=name,
             started_at=datetime.now(),
             metadata=metadata,

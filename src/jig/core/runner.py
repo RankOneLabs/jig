@@ -54,7 +54,7 @@ async def run_agent(config: AgentConfig, input: str) -> AgentResult:
     start = time.time()
 
     # 1. Start trace
-    trace = config.tracer.start_trace(config.name, {"input": input})
+    trace = config.tracer.start_trace(config.name, {"input": input}, kind=SpanKind.AGENT_RUN)
 
     # 2. Resolve system prompt
     if callable(config.system_prompt):

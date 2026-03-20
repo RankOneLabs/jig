@@ -1,4 +1,5 @@
 from jig.core.errors import JigError, JigLLMError, JigMemoryError, JigToolError
+from jig.core.pipeline import MapResult, PipelineConfig, PipelineResult, Step
 from jig.core.types import (
     AgentMemory,
     CompletionParams,
@@ -35,14 +36,18 @@ __all__ = [
     "JigToolError",
     "LLMClient",
     "LLMResponse",
+    "MapResult",
     "MemoryEntry",
     "Message",
+    "PipelineConfig",
+    "PipelineResult",
     "Role",
     "Score",
     "ScoredResult",
     "ScoreSource",
     "Span",
     "SpanKind",
+    "Step",
     "Tool",
     "ToolCall",
     "ToolDefinition",
