@@ -11,17 +11,23 @@ import aiosqlite
 from jig.core.types import Span, SpanKind, TracingLogger, Usage
 
 
+def _default_serializer(obj: Any) -> Any:
+    """Fallback serializer for json.dumps — handles datetime, dataclasses, etc."""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        return dataclasses.asdict(obj)
+    return repr(obj)
+
+
 def _safe_json(obj: Any) -> str | None:
-    """Serialize to JSON, falling back to repr for non-serializable objects."""
+    """Serialize to JSON, falling back gracefully for non-serializable objects."""
     if obj is None:
         return None
     try:
-        return json.dumps(obj)
+        return json.dumps(obj, default=_default_serializer)
     except (TypeError, ValueError):
-        pass
-    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-        return json.dumps(dataclasses.asdict(obj))
-    return json.dumps(repr(obj))
+        return json.dumps(repr(obj))
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS spans (
@@ -185,11 +191,11 @@ class SQLiteTracer(TracingLogger):
             name=name,
             started_at=datetime.fromisoformat(started),
             parent_id=parent_id,
-            input=json.loads(inp) if inp else None,
-            output=json.loads(out) if out else None,
+            input=json.loads(inp) if isinstance(inp, str) else inp,
+            output=json.loads(out) if isinstance(out, str) else out,
             ended_at=datetime.fromisoformat(ended) if ended else None,
             duration_ms=duration,
-            metadata=json.loads(meta) if meta else None,
+            metadata=json.loads(meta) if isinstance(meta, str) else meta,
             error=error,
             usage=usage,
         )
