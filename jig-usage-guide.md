@@ -1,6 +1,11 @@
 # jig — usage guide
 
-jig is a minimal agent orchestration framework. It defines the shapes between components, runs a loop, and gets out of the way. Your agents, tools, and services can be anything — jig just holds the pieces while you work on them.
+jig is a minimal agent orchestration framework. It defines the shapes between components, runs your execution model, and gets out of the way. Your agents, tools, and services can be anything — jig just holds the pieces while you work on them.
+
+jig has two execution models:
+
+- **`run_agent`** — LLM-in-the-loop. The model decides what to do next via a completion + tool loop.
+- **`run_pipeline`** — Orchestrator-controlled. You define the step sequence; jig wraps it with tracing, grading, and feedback.
 
 ## Install
 
@@ -25,7 +30,7 @@ dependencies = [
 ]
 ```
 
-## Quick start
+## Quick start — agent
 
 ```python
 from jig import AgentConfig, run_agent
@@ -50,6 +55,37 @@ result = await run_agent(config, "Do the thing")
 print(result.output)
 ```
 
+## Quick start — pipeline
+
+```python
+from jig import PipelineConfig, Step, run_pipeline
+from jig.tracing import StdoutTracer
+
+async def fetch(ctx):
+    return await get_document(ctx["input"])
+
+async def summarize(ctx):
+    return await llm_summarize(ctx["fetch"])
+
+async def evaluate(ctx):
+    return score_quality(ctx["summarize"])
+
+result = await run_pipeline(
+    PipelineConfig(
+        name="summarizer",
+        steps=[
+            Step(name="fetch", fn=fetch),
+            Step(name="summarize", fn=summarize),
+            Step(name="evaluate", fn=evaluate),
+        ],
+        tracer=StdoutTracer(),
+    ),
+    input="https://example.com/article",
+)
+print(result.output)            # evaluate result
+print(result.step_outputs)      # {"fetch": ..., "summarize": ..., "evaluate": ...}
+```
+
 ## What `run_agent` does
 
 Every call to `run_agent(config, input)` executes the same loop:
@@ -66,6 +102,181 @@ Every call to `run_agent(config, input)` executes the same loop:
 10. **Return `AgentResult`** — output, trace ID, usage stats, scores, duration
 
 You don't call these steps. You configure the components and `run_agent` handles the rest.
+
+## What `run_pipeline` does
+
+Every call to `run_pipeline(config, input)` executes a fixed sequence of steps you define:
+
+1. **Start trace** — opens a root span (`PIPELINE_RUN`). If `_parent_span_id` is provided, creates a child span instead (for nesting).
+2. **Init context** — `ctx = {"input": input, "_tracer": config.tracer, "_span_id": root.id, **context}`. Steps read their inputs from `ctx` and their outputs are stored back into it.
+3. **For each step:**
+   - If `skip_when(ctx)` returns `True` → record a skipped span, continue
+   - Open a `PIPELINE_STEP` span
+   - Call `step.fn(ctx)`
+   - Store the return value in `ctx[step.name]` and `step_outputs`
+   - If `is_err(result)` → end span with error from `extract_err`, short-circuit (remaining steps don't run)
+   - If `step.grader` is set → grade in a `GRADING` sub-span, store in `step_scores`. If `feedback` is configured, call `feedback.score()`.
+4. **Pipeline grader** — if `config.grader` is set and no short-circuit, grade the overall (input, final output)
+5. **Close trace**, return `PipelineResult`
+
+The key difference from `run_agent`: **you** define the step sequence. The LLM (if any) is a transform inside a step function, not the decision-maker. jig provides tracing, grading, and feedback — the same infrastructure as `run_agent`, without the completion loop.
+
+### `PipelineConfig`
+
+```python
+from jig import PipelineConfig, Step
+
+config = PipelineConfig(
+    name="my-pipeline",                 # required — trace name
+    steps=[...],                        # required — sequence of Step
+    tracer=SQLiteTracer(),              # required — same TracingLogger interface
+
+    grader=my_grader,                   # optional — grades overall output
+    feedback=my_feedback_loop,          # optional — stores per-step scores
+    is_err=lambda r: hasattr(r, "error"),   # optional — detect errors in step output
+    extract_err=lambda r: r.error,          # optional — extract error message
+    metadata={"version": "1.2"},        # optional — attached to root span
+)
+```
+
+Only `name`, `steps`, and `tracer` are required. Everything else is opt-in.
+
+### `Step`
+
+```python
+Step(
+    name="summarize",                    # stored in ctx under this key
+    fn=summarize,                        # async fn(ctx) -> Any
+    grader=quality_grader,               # optional — grade this step's output
+    skip_when=lambda ctx: ctx.get("cached"),  # optional — skip if predicate is True
+)
+```
+
+Step functions receive the context dict and return anything. The framework doesn't constrain the types — type safety lives in your functions, not the framework.
+
+### `PipelineResult`
+
+```python
+result = await run_pipeline(config, input="some input")
+
+result.output           # Any — return value of the last step that ran
+result.trace_id         # str — look up full trace in the tracer
+result.step_outputs     # dict[str, Any] — {step_name: return_value}
+result.scores           # list[Score] | None — pipeline-level grading
+result.step_scores      # dict[str, list[Score]] — per-step grading
+result.duration_ms      # float — wall clock time
+result.short_circuited  # bool — True if is_err triggered early exit
+result.error_step       # str | None — name of the step that errored
+```
+
+### Context dict
+
+The context dict (`ctx`) is the data bus between steps. It starts with:
+
+```python
+{
+    "input": input,          # the value passed to run_pipeline
+    "_tracer": config.tracer,  # for nested pipelines
+    "_span_id": root.id,      # for nested pipelines
+}
+```
+
+Plus any extra keys from the `context` parameter. After each step runs, `ctx[step.name]` is set to its return value. Steps downstream read from these keys.
+
+### Short-circuiting on errors
+
+By default, `run_pipeline` runs all steps to completion. To enable early exit on errors, provide `is_err` and `extract_err`:
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class Err:
+    error: str
+
+config = PipelineConfig(
+    name="fallible",
+    steps=[step_a, step_b, step_c],
+    tracer=tracer,
+    is_err=lambda r: isinstance(r, Err),
+    extract_err=lambda r: r.error,
+)
+```
+
+This teaches the pipeline how to detect errors in your types without importing them. If `step_b` returns an `Err`, `step_c` never runs, and `result.short_circuited` is `True`.
+
+### Conditional steps with `skip_when`
+
+```python
+Step(
+    name="cache_lookup",
+    fn=lookup_cache,
+)
+Step(
+    name="expensive_compute",
+    fn=compute,
+    skip_when=lambda ctx: ctx.get("cache_lookup") is not None,
+)
+```
+
+When `skip_when` returns `True`, the step is recorded as a skipped span (output: `"skipped"`) and doesn't appear in `step_outputs`.
+
+### Per-step grading
+
+Attach a `Grader` to individual steps to score intermediate outputs:
+
+```python
+Step(
+    name="summarize",
+    fn=summarize,
+    grader=HeuristicGrader(checks=[
+        Check(name="min_length", pattern=lambda i, o: min(1.0, len(o) / 100)),
+    ]),
+)
+```
+
+Per-step scores appear in `result.step_scores["summarize"]`. If `config.feedback` is also set, scores are stored via `feedback.score()` with a result ID of `{trace_id}:{step_name}`.
+
+### `map_pipeline`
+
+Runs the same pipeline over a sequence of items. Each item gets its own `run_pipeline` call as a child span under a shared parent trace.
+
+```python
+from jig import map_pipeline
+
+result = await map_pipeline(config, items=[doc1, doc2, doc3])
+
+result.results       # list[PipelineResult] — one per item
+result.trace_id      # str — parent trace ID
+result.duration_ms   # float — total wall clock time
+result.scores        # list[Score] | None — batch-level grading
+```
+
+Optional `batch_grader` grades the entire batch after all items complete:
+
+```python
+result = await map_pipeline(
+    config,
+    items=[doc1, doc2, doc3],
+    batch_grader=my_batch_grader,
+)
+```
+
+### Nested pipelines
+
+A step can call `run_pipeline` internally to compose pipelines. Pass `_parent_span_id` to nest the child trace under the parent:
+
+```python
+async def enrich_step(ctx):
+    inner_result = await run_pipeline(
+        enrich_config,
+        input=ctx["fetch"],
+        _parent_span_id=ctx["_span_id"],
+    )
+    return inner_result.output
+```
+
+The inner pipeline's spans appear as children of the outer pipeline's root span. This nests indefinitely — pipelines are fractal.
 
 ## Components
 
@@ -189,7 +400,9 @@ These components have sensible defaults (off) and can be added when you need the
 
 **Default: `None` (no auto-grading)**
 
-Automatically scores the agent's output after each run. Scores are stored in the feedback loop and available to future runs via `get_signals()`.
+Automatically scores output after each run. In `run_agent`, scores are stored in the feedback loop and available to future runs via `get_signals()`. In `run_pipeline`, graders can be attached per-step (via `Step.grader`) or pipeline-wide (via `PipelineConfig.grader`).
+
+Graders accept `Any` for input and output, so they work with both string-based agent outputs and typed pipeline step outputs.
 
 | Grader | How it works | Cost |
 |--------|-------------|------|
@@ -314,6 +527,8 @@ Tools catch their own errors. If `execute()` raises, jig wraps the exception int
 
 ## Working with results
 
+### `AgentResult`
+
 ```python
 result = await run_agent(config, "Find agent auth discussions on Farcaster")
 
@@ -327,6 +542,32 @@ result.usage           # dict:
                        #   total_cost: float (USD)
                        #   llm_calls: int
                        #   tool_calls: int
+```
+
+### `PipelineResult`
+
+```python
+result = await run_pipeline(config, input=my_input)
+
+result.output           # Any — last step's return value
+result.trace_id         # str — look up full trace in the tracer
+result.step_outputs     # dict[str, Any] — every step's return value by name
+result.scores           # list[Score] | None — pipeline-level grading
+result.step_scores      # dict[str, list[Score]] — per-step grading
+result.duration_ms      # float — wall clock time
+result.short_circuited  # bool — True if is_err triggered early exit
+result.error_step       # str | None — which step errored
+```
+
+### `MapResult`
+
+```python
+result = await map_pipeline(config, items=[a, b, c])
+
+result.results       # list[PipelineResult] — one per item
+result.trace_id      # str — parent trace ID
+result.duration_ms   # float — total wall clock time
+result.scores        # list[Score] | None — batch-level grading
 ```
 
 What you do with the result is your business. jig returns it and gets out of the way.
