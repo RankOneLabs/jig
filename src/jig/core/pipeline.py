@@ -11,7 +11,7 @@ from jig.core.types import FeedbackLoop, Grader, Score, SpanKind, TracingLogger
 @dataclass(frozen=True, slots=True)
 class Step:
     name: str
-    fn: Callable[..., Awaitable[Any]]
+    fn: Callable[[dict[str, Any]], Awaitable[Any]]
     grader: Grader | None = None
     skip_when: Callable[[dict[str, Any]], bool] | None = None
 
@@ -81,75 +81,98 @@ async def run_pipeline(
     step_scores: dict[str, list[Score]] = {}
     short_circuited = False
     error_step: str | None = None
+    error_detail: str | None = None
     last_output: Any = input
 
     # 3. Execute steps
-    for step in config.steps:
-        # Check skip_when
-        if step.skip_when and step.skip_when(ctx):
-            skip_span = config.tracer.start_span(
+    try:
+        for step in config.steps:
+            # Check skip_when
+            if step.skip_when and step.skip_when(ctx):
+                skip_span = config.tracer.start_span(
+                    root.id, SpanKind.PIPELINE_STEP, step.name
+                )
+                config.tracer.end_span(skip_span.id, output="skipped")
+                continue
+
+            step_span = config.tracer.start_span(
                 root.id, SpanKind.PIPELINE_STEP, step.name
             )
-            config.tracer.end_span(skip_span.id, output="skipped")
-            continue
 
-        step_span = config.tracer.start_span(
-            root.id, SpanKind.PIPELINE_STEP, step.name
-        )
+            try:
+                result = await step.fn(ctx)
+            except Exception as exc:
+                config.tracer.end_span(step_span.id, error=str(exc))
+                raise
 
-        result = await step.fn(ctx)
+            # Store in context and outputs
+            ctx[step.name] = result
+            step_outputs[step.name] = result
+            last_output = result
 
-        # Store in context and outputs
-        ctx[step.name] = result
-        step_outputs[step.name] = result
-        last_output = result
-
-        # Check for error
-        if config.is_err and config.is_err(result):
-            err_detail = config.extract_err(result) if config.extract_err else str(result)
-            config.tracer.end_span(step_span.id, error=err_detail)
-            short_circuited = True
-            error_step = step.name
-            break
-
-        config.tracer.end_span(step_span.id, output=result)
-
-        # Per-step grading
-        if step.grader:
-            grade_span = config.tracer.start_span(
-                root.id, SpanKind.GRADING, f"grade_{step.name}"
-            )
-            scores = await step.grader.grade(input, result, ctx)
-            step_scores[step.name] = scores
-            config.tracer.end_span(
-                grade_span.id,
-                output=[{"dim": s.dimension, "val": s.value} for s in scores],
-            )
-
-            # Feedback integration
-            if config.feedback and scores:
-                await config.feedback.score(
-                    f"{trace_id}:{step.name}", scores
+            # Check for error
+            if config.is_err and config.is_err(result):
+                error_detail = (
+                    config.extract_err(result) if config.extract_err else str(result)
                 )
+                config.tracer.end_span(step_span.id, error=error_detail)
+                short_circuited = True
+                error_step = step.name
+                break
 
-    # 4. Pipeline-level grading
-    pipeline_scores: list[Score] | None = None
-    if config.grader and not short_circuited:
-        grade_span = config.tracer.start_span(
-            root.id, SpanKind.GRADING, "pipeline_grade"
-        )
-        pipeline_scores = await config.grader.grade(input, last_output)
-        config.tracer.end_span(
-            grade_span.id,
-            output=[{"dim": s.dimension, "val": s.value} for s in pipeline_scores],
-        )
+            config.tracer.end_span(step_span.id, output=result)
+
+            # Per-step grading
+            if step.grader:
+                grade_span = config.tracer.start_span(
+                    root.id, SpanKind.GRADING, f"grade_{step.name}"
+                )
+                try:
+                    scores = await step.grader.grade(input, result, ctx)
+                    step_scores[step.name] = scores
+                    config.tracer.end_span(
+                        grade_span.id,
+                        output=[{"dim": s.dimension, "val": s.value} for s in scores],
+                    )
+                except Exception as exc:
+                    config.tracer.end_span(grade_span.id, error=str(exc))
+                    raise
+
+                # Feedback integration
+                if config.feedback and scores:
+                    await config.feedback.score(
+                        f"{trace_id}:{step.name}", scores
+                    )
+
+        # 4. Pipeline-level grading
+        pipeline_scores: list[Score] | None = None
+        if config.grader and not short_circuited:
+            grade_span = config.tracer.start_span(
+                root.id, SpanKind.GRADING, "pipeline_grade"
+            )
+            try:
+                pipeline_scores = await config.grader.grade(input, last_output)
+                config.tracer.end_span(
+                    grade_span.id,
+                    output=[
+                        {"dim": s.dimension, "val": s.value} for s in pipeline_scores
+                    ],
+                )
+            except Exception as exc:
+                config.tracer.end_span(grade_span.id, error=str(exc))
+                raise
+
+    except Exception:
+        # Ensure root span is always closed on unhandled exceptions
+        config.tracer.end_span(root.id, error="unhandled exception")
+        raise
 
     # 5. Close trace
     duration = (time.time() - start) * 1000
     config.tracer.end_span(
         root.id,
         output=last_output,
-        error=error_step if short_circuited else None,
+        error=error_detail if short_circuited else None,
     )
 
     return PipelineResult(
