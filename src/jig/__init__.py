@@ -10,14 +10,18 @@ from jig.core import (
     JigToolError,
     LLMClient,
     LLMResponse,
+    MapResult,
     MemoryEntry,
     Message,
+    PipelineConfig,
+    PipelineResult,
     Role,
     Score,
     ScoredResult,
     ScoreSource,
     Span,
     SpanKind,
+    Step,
     Tool,
     ToolCall,
     ToolDefinition,
@@ -25,12 +29,17 @@ from jig.core import (
     TracingLogger,
     Usage,
 )
+from jig.core.pipeline import map_pipeline, run_pipeline
 from jig.core.runner import AgentConfig, AgentResult, run_agent
 from jig.tools import ToolRegistry
 
 __all__ = [
     # Core types
     "AgentMemory",
+    "MapResult",
+    "PipelineConfig",
+    "PipelineResult",
+    "Step",
     "CompletionParams",
     "EvalCase",
     "FeedbackLoop",
@@ -60,6 +69,9 @@ __all__ = [
     "AgentConfig",
     "AgentResult",
     "run_agent",
+    # Pipeline
+    "run_pipeline",
+    "map_pipeline",
     # Tools
     "ToolRegistry",
 ]

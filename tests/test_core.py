@@ -82,8 +82,8 @@ class FakeTracer(TracingLogger):
     def __init__(self) -> None:
         self.spans: list[Span] = []
 
-    def start_trace(self, name: str, metadata: dict[str, Any] | None = None) -> Span:
-        s = Span(id="trace-0", trace_id="t-0", kind=SpanKind.AGENT_RUN, name=name, started_at=datetime.now(), metadata=metadata)
+    def start_trace(self, name: str, metadata: dict[str, Any] | None = None, kind: SpanKind = SpanKind.AGENT_RUN) -> Span:
+        s = Span(id="trace-0", trace_id="t-0", kind=kind, name=name, started_at=datetime.now(), metadata=metadata)
         self.spans.append(s)
         return s
 

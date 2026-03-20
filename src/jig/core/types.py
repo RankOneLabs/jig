@@ -112,6 +112,8 @@ class EvalCase:
 
 class SpanKind(str, Enum):
     AGENT_RUN = "agent_run"
+    PIPELINE_RUN = "pipeline_run"
+    PIPELINE_STEP = "pipeline_step"
     LLM_CALL = "llm_call"
     TOOL_CALL = "tool_call"
     MEMORY_QUERY = "memory_query"
@@ -197,15 +199,20 @@ class Grader(ABC):
     @abstractmethod
     async def grade(
         self,
-        input: str,
-        output: str,
+        input: Any,
+        output: Any,
         context: dict[str, Any] | None = None,
     ) -> list[Score]: ...
 
 
 class TracingLogger(ABC):
     @abstractmethod
-    def start_trace(self, name: str, metadata: dict[str, Any] | None = None) -> Span: ...
+    def start_trace(
+        self,
+        name: str,
+        metadata: dict[str, Any] | None = None,
+        kind: SpanKind = SpanKind.AGENT_RUN,
+    ) -> Span: ...
 
     @abstractmethod
     def start_span(self, parent_id: str, kind: SpanKind, name: str, input: Any = None) -> Span: ...

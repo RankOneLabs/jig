@@ -8,11 +8,13 @@ from typing import Any
 from jig.core.types import Span, SpanKind, TracingLogger
 
 _COLORS = {
-    SpanKind.AGENT_RUN: "\033[1;36m",    # bold cyan
-    SpanKind.LLM_CALL: "\033[1;33m",     # bold yellow
-    SpanKind.TOOL_CALL: "\033[1;32m",    # bold green
-    SpanKind.MEMORY_QUERY: "\033[1;35m", # bold magenta
-    SpanKind.GRADING: "\033[1;34m",      # bold blue
+    SpanKind.AGENT_RUN: "\033[1;36m",      # bold cyan
+    SpanKind.PIPELINE_RUN: "\033[1;36m",   # bold cyan
+    SpanKind.PIPELINE_STEP: "\033[1;37m",  # bold white
+    SpanKind.LLM_CALL: "\033[1;33m",      # bold yellow
+    SpanKind.TOOL_CALL: "\033[1;32m",     # bold green
+    SpanKind.MEMORY_QUERY: "\033[1;35m",  # bold magenta
+    SpanKind.GRADING: "\033[1;34m",       # bold blue
 }
 _RESET = "\033[0m"
 _RED = "\033[1;31m"
@@ -30,20 +32,25 @@ class StdoutTracer(TracingLogger):
     def _r(self) -> str:
         return _RESET if self._color else ""
 
-    def start_trace(self, name: str, metadata: dict[str, Any] | None = None) -> Span:
+    def start_trace(
+        self,
+        name: str,
+        metadata: dict[str, Any] | None = None,
+        kind: SpanKind = SpanKind.AGENT_RUN,
+    ) -> Span:
         span_id = str(uuid.uuid4())
         trace_id = str(uuid.uuid4())
         span = Span(
             id=span_id,
             trace_id=trace_id,
-            kind=SpanKind.AGENT_RUN,
+            kind=kind,
             name=name,
             started_at=datetime.now(),
             metadata=metadata,
         )
         self._spans[span_id] = span
         self._depth[span_id] = 0
-        print(f"{self._c(SpanKind.AGENT_RUN)}[TRACE] {name} started{self._r()}")
+        print(f"{self._c(kind)}[{kind.value}] {name} started{self._r()}")
         return span
 
     def start_span(
