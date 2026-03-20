@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import uuid
 from datetime import datetime
@@ -8,6 +9,19 @@ from typing import Any
 import aiosqlite
 
 from jig.core.types import Span, SpanKind, TracingLogger, Usage
+
+
+def _safe_json(obj: Any) -> str | None:
+    """Serialize to JSON, falling back to repr for non-serializable objects."""
+    if obj is None:
+        return None
+    try:
+        return json.dumps(obj)
+    except (TypeError, ValueError):
+        pass
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        return json.dumps(dataclasses.asdict(obj))
+    return json.dumps(repr(obj))
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS spans (
@@ -109,12 +123,12 @@ class SQLiteTracer(TracingLogger):
                     span.parent_id,
                     span.kind.value,
                     span.name,
-                    json.dumps(span.input) if span.input is not None else None,
-                    json.dumps(span.output) if span.output is not None else None,
+                    _safe_json(span.input),
+                    _safe_json(span.output),
                     span.started_at.isoformat(),
                     span.ended_at.isoformat() if span.ended_at else None,
                     span.duration_ms,
-                    json.dumps(span.metadata) if span.metadata else None,
+                    _safe_json(span.metadata),
                     span.error,
                     span.usage.input_tokens if span.usage else None,
                     span.usage.output_tokens if span.usage else None,
