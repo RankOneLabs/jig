@@ -183,6 +183,7 @@ async def run_agent(config: AgentConfig, input: str) -> AgentResult:
     # 9. Close trace
     duration = (time.time() - start) * 1000
     config.tracer.end_span(trace.id, {"output": final_output[:200], "scores": scores})
+    await config.tracer.flush()
 
     return AgentResult(
         output=final_output,
