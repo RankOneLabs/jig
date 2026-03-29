@@ -101,7 +101,7 @@ class GeminiClient(LLMClient):
             config_kwargs["tools"] = self._convert_tools(params.tools)
         if params.temperature is not None:
             config_kwargs["temperature"] = params.temperature
-        if params.max_tokens:
+        if params.max_tokens is not None:
             config_kwargs["max_output_tokens"] = params.max_tokens
         if params.provider_params:
             config_kwargs.update(params.provider_params)
