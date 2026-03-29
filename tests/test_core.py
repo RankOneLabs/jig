@@ -105,6 +105,9 @@ class FakeTracer(TracingLogger):
     async def list_traces(self, since: datetime | None = None, limit: int = 50, name: str | None = None) -> list[Span]:
         return [s for s in self.spans if s.kind == SpanKind.AGENT_RUN]
 
+    async def flush(self) -> None:
+        pass
+
 
 class EchoTool(Tool):
     @property
