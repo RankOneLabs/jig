@@ -13,10 +13,11 @@ dependencies = [
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40"]
 openai = ["openai>=1.50"]
+google = ["google-genai>=1.0"]
 ollama = ["ollama>=0.4"]
 honcho = ["honcho>=0.1"]
 zep = ["zep-python>=2.0"]
-all = ["jig[anthropic,openai,ollama,honcho,zep]"]
+all = ["jig[anthropic,openai,google,ollama,honcho,zep]"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
 
 [build-system]
