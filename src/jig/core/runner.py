@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
+from jig.core.errors import JigLLMError
 from jig.core.prompt import build_system_message
 from jig.core.types import (
     AgentMemory,
@@ -21,6 +23,10 @@ from jig.core.types import (
 )
 from jig.tools.registry import ToolRegistry
 
+logger = logging.getLogger(__name__)
+
+_MAX_LLM_RETRIES = 3
+
 
 @dataclass
 class AgentConfig:
@@ -36,6 +42,7 @@ class AgentConfig:
 
     grader: Grader | None = None
     max_tool_calls: int = 10
+    max_llm_retries: int = _MAX_LLM_RETRIES
     include_memory_in_prompt: bool = True
     include_feedback_in_prompt: bool = True
     session_id: str | None = None
@@ -98,6 +105,7 @@ async def run_agent(config: AgentConfig, input: str) -> AgentResult:
         "tool_calls": 0,
     }
     tool_call_count = 0
+    consecutive_llm_errors = 0
     final_output = ""
 
     while True:
@@ -107,7 +115,27 @@ async def run_agent(config: AgentConfig, input: str) -> AgentResult:
             system=system_message,
             tools=config.tools.list() or None,
         )
-        response = await config.llm.complete(params)
+
+        try:
+            response = await config.llm.complete(params)
+        except JigLLMError as e:
+            consecutive_llm_errors += 1
+            config.tracer.end_span(llm_span.id, None, error=str(e))
+            logger.warning(
+                "LLM call failed (%d/%d): %s",
+                consecutive_llm_errors, config.max_llm_retries, e,
+            )
+            if consecutive_llm_errors >= config.max_llm_retries:
+                final_output = f"[agent terminated: {consecutive_llm_errors} consecutive LLM errors, last: {e}]"
+                break
+            # Inject an error message so the model can see it on next turn
+            messages.append(Message(
+                role=Role.USER,
+                content=f"[system: LLM call failed: {e}. Please continue.]",
+            ))
+            continue
+
+        consecutive_llm_errors = 0
         config.tracer.end_span(
             llm_span.id,
             {"content": response.content[:200], "tool_calls": len(response.tool_calls or [])},
@@ -148,8 +176,16 @@ async def run_agent(config: AgentConfig, input: str) -> AgentResult:
             result = await config.tools.execute(call)
             config.tracer.end_span(tool_span.id, result.output[:500], error=result.error)
 
+            # Surface tool errors to the model so it can react
+            if result.error:
+                content = f"[tool error: {result.error}]"
+                if result.output:
+                    content = f"{result.output}\n{content}"
+            else:
+                content = result.output
+
             messages.append(
-                Message(role=Role.TOOL, content=result.output, tool_call_id=call.id)
+                Message(role=Role.TOOL, content=content, tool_call_id=call.id)
             )
             tool_call_count += 1
             total_usage["tool_calls"] += 1
