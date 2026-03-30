@@ -118,7 +118,7 @@ async def run_agent(config: AgentConfig, input: str) -> AgentResult:
 
         try:
             response = await config.llm.complete(params)
-        except (JigLLMError, Exception) as e:
+        except JigLLMError as e:
             consecutive_llm_errors += 1
             config.tracer.end_span(llm_span.id, None, error=str(e))
             logger.warning(

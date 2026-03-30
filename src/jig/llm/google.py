@@ -100,6 +100,7 @@ class GeminiClient(LLMClient):
                         "FunctionResponse validation failed for tool %s, "
                         "falling back to string representation",
                         tool_name,
+                        exc_info=True,
                     )
                     fr = genai_types.Part(
                         function_response=genai_types.FunctionResponse(
