@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import math
 import time
 import uuid
 from typing import Any
@@ -24,6 +26,27 @@ try:
 except ImportError:
     genai = None  # type: ignore[assignment]
     genai_types = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
+
+
+def _sanitize_for_gemini(obj: Any) -> Any:
+    """Sanitize a value so it passes google-genai FunctionResponse validation.
+
+    The google-genai SDK uses Pydantic to validate FunctionResponse.response,
+    which rejects None values, NaN/Inf floats, and non-primitive types.
+    """
+    if obj is None:
+        return ""
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return str(obj)
+        return obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_gemini(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_for_gemini(v) for v in obj]
+    return obj
 
 
 class GeminiClient(LLMClient):
@@ -63,12 +86,27 @@ class GeminiClient(LLMClient):
                 except (json.JSONDecodeError, TypeError):
                     result = {"result": msg.content}
 
-                fr = genai_types.Part(
-                    function_response=genai_types.FunctionResponse(
-                        name=tool_name,
-                        response=result,
+                result = _sanitize_for_gemini(result)
+
+                try:
+                    fr = genai_types.Part(
+                        function_response=genai_types.FunctionResponse(
+                            name=tool_name,
+                            response=result,
+                        )
                     )
-                )
+                except Exception:
+                    logger.warning(
+                        "FunctionResponse validation failed for tool %s, "
+                        "falling back to string representation",
+                        tool_name,
+                    )
+                    fr = genai_types.Part(
+                        function_response=genai_types.FunctionResponse(
+                            name=tool_name,
+                            response={"result": str(msg.content)},
+                        )
+                    )
                 # Gemini expects function_response parts in a user turn —
                 # merge consecutive tool results into one Content block.
                 if contents and contents[-1].role == "user" and any(
@@ -134,7 +172,8 @@ class GeminiClient(LLMClient):
         tool_calls: list[ToolCall] = []
 
         if response.candidates and response.candidates[0].content:
-            for part in response.candidates[0].content.parts:
+            parts = response.candidates[0].content.parts or []
+            for part in parts:
                 if part.text:
                     text_parts.append(part.text)
                 elif part.function_call:
