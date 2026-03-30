@@ -65,7 +65,7 @@ class FakeTracer(TracingLogger):
         return s
 
     def end_span(
-        self, span_id: str, output: Any = None, error: str | None = None
+        self, span_id: str, output: Any = None, error: str | None = None, usage: Any = None
     ) -> None:
         for s in self.spans:
             if s.id == span_id:
