@@ -105,7 +105,7 @@ class SQLiteTracer(TracingLogger):
         self._spans[span_id] = span
         return span
 
-    def end_span(self, span_id: str, output: Any = None, error: str | None = None) -> None:
+    def end_span(self, span_id: str, output: Any = None, error: str | None = None, usage: Usage | None = None) -> None:
         span = self._spans.get(span_id)
         if not span:
             return
@@ -113,6 +113,7 @@ class SQLiteTracer(TracingLogger):
         span.duration_ms = (span.ended_at - span.started_at).total_seconds() * 1000
         span.output = output
         span.error = error
+        span.usage = usage
 
     async def flush(self) -> None:
         db = await self._get_db()

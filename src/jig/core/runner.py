@@ -139,6 +139,7 @@ async def run_agent(config: AgentConfig, input: str) -> AgentResult:
         config.tracer.end_span(
             llm_span.id,
             {"content": response.content[:200], "tool_calls": len(response.tool_calls or [])},
+            usage=response.usage,
         )
 
         total_usage["total_input_tokens"] += response.usage.input_tokens

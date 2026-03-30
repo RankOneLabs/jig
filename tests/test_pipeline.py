@@ -65,13 +65,14 @@ class FakeTracer(TracingLogger):
         return s
 
     def end_span(
-        self, span_id: str, output: Any = None, error: str | None = None
+        self, span_id: str, output: Any = None, error: str | None = None, usage: Any = None
     ) -> None:
         for s in self.spans:
             if s.id == span_id:
                 s.ended_at = datetime.now()
                 s.output = output
                 s.error = error
+                s.usage = usage
 
     async def get_trace(self, trace_id: str) -> list[Span]:
         return [s for s in self.spans if s.trace_id == trace_id]
