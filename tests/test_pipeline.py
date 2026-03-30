@@ -72,6 +72,7 @@ class FakeTracer(TracingLogger):
                 s.ended_at = datetime.now()
                 s.output = output
                 s.error = error
+                s.usage = usage
 
     async def get_trace(self, trace_id: str) -> list[Span]:
         return [s for s in self.spans if s.trace_id == trace_id]

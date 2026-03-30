@@ -123,8 +123,9 @@ class EchoTool(Tool):
 
 
 async def test_simple_completion():
+    tracer = FakeTracer()
     llm = FakeLLM([
-        LLMResponse(content="Hello!", tool_calls=None, usage=Usage(10, 5), latency_ms=100, model="fake"),
+        LLMResponse(content="Hello!", tool_calls=None, usage=Usage(10, 5, cost=0.0025), latency_ms=100, model="fake"),
     ])
     result = await run_agent(
         AgentConfig(
@@ -134,7 +135,7 @@ async def test_simple_completion():
             llm=llm,
             memory=FakeMemory(),
             feedback=FakeFeedback(),
-            tracer=FakeTracer(),
+            tracer=tracer,
             tools=ToolRegistry(),
         ),
         "Hi",
@@ -142,6 +143,14 @@ async def test_simple_completion():
     assert result.output == "Hello!"
     assert result.usage["llm_calls"] == 1
     assert result.usage["tool_calls"] == 0
+
+    # Verify usage is persisted on the LLM span
+    llm_spans = [s for s in tracer.spans if s.kind == SpanKind.LLM_CALL]
+    assert len(llm_spans) == 1
+    assert llm_spans[0].usage is not None
+    assert llm_spans[0].usage.input_tokens == 10
+    assert llm_spans[0].usage.output_tokens == 5
+    assert llm_spans[0].usage.cost == 0.0025
 
 
 async def test_tool_loop():
