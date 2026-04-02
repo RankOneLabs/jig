@@ -95,14 +95,21 @@ class OllamaClient(LLMClient):
         tool_calls: list[ToolCall] | None = None
         raw_calls = response.get("message", {}).get("tool_calls")
         if raw_calls:
-            tool_calls = [
-                ToolCall(
-                    id=str(uuid.uuid4()),
-                    name=tc["function"]["name"],
-                    arguments=tc["function"]["arguments"],
+            try:
+                tool_calls = [
+                    ToolCall(
+                        id=str(uuid.uuid4()),
+                        name=tc["function"]["name"],
+                        arguments=tc["function"]["arguments"],
+                    )
+                    for tc in raw_calls
+                ]
+            except (KeyError, TypeError) as e:
+                raise JigLLMError(
+                    f"Malformed tool call: {e}. Raw: {raw_calls}",
+                    "ollama",
+                    retryable=True,
                 )
-                for tc in raw_calls
-            ]
 
         return LLMResponse(
             content=response.get("message", {}).get("content", ""),
