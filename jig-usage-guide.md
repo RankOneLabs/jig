@@ -293,6 +293,7 @@ The model that powers the agent. One adapter per provider.
 | `AnthropicClient` | Anthropic Messages API | `anthropic` | Sonnet, Opus, Haiku |
 | `OpenAIClient` | OpenAI Chat Completions | `openai` | GPT-4, GPT-5, o-series |
 | `OllamaClient` | Ollama (local) | `ollama` | Any model on your hardware. Cost is always `None`. |
+| `DispatchClient` | Smithers dispatch (fleet) | _(core)_ | Routes inference to homelab GPU workers via smithers. |
 
 ```python
 from jig.llm import AnthropicClient
@@ -301,6 +302,16 @@ llm = AnthropicClient(
     model="claude-sonnet-4-20250514",
     api_key="sk-...",          # or set ANTHROPIC_API_KEY env var
 )
+```
+
+For local fleet inference via smithers dispatch:
+
+```python
+from jig.llm import DispatchClient
+
+llm = DispatchClient(model="llama-70b")                   # router picks machine
+llm = DispatchClient(model="llama-70b", machine="mcbain") # explicit machine
+llm = DispatchClient(dispatch_url="http://willie:8900")    # router picks everything
 ```
 
 Temperature, max_tokens, and provider-specific parameters are set per-call via `CompletionParams`, not on the client:
