@@ -42,7 +42,7 @@ print(result.output)
 
 | Interface | Purpose | Adapters |
 |---|---|---|
-| `LLMClient` | LLM completions | Anthropic, OpenAI, Ollama |
+| `LLMClient` | LLM completions | Anthropic, OpenAI, Ollama, Dispatch (smithers fleet) |
 | `AgentMemory` | Storage + retrieval | Local (SQLite + embeddings), Honcho, Zep |
 | `FeedbackLoop` | Score tracking + eval export | SQLite |
 | `Grader` | Auto-score outputs | LLM Judge, Heuristic, Ground Truth, Composite |
