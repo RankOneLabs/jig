@@ -105,22 +105,35 @@ class DispatchClient(LLMClient):
                 f"Dispatch submission failed: {e.response.status_code} {e.response.text}",
                 "dispatch",
             )
+        except httpx.RequestError as e:
+            raise JigLLMError(
+                f"Dispatch request error: {e}",
+                "dispatch",
+                retryable=True,
+            )
 
-        job_id = resp.json()["job_id"]
+        try:
+            job_id = resp.json()["job_id"]
+        except (ValueError, KeyError) as e:
+            raise JigLLMError(
+                f"Unexpected dispatch response: {resp.text}",
+                "dispatch",
+            )
+
         logger.info(f"Dispatch job {job_id} submitted (model={self._model})")
 
         # Poll for completion
         interval = self._poll_interval
         while True:
-            elapsed = time.time() - start
-            if elapsed > self._timeout_seconds:
+            remaining = self._timeout_seconds - (time.time() - start)
+            if remaining <= 0:
                 raise JigLLMError(
                     f"Dispatch job {job_id} timed out after {self._timeout_seconds}s",
                     "dispatch",
                     retryable=True,
                 )
 
-            await asyncio.sleep(interval)
+            await asyncio.sleep(min(interval, remaining))
             interval = min(interval * 2, self._poll_max_interval)
 
             try:
@@ -129,7 +142,16 @@ class DispatchClient(LLMClient):
             except httpx.ConnectError:
                 logger.warning(f"Lost connection polling job {job_id}, retrying...")
                 continue
-            except httpx.HTTPStatusError:
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 404:
+                    raise JigLLMError(
+                        f"Dispatch job {job_id} not found (expired or invalid)",
+                        "dispatch",
+                    )
+                logger.warning(f"HTTP {e.response.status_code} polling job {job_id}, retrying...")
+                continue
+            except httpx.RequestError:
+                logger.warning(f"Request error polling job {job_id}, retrying...")
                 continue
 
             data = poll.json()
