@@ -154,8 +154,12 @@ class DispatchClient(LLMClient):
                 logger.warning(f"Request error polling job {job_id}, retrying...")
                 continue
 
-            data = poll.json()
-            status = data.get("status", "")
+            try:
+                data = poll.json()
+            except ValueError:
+                logger.warning(f"Malformed JSON polling job {job_id}, retrying...")
+                continue
+            status = data.get("status", "") if isinstance(data, dict) else ""
 
             if status in _PENDING_STATUSES:
                 continue
