@@ -1,0 +1,276 @@
+"""Tests for the smithers DispatchClient."""
+from __future__ import annotations
+
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
+import pytest
+
+from jig.core.errors import JigLLMError
+from jig.core.types import CompletionParams, Message, Role, ToolDefinition
+from jig.llm.dispatch import DispatchClient
+
+
+def _mock_submit_response(job_id: str = "job-123", status: str = "queued"):
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = 200
+    resp.json.return_value = {"job_id": job_id, "status": status}
+    resp.raise_for_status = MagicMock()
+    return resp
+
+
+def _mock_poll_response(
+    job_id: str = "job-123",
+    status: str = "complete",
+    result: dict | None = None,
+    model: str | None = "llama-70b",
+    error: str | None = None,
+):
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = 200
+    resp.json.return_value = {
+        "job_id": job_id,
+        "status": status,
+        "result": result,
+        "model": model,
+        "error": error,
+    }
+    resp.raise_for_status = MagicMock()
+    return resp
+
+
+class TestBuildPayload:
+    """Tests for _build_payload conversion."""
+
+    def test_basic_message(self):
+        client = DispatchClient(model="llama-70b")
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hello")],
+        )
+        payload = client._build_payload(params)
+
+        assert payload["messages"] == [{"role": "user", "content": "Hello"}]
+        assert "temperature" not in payload
+        assert "max_tokens" not in payload
+
+    def test_system_prompt(self):
+        client = DispatchClient()
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hi")],
+            system="You are helpful.",
+        )
+        payload = client._build_payload(params)
+
+        assert payload["messages"][0] == {"role": "system", "content": "You are helpful."}
+        assert payload["messages"][1] == {"role": "user", "content": "Hi"}
+
+    def test_temperature_and_max_tokens(self):
+        client = DispatchClient()
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hi")],
+            temperature=0.7,
+            max_tokens=1024,
+        )
+        payload = client._build_payload(params)
+
+        assert payload["temperature"] == 0.7
+        assert payload["max_tokens"] == 1024
+
+    def test_tools_rejected(self):
+        client = DispatchClient()
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hi")],
+            tools=[ToolDefinition(name="test", description="test", parameters={})],
+        )
+        with pytest.raises(JigLLMError, match="Tool use is not supported"):
+            client._build_payload(params)
+
+    def test_skips_system_role_in_messages(self):
+        client = DispatchClient()
+        params = CompletionParams(
+            messages=[
+                Message(role=Role.SYSTEM, content="system msg"),
+                Message(role=Role.USER, content="user msg"),
+            ],
+            system="Actual system prompt",
+        )
+        payload = client._build_payload(params)
+
+        # System role message should be skipped; system param used instead
+        roles = [m["role"] for m in payload["messages"]]
+        assert roles == ["system", "user"]
+        assert payload["messages"][0]["content"] == "Actual system prompt"
+
+
+class TestComplete:
+    """Tests for the complete() method."""
+
+    @pytest.mark.asyncio
+    async def test_submit_and_poll_complete(self):
+        """Happy path: submit job, poll once, get result."""
+        client = DispatchClient(model="llama-70b", poll_interval=0.01)
+
+        client._http = AsyncMock(spec=httpx.AsyncClient)
+        client._http.post.return_value = _mock_submit_response()
+        client._http.get.return_value = _mock_poll_response(
+            result={"content": "Hello world"},
+        )
+
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hi")],
+        )
+        response = await client.complete(params)
+
+        assert response.content == "Hello world"
+        assert response.model == "llama-70b"
+        assert response.latency_ms > 0
+        assert response.tool_calls is None
+
+    @pytest.mark.asyncio
+    async def test_poll_through_intermediate_states(self):
+        """Should keep polling through queued/running states."""
+        client = DispatchClient(model="llama-70b", poll_interval=0.01)
+
+        client._http = AsyncMock(spec=httpx.AsyncClient)
+        client._http.post.return_value = _mock_submit_response()
+        client._http.get.side_effect = [
+            _mock_poll_response(status="queued", result=None),
+            _mock_poll_response(status="running", result=None),
+            _mock_poll_response(status="complete", result={"content": "Done"}),
+        ]
+
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hi")],
+        )
+        response = await client.complete(params)
+
+        assert response.content == "Done"
+        assert client._http.get.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_job_failed(self):
+        """Should raise JigLLMError on job failure."""
+        client = DispatchClient(poll_interval=0.01)
+
+        client._http = AsyncMock(spec=httpx.AsyncClient)
+        client._http.post.return_value = _mock_submit_response()
+        client._http.get.return_value = _mock_poll_response(
+            status="failed", error="Model not available",
+        )
+
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hi")],
+        )
+        with pytest.raises(JigLLMError, match="Model not available"):
+            await client.complete(params)
+
+    @pytest.mark.asyncio
+    async def test_job_cancelled(self):
+        """Should raise JigLLMError on cancellation."""
+        client = DispatchClient(poll_interval=0.01)
+
+        client._http = AsyncMock(spec=httpx.AsyncClient)
+        client._http.post.return_value = _mock_submit_response()
+        client._http.get.return_value = _mock_poll_response(status="cancelled")
+
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hi")],
+        )
+        with pytest.raises(JigLLMError, match="cancelled"):
+            await client.complete(params)
+
+    @pytest.mark.asyncio
+    async def test_timeout(self):
+        """Should raise JigLLMError after timeout."""
+        client = DispatchClient(
+            timeout_seconds=0.1, poll_interval=0.01, poll_max_interval=0.02,
+        )
+
+        client._http = AsyncMock(spec=httpx.AsyncClient)
+        client._http.post.return_value = _mock_submit_response()
+        client._http.get.return_value = _mock_poll_response(status="running", result=None)
+
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hi")],
+        )
+        with pytest.raises(JigLLMError, match="timed out"):
+            await client.complete(params)
+
+    @pytest.mark.asyncio
+    async def test_submit_connect_error(self):
+        """Should raise JigLLMError on connection failure."""
+        client = DispatchClient()
+
+        client._http = AsyncMock(spec=httpx.AsyncClient)
+        client._http.post.side_effect = httpx.ConnectError("Connection refused")
+
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hi")],
+        )
+        with pytest.raises(JigLLMError, match="Cannot reach dispatch"):
+            await client.complete(params)
+
+    @pytest.mark.asyncio
+    async def test_submit_http_error(self):
+        """Should raise JigLLMError on HTTP error from dispatch."""
+        client = DispatchClient()
+
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = 400
+        resp.text = "Bad request"
+        resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "400", request=MagicMock(), response=resp,
+        )
+        client._http = AsyncMock(spec=httpx.AsyncClient)
+        client._http.post.return_value = resp
+
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hi")],
+        )
+        with pytest.raises(JigLLMError, match="submission failed"):
+            await client.complete(params)
+
+    @pytest.mark.asyncio
+    async def test_model_in_submission(self):
+        """Should include model and machine in job submission."""
+        client = DispatchClient(model="qwen-72b", machine="frink", poll_interval=0.01)
+
+        client._http = AsyncMock(spec=httpx.AsyncClient)
+        client._http.post.return_value = _mock_submit_response()
+        client._http.get.return_value = _mock_poll_response(
+            result={"content": "ok"}, model="qwen-72b",
+        )
+
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hi")],
+        )
+        await client.complete(params)
+
+        # Check the submission payload
+        call_args = client._http.post.call_args
+        body = call_args.kwargs.get("json") or call_args[1].get("json")
+        assert body["model"] == "qwen-72b"
+        assert body["machine"] == "frink"
+        assert body["task_type"] == "inference"
+        assert body["requester"] == "jig"
+
+    @pytest.mark.asyncio
+    async def test_no_model_omits_field(self):
+        """Should omit model/machine from submission when not specified."""
+        client = DispatchClient(poll_interval=0.01)
+
+        client._http = AsyncMock(spec=httpx.AsyncClient)
+        client._http.post.return_value = _mock_submit_response()
+        client._http.get.return_value = _mock_poll_response(
+            result={"content": "ok"}, model=None,
+        )
+
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hi")],
+        )
+        await client.complete(params)
+
+        body = client._http.post.call_args.kwargs.get("json") or client._http.post.call_args[1].get("json")
+        assert "model" not in body
+        assert "machine" not in body
