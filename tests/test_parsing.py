@@ -49,6 +49,16 @@ def test_unexpected_type_raises():
         parse_tool_arguments(42, "ollama")
     assert "Unexpected tool call arguments type" in str(excinfo.value)
     assert excinfo.value.provider == "ollama"
+    assert excinfo.value.retryable is True
+
+
+def test_long_raw_is_truncated_in_error():
+    huge = "x" * 5000  # invalid JSON, huge payload
+    with pytest.raises(JigLLMError) as excinfo:
+        parse_tool_arguments(huge, "openai")
+    msg = str(excinfo.value)
+    assert "len=5000" in msg
+    assert len(msg) < 500  # full payload would blow this up
 
 
 def test_provider_name_propagated():
