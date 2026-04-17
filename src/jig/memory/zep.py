@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime
 from typing import Any
@@ -10,6 +11,8 @@ try:
     from zep_python.client import AsyncZep
 except ImportError:
     AsyncZep = None  # type: ignore[assignment, misc]
+
+logger = logging.getLogger(__name__)
 
 _ROLE_TO_ZEP = {Role.USER: "human", Role.ASSISTANT: "ai", Role.TOOL: "tool"}
 _ZEP_TO_ROLE = {"human": Role.USER, "ai": Role.ASSISTANT, "tool": Role.TOOL}
@@ -48,6 +51,7 @@ class ZepMemory(AgentMemory):
         try:
             results = await self._client.memory.search(sid, query, limit=limit)
         except Exception:
+            logger.warning("Zep search failed (session_id=%s)", sid, exc_info=True)
             return []
 
         return [
@@ -64,6 +68,7 @@ class ZepMemory(AgentMemory):
         try:
             memory = await self._client.memory.get(session_id)
         except Exception:
+            logger.warning("Zep session lookup failed (session_id=%s)", session_id, exc_info=True)
             return []
 
         messages: list[Message] = []
