@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any
 
@@ -9,6 +10,8 @@ try:
     from honcho import AsyncHoncho
 except ImportError:
     AsyncHoncho = None  # type: ignore[assignment, misc]
+
+logger = logging.getLogger(__name__)
 
 
 class HonchoMemory(AgentMemory):
@@ -54,7 +57,8 @@ class HonchoMemory(AgentMemory):
                 user_id=self._user_id,
                 name=self._collection_name,
             )
-        except Exception:
+        except Exception as e:
+            logger.warning("Honcho collection lookup failed (%s=%r): %s", self._collection_name, e, exc_info=False)
             return []
 
         results = await self._client.apps.users.collections.documents.query(
@@ -82,7 +86,8 @@ class HonchoMemory(AgentMemory):
                 user_id=self._user_id,
                 session_id=session_id,
             )
-        except Exception:
+        except Exception as e:
+            logger.warning("Honcho session lookup failed (session_id=%s): %s", session_id, e, exc_info=False)
             return []
 
         return [

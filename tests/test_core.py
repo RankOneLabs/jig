@@ -283,6 +283,23 @@ async def test_tool_registry_error_handling():
     assert result.error == "boom"
 
 
+async def test_tool_registry_execute_timeout():
+    class SlowTool(Tool):
+        @property
+        def definition(self) -> ToolDefinition:
+            return ToolDefinition(name="slow", description="Hangs forever", parameters={})
+
+        async def execute(self, args: dict[str, Any]) -> str:
+            await asyncio.sleep(10)
+            return "done"
+
+    registry = ToolRegistry([SlowTool()], execute_timeout=0.05)
+    result = await registry.execute(ToolCall(id="x", name="slow", arguments={}))
+    assert result.output == ""
+    assert result.error is not None
+    assert "timed out after 0.05s" in result.error
+
+
 async def test_completion_params_provider_params():
     params = CompletionParams(
         messages=[Message(role=Role.USER, content="hi")],
