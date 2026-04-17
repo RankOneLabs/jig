@@ -22,4 +22,7 @@ async def ollama_embed(
         raise ImportError("Install ollama: pip install 'jig[ollama]'")
     client = OllamaAsyncClient(host=host)
     response = await client.embed(model=model, input=text)
-    return np.array(response["embeddings"][0], dtype=np.float32)
+    embeddings = response.get("embeddings") if isinstance(response, dict) else None
+    if not embeddings:
+        raise RuntimeError(f"Ollama embed response missing 'embeddings' (model={model})")
+    return np.array(embeddings[0], dtype=np.float32)

@@ -109,9 +109,8 @@ class OpenAIClient(LLMClient):
         try:
             response = await with_retry(_call, max_attempts=3, retryable=_retryable)
         except Exception as e:
-            if openai and isinstance(e, openai.AuthenticationError):
-                raise
-            raise JigLLMError(str(e), "openai") from e
+            status = getattr(e, "status_code", None)
+            raise JigLLMError(str(e), "openai", status_code=status) from e
 
         latency_ms = (time.time() - start) * 1000
         choice = response.choices[0].message
