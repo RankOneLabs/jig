@@ -58,7 +58,7 @@ class HonchoMemory(AgentMemory):
                 name=self._collection_name,
             )
         except Exception as e:
-            logger.warning("Honcho collection lookup failed (%s=%r): %s", self._collection_name, e, exc_info=False)
+            logger.warning("Honcho collection lookup failed (collection_name=%r): %s", self._collection_name, e, exc_info=False)
             return []
 
         results = await self._client.apps.users.collections.documents.query(
