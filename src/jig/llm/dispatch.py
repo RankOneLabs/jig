@@ -170,14 +170,15 @@ class DispatchClient(LLMClient):
                 result = data.get("result") or {}
                 content = result.get("content", "")
                 model = data.get("model") or self._model or "dispatch"
+                usage_data = result.get("usage") or {}
                 logger.info(f"Dispatch job {job_id} complete ({latency_ms:.0f}ms)")
                 return LLMResponse(
                     content=content,
                     tool_calls=None,
                     usage=Usage(
-                        input_tokens=0,
-                        output_tokens=0,
-                        cost=None,
+                        input_tokens=int(usage_data.get("input_tokens", 0)),
+                        output_tokens=int(usage_data.get("output_tokens", 0)),
+                        cost=usage_data.get("cost", 0.0),
                     ),
                     latency_ms=latency_ms,
                     model=model,

@@ -118,7 +118,7 @@ class OllamaClient(LLMClient):
             usage=Usage(
                 input_tokens=response.get("prompt_eval_count", 0),
                 output_tokens=response.get("eval_count", 0),
-                cost=None,
+                cost=0.0,
             ),
             latency_ms=latency_ms,
             model=self._model,

@@ -1,9 +1,11 @@
+from jig.budget import BudgetedLLMClient, BudgetTracker
 from jig.core import (
     AgentMemory,
     CompletionParams,
     EvalCase,
     FeedbackLoop,
     Grader,
+    JigBudgetError,
     JigError,
     JigLLMError,
     JigMemoryError,
@@ -31,6 +33,7 @@ from jig.core import (
 )
 from jig.core.pipeline import map_pipeline, run_pipeline
 from jig.core.runner import AgentConfig, AgentResult, run_agent
+from jig.llm.factory import complete, from_model
 from jig.tools import ToolRegistry
 
 __all__ = [
@@ -61,6 +64,7 @@ __all__ = [
     "TracingLogger",
     "Usage",
     # Errors
+    "JigBudgetError",
     "JigError",
     "JigLLMError",
     "JigMemoryError",
@@ -74,4 +78,10 @@ __all__ = [
     "map_pipeline",
     # Tools
     "ToolRegistry",
+    # LLM factory + one-shot
+    "complete",
+    "from_model",
+    # Budget
+    "BudgetTracker",
+    "BudgetedLLMClient",
 ]

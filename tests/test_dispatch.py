@@ -255,6 +255,47 @@ class TestComplete:
         assert body["requester"] == "jig"
 
     @pytest.mark.asyncio
+    async def test_cost_from_result_usage(self):
+        """Dispatch should surface usage (tokens + cost) when smithers reports it."""
+        client = DispatchClient(model="llama-70b", poll_interval=0.01)
+
+        client._http = AsyncMock(spec=httpx.AsyncClient)
+        client._http.post.return_value = _mock_submit_response()
+        client._http.get.return_value = _mock_poll_response(
+            result={
+                "content": "hi",
+                "usage": {"input_tokens": 42, "output_tokens": 17, "cost": 0.0},
+            },
+        )
+
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hi")],
+        )
+        response = await client.complete(params)
+        assert response.usage.input_tokens == 42
+        assert response.usage.output_tokens == 17
+        assert response.usage.cost == 0.0
+
+    @pytest.mark.asyncio
+    async def test_usage_defaults_when_result_lacks_it(self):
+        """Dispatch should default usage fields when smithers omits them."""
+        client = DispatchClient(model="llama-70b", poll_interval=0.01)
+
+        client._http = AsyncMock(spec=httpx.AsyncClient)
+        client._http.post.return_value = _mock_submit_response()
+        client._http.get.return_value = _mock_poll_response(
+            result={"content": "hi"},
+        )
+
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hi")],
+        )
+        response = await client.complete(params)
+        assert response.usage.input_tokens == 0
+        assert response.usage.output_tokens == 0
+        assert response.usage.cost == 0.0
+
+    @pytest.mark.asyncio
     async def test_no_model_omits_field(self):
         """Should omit model/machine from submission when not specified."""
         client = DispatchClient(poll_interval=0.01)

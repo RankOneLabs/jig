@@ -16,6 +16,7 @@ from jig.core.types import (
     Usage,
 )
 from jig.llm._parsing import parse_tool_arguments
+from jig.llm.pricing import stamp_cost
 
 try:
     import openai
@@ -126,13 +127,15 @@ class OpenAIClient(LLMClient):
                 for tc in choice.tool_calls
             ]
 
+        usage = Usage(
+            input_tokens=response.usage.prompt_tokens,
+            output_tokens=response.usage.completion_tokens,
+        )
+        stamp_cost(usage, response.model)
         return LLMResponse(
             content=choice.content or "",
             tool_calls=tool_calls,
-            usage=Usage(
-                input_tokens=response.usage.prompt_tokens,
-                output_tokens=response.usage.completion_tokens,
-            ),
+            usage=usage,
             latency_ms=latency_ms,
             model=response.model,
         )
