@@ -11,6 +11,8 @@ class ToolRegistry:
         tools: list[Tool] | None = None,
         execute_timeout: float | None = None,
     ):
+        if execute_timeout is not None and execute_timeout <= 0:
+            raise ValueError(f"execute_timeout must be > 0 when provided, got {execute_timeout}")
         self._tools: dict[str, Tool] = {}
         self._execute_timeout = execute_timeout
         for tool in tools or []:

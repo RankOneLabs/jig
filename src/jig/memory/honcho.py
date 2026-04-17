@@ -57,18 +57,22 @@ class HonchoMemory(AgentMemory):
                 user_id=self._user_id,
                 name=self._collection_name,
             )
-        except Exception as e:
-            logger.warning("Honcho collection lookup failed (collection_name=%r): %s", self._collection_name, e, exc_info=False)
+            results = await self._client.apps.users.collections.documents.query(
+                app_id=self._app_id,
+                user_id=self._user_id,
+                collection_id=collection.id,
+                query=query,
+                top_k=limit,
+                filter=filter or {},
+            )
+        except Exception:
+            logger.warning(
+                "Honcho query failed (collection_name=%r)",
+                self._collection_name,
+                exc_info=True,
+            )
             return []
 
-        results = await self._client.apps.users.collections.documents.query(
-            app_id=self._app_id,
-            user_id=self._user_id,
-            collection_id=collection.id,
-            query=query,
-            top_k=limit,
-            filter=filter or {},
-        )
         return [
             MemoryEntry(
                 id=str(doc.id),
@@ -86,8 +90,8 @@ class HonchoMemory(AgentMemory):
                 user_id=self._user_id,
                 session_id=session_id,
             )
-        except Exception as e:
-            logger.warning("Honcho session lookup failed (session_id=%s): %s", session_id, e, exc_info=False)
+        except Exception:
+            logger.warning("Honcho session lookup failed (session_id=%s)", session_id, exc_info=True)
             return []
 
         return [

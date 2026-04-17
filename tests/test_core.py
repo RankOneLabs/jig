@@ -283,6 +283,15 @@ async def test_tool_registry_error_handling():
     assert result.error == "boom"
 
 
+def test_tool_registry_rejects_non_positive_timeout():
+    import pytest
+
+    with pytest.raises(ValueError, match="must be > 0"):
+        ToolRegistry(execute_timeout=0)
+    with pytest.raises(ValueError, match="must be > 0"):
+        ToolRegistry(execute_timeout=-1.5)
+
+
 async def test_tool_registry_execute_timeout():
     class SlowTool(Tool):
         @property

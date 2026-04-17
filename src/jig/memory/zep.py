@@ -50,8 +50,8 @@ class ZepMemory(AgentMemory):
         sid = session_id or self._default_session_id
         try:
             results = await self._client.memory.search(sid, query, limit=limit)
-        except Exception as e:
-            logger.warning("Zep search failed (session_id=%s): %s", sid, e, exc_info=False)
+        except Exception:
+            logger.warning("Zep search failed (session_id=%s)", sid, exc_info=True)
             return []
 
         return [
@@ -67,8 +67,8 @@ class ZepMemory(AgentMemory):
     async def get_session(self, session_id: str) -> list[Message]:
         try:
             memory = await self._client.memory.get(session_id)
-        except Exception as e:
-            logger.warning("Zep session lookup failed (session_id=%s): %s", session_id, e, exc_info=False)
+        except Exception:
+            logger.warning("Zep session lookup failed (session_id=%s)", session_id, exc_info=True)
             return []
 
         messages: list[Message] = []
