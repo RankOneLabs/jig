@@ -15,6 +15,7 @@ from jig.core.types import (
     ToolDefinition,
     Usage,
 )
+from jig.llm._parsing import parse_tool_arguments
 
 try:
     import openai
@@ -121,7 +122,7 @@ class OpenAIClient(LLMClient):
                 ToolCall(
                     id=tc.id,
                     name=tc.function.name,
-                    arguments=json.loads(tc.function.arguments),
+                    arguments=parse_tool_arguments(tc.function.arguments, "openai"),
                 )
                 for tc in choice.tool_calls
             ]

@@ -15,6 +15,7 @@ from jig.core.types import (
     ToolDefinition,
     Usage,
 )
+from jig.llm._parsing import parse_tool_arguments
 
 try:
     import ollama as _ollama
@@ -100,7 +101,7 @@ class OllamaClient(LLMClient):
                     ToolCall(
                         id=str(uuid.uuid4()),
                         name=tc["function"]["name"],
-                        arguments=tc["function"]["arguments"],
+                        arguments=parse_tool_arguments(tc["function"]["arguments"], "ollama"),
                     )
                     for tc in raw_calls
                 ]
