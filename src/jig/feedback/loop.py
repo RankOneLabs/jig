@@ -8,6 +8,7 @@ from typing import Any
 import aiosqlite
 import numpy as np
 
+from jig._embed import ollama_embed
 from jig.core.types import (
     EvalCase,
     FeedbackLoop,
@@ -15,11 +16,6 @@ from jig.core.types import (
     ScoreSource,
     ScoredResult,
 )
-
-try:
-    from ollama import AsyncClient as OllamaAsyncClient
-except ImportError:
-    OllamaAsyncClient = None  # type: ignore[assignment, misc]
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS results (
@@ -62,11 +58,7 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         return self._db
 
     async def _embed(self, text: str) -> np.ndarray:
-        if OllamaAsyncClient is None:
-            raise ImportError("Install ollama: pip install 'jig[ollama]'")
-        client = OllamaAsyncClient(host=self._ollama_host)
-        response = await client.embed(model=self._embed_model, input=text)
-        return np.array(response["embeddings"][0], dtype=np.float32)
+        return await ollama_embed(text, self._embed_model, self._ollama_host)
 
     async def store_result(
         self,

@@ -114,8 +114,6 @@ class AnthropicClient(LLMClient):
         try:
             response = await with_retry(_call, max_attempts=3, retryable=_retryable)
         except Exception as e:
-            if anthropic and isinstance(e, anthropic.AuthenticationError):
-                raise
             status = getattr(e, "status_code", None)
             raise JigLLMError(str(e), "anthropic", status_code=status) from e
 
