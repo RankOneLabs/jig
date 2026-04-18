@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
 import time
 from dataclasses import dataclass
@@ -37,8 +38,15 @@ _MAX_LLM_RETRIES = 3
 SUBMIT_OUTPUT_TOOL = "submit_output"
 
 
-@dataclass
+@dataclass(frozen=True, kw_only=True)
 class AgentConfig[T]:
+    """Immutable agent configuration.
+
+    Keyword-only construction. Frozen so configs can be shared across
+    concurrent runs without aliasing bugs. Derive variants with
+    :meth:`with_` rather than mutating — the generic ``T`` is preserved.
+    """
+
     name: str
     description: str
     system_prompt: str | Callable[[], str | Awaitable[str]]
@@ -69,6 +77,40 @@ class AgentConfig[T]:
     # ``AgentResult.parsed`` as None.
     output_schema: type[T] | None = None
     max_parse_retries: int = 2
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("AgentConfig.name must be non-empty.")
+        if self.max_tool_calls <= 0:
+            raise ValueError(
+                f"max_tool_calls must be positive, got {self.max_tool_calls}."
+            )
+        if self.max_llm_calls <= 0:
+            raise ValueError(
+                f"max_llm_calls must be positive, got {self.max_llm_calls}."
+            )
+        if self.max_llm_retries <= 0:
+            raise ValueError(
+                f"max_llm_retries must be positive, got {self.max_llm_retries}."
+            )
+        if self.max_parse_retries < 0:
+            raise ValueError(
+                f"max_parse_retries must be non-negative, got {self.max_parse_retries}."
+            )
+
+    def with_(self, **overrides: Any) -> AgentConfig[T]:
+        """Return a new config with the given fields replaced.
+
+        Preserves the generic parameter ``T`` so typed configs stay typed
+        across variants::
+
+            base = AgentConfig[StrategyOutput](..., grader=explore_grader)
+            refined = base.with_(model=..., max_tool_calls=15, grader=strict_grader)
+
+        Any unknown field names raise ``TypeError`` (from ``dataclasses.replace``);
+        ``__post_init__`` validation runs on the new instance.
+        """
+        return dataclasses.replace(self, **overrides)
 
 
 @dataclass
