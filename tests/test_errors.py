@@ -350,13 +350,13 @@ class TestAgentResultError:
         # calls cap is lower.
         assert isinstance(result.error, AgentMaxLLMCallsError)
 
-    async def test_non_retryable_llm_error_terminates_fast(self):
-        """retryable=False → one attempt, AgentLLMPermanentError, no retry burn."""
+    async def test_permanent_status_terminates_fast(self):
+        """status_code in permanent set → one attempt, AgentLLMPermanentError."""
         err = JigLLMError(
             "invalid api key", "anthropic", status_code=401, retryable=False,
         )
-        # Buffer many retries; if the runner ignored retryable it would
-        # consume several before hitting max_llm_retries
+        # Buffer many retries; if the runner ignored the permanent signal
+        # it would consume several before hitting max_llm_retries
         llm = FakeLLM([err] * 5)
         result = await run_agent(
             _config(llm, max_llm_retries=5, max_llm_calls=10),
@@ -368,6 +368,37 @@ class TestAgentResultError:
         assert result.error.status_code == 401
         # Only one attempt was made — budget preserved
         assert result.usage["llm_calls"] == 1
+
+    async def test_transient_500_does_not_fast_fail(self):
+        """500 with retryable=False should still use the retry path.
+
+        Locks in the fix for the case where adapters conservatively default
+        retryable=False on unknown server errors. We must NOT treat every
+        non-retryable error as permanent — only known-permanent status codes
+        (auth/bad-request/not-found) trigger the fast-fail path.
+        """
+        err = JigLLMError(
+            "internal server error", "fake", status_code=500, retryable=False,
+        )
+        ok = LLMResponse(content="ok", tool_calls=None, usage=Usage(1, 1), latency_ms=1, model="fake")
+        # If runner fast-failed on 500, it would terminate after 1 call.
+        # Correct behavior: retry and succeed on the 3rd attempt.
+        llm = FakeLLM([err, err, ok])
+        result = await run_agent(_config(llm, max_llm_retries=5), "go")
+
+        assert result.error is None
+        assert result.output == "ok"
+        assert result.usage["llm_calls"] == 3
+
+    async def test_unknown_error_without_status_uses_retry_path(self):
+        """status_code=None → retry path, not fast-fail."""
+        err = JigLLMError("generic failure", "fake", retryable=False)
+        ok = LLMResponse(content="ok", tool_calls=None, usage=Usage(1, 1), latency_ms=1, model="fake")
+        llm = FakeLLM([err, ok])
+        result = await run_agent(_config(llm, max_llm_retries=5), "go")
+
+        assert result.error is None
+        assert result.usage["llm_calls"] == 2
 
     async def test_retryable_llm_error_uses_retry_path(self):
         """retryable=True preserves existing consecutive-retries behavior."""

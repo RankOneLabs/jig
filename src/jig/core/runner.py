@@ -46,6 +46,15 @@ _MAX_LLM_RETRIES = 3
 # against the schema to produce AgentResult.parsed.
 SUBMIT_OUTPUT_TOOL = "submit_output"
 
+# HTTP status codes that indicate a definitely-permanent LLM failure.
+# 400 / 422 — malformed request; 401 / 403 — auth problem; 404 — bad
+# model or endpoint. Retrying these is pure budget burn — fail fast.
+# Unknown errors (status_code=None) and transient server errors (5xx)
+# continue to use the existing max_llm_retries retry path: we only
+# want to short-circuit when we're confident the next call would fail
+# identically.
+_PERMANENT_LLM_STATUS_CODES = frozenset({400, 401, 403, 404, 422})
+
 
 @dataclass(frozen=True, kw_only=True)
 class AgentConfig[T]:
@@ -297,18 +306,22 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                 response = await config.llm.complete(params)
             except JigLLMError as e:
                 config.tracer.end_span(llm_span.id, None, error=str(e))
-                # Honor the adapter's retryability signal. Permanent failures
-                # (auth, bad model config) shouldn't burn the retry budget or
-                # be misclassified as "max retries exceeded" — terminate fast
-                # with the original provider error.
-                if not e.retryable:
+                # Fast-fail only on known-permanent errors (auth, bad
+                # request, not-found). Unknown errors and 5xx go through
+                # the retry path — adapters default `retryable=False`
+                # broadly, so reading that flag would collapse transient
+                # server errors into immediate termination.
+                if e.status_code in _PERMANENT_LLM_STATUS_CODES:
                     agent_error = AgentLLMPermanentError(
                         provider=e.provider,
                         message=str(e),
                         status_code=e.status_code,
                     )
                     final_output = f"[agent terminated: {agent_error}]"
-                    logger.warning("Non-retryable LLM error; terminating: %s", e)
+                    logger.warning(
+                        "Permanent LLM error (status %s); terminating: %s",
+                        e.status_code, e,
+                    )
                     break
                 consecutive_llm_errors += 1
                 logger.warning(
