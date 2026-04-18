@@ -488,7 +488,14 @@ class TestFailClosedOnPlainText:
             "go",
         )
 
+        from jig import AgentSchemaNotCalledError
+
         assert result.parsed is None
-        # Must be the deterministic marker, not any of the free-form responses
-        assert "retry budget" in result.output
+        # Structured termination reason — the API surface callers should
+        # branch on rather than parsing the output string.
+        assert isinstance(result.error, AgentSchemaNotCalledError)
+        assert result.error.retries == 2
+        # Marker is kept for backward-compat debugging; the model's last
+        # free-form content must not leak through.
+        assert "agent terminated" in result.output
         assert "free form" not in result.output

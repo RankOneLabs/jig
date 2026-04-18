@@ -249,6 +249,16 @@ class TracingLogger(ABC):
         name: str | None = None,
     ) -> list[Span]: ...
 
+    async def flush(self) -> None:
+        """Flush any buffered spans to the backing store.
+
+        Default is a no-op. Backends that buffer writes (notably
+        :class:`SQLiteTracer`) should override this. Safe for callers to
+        invoke on any tracer — ``run_agent`` always calls it at the end
+        of a run.
+        """
+        return None
+
 
 class Tool(ABC):
     @property
