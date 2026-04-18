@@ -5,6 +5,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
+from pydantic import BaseModel, ValidationError
+
 from jig.core.errors import JigLLMError
 from jig.core.prompt import build_system_message
 from jig.core.types import (
@@ -19,6 +21,8 @@ from jig.core.types import (
     Score,
     ScoredResult,
     SpanKind,
+    ToolCall,
+    ToolDefinition,
     TracingLogger,
 )
 from jig.tools.registry import ToolRegistry
@@ -27,9 +31,14 @@ logger = logging.getLogger(__name__)
 
 _MAX_LLM_RETRIES = 3
 
+# Reserved tool name the runner injects when output_schema is set. The agent
+# loop terminates when the model calls this tool; its arguments are validated
+# against the schema to produce AgentResult.parsed.
+SUBMIT_OUTPUT_TOOL = "submit_output"
+
 
 @dataclass
-class AgentConfig:
+class AgentConfig[T]:
     name: str
     description: str
     system_prompt: str | Callable[[], str | Awaitable[str]]
@@ -40,25 +49,67 @@ class AgentConfig:
     tracer: TracingLogger
     tools: ToolRegistry
 
-    grader: Grader | None = None
+    grader: Grader[T] | Grader[str] | None = None
     max_tool_calls: int = 10
     max_llm_retries: int = _MAX_LLM_RETRIES
     include_memory_in_prompt: bool = True
     include_feedback_in_prompt: bool = True
     session_id: str | None = None
 
+    # --- Structured output ---
+    # Pydantic model the agent should produce. When set, the runner injects a
+    # ``submit_output`` tool with the model's JSON schema; the loop ends when
+    # the model calls it. Invalid args trigger a retry up to
+    # ``max_parse_retries`` times before the loop gives up and leaves
+    # ``AgentResult.parsed`` as None.
+    output_schema: type[T] | None = None
+    max_parse_retries: int = 2
+
 
 @dataclass
-class AgentResult:
+class AgentResult[T]:
     output: str
     trace_id: str
     usage: dict[str, Any]
     scores: list[Score] | None
     duration_ms: float
+    parsed: T | None = None
 
 
-async def run_agent(config: AgentConfig, input: str) -> AgentResult:
+def _validate_output_schema(schema: type) -> None:
+    if not (isinstance(schema, type) and issubclass(schema, BaseModel)):
+        raise TypeError(
+            f"output_schema must be a pydantic BaseModel subclass, got {schema!r}"
+        )
+
+
+def _build_submit_output_tool(schema: type[BaseModel]) -> ToolDefinition:
+    return ToolDefinition(
+        name=SUBMIT_OUTPUT_TOOL,
+        description=(
+            "Submit your final answer. Call this exactly once when you have "
+            "your result — do not produce a free-form text response as your "
+            "final answer."
+        ),
+        parameters=schema.model_json_schema(),
+    )
+
+
+def _append_schema_instruction(system_message: str) -> str:
+    return (
+        f"{system_message}\n\n"
+        f"When you have your final answer, call the `{SUBMIT_OUTPUT_TOOL}` "
+        f"tool with your result matching the provided schema. Do not produce "
+        f"a free-form text response as your final answer — always finish by "
+        f"calling `{SUBMIT_OUTPUT_TOOL}`."
+    )
+
+
+async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
     start = time.time()
+
+    if config.output_schema is not None:
+        _validate_output_schema(config.output_schema)
 
     # 1. Start trace
     trace = config.tracer.start_trace(config.name, {"input": input}, kind=SpanKind.AGENT_RUN)
@@ -90,11 +141,20 @@ async def run_agent(config: AgentConfig, input: str) -> AgentResult:
 
     # 5. Assemble messages (system prompt is separate, not in messages list)
     system_message = build_system_message(system_prompt, memory_context, feedback_signals)
+    if config.output_schema is not None:
+        system_message = _append_schema_instruction(system_message)
     messages: list[Message] = []
     if config.session_id:
         history = await config.memory.get_session(config.session_id)
         messages.extend(history)
     messages.append(Message(role=Role.USER, content=input))
+
+    # Build the tool list — user tools + submit_output when a schema is set.
+    user_tools = config.tools.list()
+    extra_tools: list[ToolDefinition] = []
+    if config.output_schema is not None:
+        extra_tools.append(_build_submit_output_tool(config.output_schema))
+    tools_for_llm = (user_tools + extra_tools) or None
 
     # 6. LLM call + tool loop
     total_usage: dict[str, Any] = {
@@ -106,14 +166,16 @@ async def run_agent(config: AgentConfig, input: str) -> AgentResult:
     }
     tool_call_count = 0
     consecutive_llm_errors = 0
+    parse_retries = 0
     final_output = ""
+    parsed: T | None = None
 
     while True:
         llm_span = config.tracer.start_span(trace.id, SpanKind.LLM_CALL, "completion")
         params = CompletionParams(
             messages=messages,
             system=system_message,
-            tools=config.tools.list() or None,
+            tools=tools_for_llm,
         )
 
         try:
@@ -147,11 +209,112 @@ async def run_agent(config: AgentConfig, input: str) -> AgentResult:
         total_usage["total_cost"] += response.usage.cost or 0.0
         total_usage["llm_calls"] += 1
 
+        # --- Structured-output termination path ---
+        # When a schema is set, the model must call submit_output to finish.
+        # If it's present in this turn's tool calls, try to validate.
+        submit_call: ToolCall | None = None
+        if config.output_schema is not None and response.tool_calls:
+            for call in response.tool_calls:
+                if call.name == SUBMIT_OUTPUT_TOOL:
+                    submit_call = call
+                    break
+
+        if submit_call is not None:
+            extract_span = config.tracer.start_span(
+                trace.id,
+                SpanKind.TOOL_CALL,
+                SUBMIT_OUTPUT_TOOL,
+                submit_call.arguments,
+            )
+            try:
+                parsed = config.output_schema.model_validate(submit_call.arguments)  # type: ignore[union-attr]
+            except ValidationError as ve:
+                parse_retries += 1
+                config.tracer.end_span(extract_span.id, None, error=str(ve))
+                logger.info(
+                    "submit_output validation failed (%d/%d): %s",
+                    parse_retries, config.max_parse_retries, ve,
+                )
+                # Record the assistant's attempt and feed the validation
+                # errors back so the model can correct. Do not execute any
+                # other tools in this turn — the model is in retry mode.
+                messages.append(
+                    Message(
+                        role=Role.ASSISTANT,
+                        content=response.content,
+                        tool_calls=response.tool_calls,
+                    )
+                )
+                # Every tool call in this turn must receive a response
+                # (providers reject assistant-with-tool_calls followed by
+                # user text without matching tool messages in between).
+                for call in response.tool_calls:
+                    if call.name == SUBMIT_OUTPUT_TOOL:
+                        content = (
+                            f"Validation failed: {ve.error_count()} error(s).\n"
+                            f"{ve}\n"
+                            f"Call {SUBMIT_OUTPUT_TOOL} again with corrected arguments."
+                        )
+                    else:
+                        content = (
+                            f"[skipped: submit_output retry in progress — "
+                            f"please call {SUBMIT_OUTPUT_TOOL} with valid "
+                            f"arguments]"
+                        )
+                    messages.append(
+                        Message(role=Role.TOOL, content=content, tool_call_id=call.id)
+                    )
+                if parse_retries > config.max_parse_retries:
+                    final_output = (
+                        f"[agent terminated: submit_output validation failed "
+                        f"{parse_retries} times, last error: {ve}]"
+                    )
+                    break
+                continue
+
+            # Validation succeeded — finalize.
+            config.tracer.end_span(extract_span.id, submit_call.arguments)
+            final_output = parsed.model_dump_json()
+            messages.append(
+                Message(
+                    role=Role.ASSISTANT,
+                    content=response.content,
+                    tool_calls=response.tool_calls,
+                )
+            )
+            break
+
+        # --- Plain-text termination path (no schema, or schema set but model
+        # didn't call submit_output this turn). ---
         if not response.tool_calls:
+            if config.output_schema is not None:
+                # Model ignored the schema instruction. Nudge and retry, up
+                # to max_parse_retries attempts.
+                parse_retries += 1
+                if parse_retries > config.max_parse_retries:
+                    final_output = response.content or (
+                        "[agent terminated: model did not call "
+                        f"{SUBMIT_OUTPUT_TOOL} within retry budget]"
+                    )
+                    break
+                messages.append(
+                    Message(role=Role.ASSISTANT, content=response.content)
+                )
+                messages.append(
+                    Message(
+                        role=Role.USER,
+                        content=(
+                            f"You must call the `{SUBMIT_OUTPUT_TOOL}` tool "
+                            f"with your final answer. Do not respond with "
+                            f"plain text."
+                        ),
+                    )
+                )
+                continue
             final_output = response.content
             break
 
-        # Execute tool calls
+        # --- Execute user-tool calls (no submit_output in this turn). ---
         messages.append(
             Message(
                 role=Role.ASSISTANT,
@@ -205,13 +368,18 @@ async def run_agent(config: AgentConfig, input: str) -> AgentResult:
             config.session_id, Message(role=Role.ASSISTANT, content=final_output)
         )
 
-    # 8. Auto-grade
+    # 8. Auto-grade — pass parsed output when available, raw otherwise.
+    # Graders that want the raw string even when parsed is present can read
+    # it from context["raw_output"].
     scores: list[Score] | None = None
     if config.grader:
         grade_span = config.tracer.start_span(
             trace.id, SpanKind.GRADING, "auto_grade", {"input": input}
         )
-        scores = await config.grader.grade(input, final_output)
+        grade_output: Any = parsed if parsed is not None else final_output
+        scores = await config.grader.grade(
+            input, grade_output, context={"raw_output": final_output}
+        )
         await config.feedback.score(result_id, scores)
         config.tracer.end_span(
             grade_span.id, [{"dim": s.dimension, "val": s.value} for s in scores]
@@ -228,4 +396,5 @@ async def run_agent(config: AgentConfig, input: str) -> AgentResult:
         usage=total_usage,
         scores=scores,
         duration_ms=duration,
+        parsed=parsed,
     )

@@ -204,12 +204,21 @@ class FeedbackLoop(ABC):
     ) -> list[EvalCase]: ...
 
 
-class Grader(ABC):
+class Grader[T](ABC):
+    """Score an agent output along one or more dimensions.
+
+    Parameterized over ``T``: the type of ``output`` passed to :meth:`grade`.
+    When an agent declares ``output_schema=MyModel``, ``T`` is ``MyModel`` and
+    graders receive a validated pydantic instance. Without a schema, ``T`` is
+    ``str`` (the raw final content). Graders that want the raw string even
+    when a schema is set can read it from ``context["raw_output"]``.
+    """
+
     @abstractmethod
     async def grade(
         self,
         input: Any,
-        output: Any,
+        output: T,
         context: dict[str, Any] | None = None,
     ) -> list[Score]: ...
 
