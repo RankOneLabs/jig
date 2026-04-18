@@ -24,7 +24,7 @@ from jig import (
     Usage,
     run_agent,
 )
-from jig.core.types import AgentMemory, FeedbackLoop, Grader, LLMClient, Tool, TracingLogger
+from jig.core.types import FeedbackLoop, Grader, LLMClient, MemoryStore, Retriever, Tool, TracingLogger
 from jig.tools import ToolRegistry
 
 
@@ -42,7 +42,10 @@ class FakeLLM(LLMClient):
         return resp
 
 
-class FakeMemory(AgentMemory):
+class FakeMemory(MemoryStore, Retriever):
+    """Combined fake — implements both protocols since tests usually
+    pass the same instance as both ``store=`` and ``retriever=``."""
+
     def __init__(self) -> None:
         self.stored: list[tuple[str, dict]] = []
         self.sessions: dict[str, list[Message]] = {}
@@ -51,7 +54,16 @@ class FakeMemory(AgentMemory):
         self.stored.append((content, metadata or {}))
         return f"mem-{len(self.stored)}"
 
-    async def query(self, query: str, limit: int = 5, filter: dict[str, Any] | None = None, session_id: str | None = None) -> list[MemoryEntry]:
+    async def get(self, id: str) -> MemoryEntry | None:
+        return None
+
+    async def all(self) -> list[MemoryEntry]:
+        return []
+
+    async def delete(self, id: str) -> None:
+        pass
+
+    async def retrieve(self, query: str, k: int = 5, context: dict[str, Any] | None = None) -> list[MemoryEntry]:
         return []
 
     async def get_session(self, session_id: str) -> list[Message]:
@@ -139,7 +151,7 @@ async def test_simple_completion():
             description="test agent",
             system_prompt="You are a test agent.",
             llm=llm,
-            memory=FakeMemory(),
+            store=FakeMemory(), retriever=None,
             feedback=FakeFeedback(),
             tracer=tracer,
             tools=ToolRegistry(),
@@ -176,7 +188,7 @@ async def test_tool_loop():
             description="test agent",
             system_prompt="You are a test agent.",
             llm=llm,
-            memory=FakeMemory(),
+            store=FakeMemory(), retriever=None,
             feedback=FakeFeedback(),
             tracer=FakeTracer(),
             tools=ToolRegistry([EchoTool()]),
@@ -206,7 +218,7 @@ async def test_max_tool_calls_enforced():
             description="test agent",
             system_prompt="test",
             llm=llm,
-            memory=FakeMemory(),
+            store=FakeMemory(), retriever=None,
             feedback=FakeFeedback(),
             tracer=FakeTracer(),
             tools=ToolRegistry([EchoTool()]),
@@ -241,7 +253,7 @@ async def test_max_llm_calls_caps_unbounded_tool_loop():
             description="runaway",
             system_prompt="test",
             llm=llm,
-            memory=FakeMemory(),
+            store=FakeMemory(), retriever=None,
             feedback=FakeFeedback(),
             tracer=FakeTracer(),
             tools=ToolRegistry([EchoTool()]),
@@ -267,7 +279,8 @@ async def test_session_persistence():
             description="test agent",
             system_prompt="test",
             llm=llm,
-            memory=memory,
+            store=memory,
+            retriever=memory,
             feedback=FakeFeedback(),
             tracer=FakeTracer(),
             tools=ToolRegistry(),
@@ -295,7 +308,7 @@ async def test_auto_grading():
             description="test agent",
             system_prompt="test",
             llm=llm,
-            memory=FakeMemory(),
+            store=FakeMemory(), retriever=None,
             feedback=feedback,
             tracer=FakeTracer(),
             tools=ToolRegistry(),

@@ -4,7 +4,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from jig.core.types import AgentMemory, MemoryEntry, Message, Role
+from jig.core.types import MemoryEntry, MemoryStore, Message, Retriever, Role
 
 try:
     from honcho import AsyncHoncho
@@ -14,7 +14,13 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-class HonchoMemory(AgentMemory):
+class HonchoMemory(MemoryStore, Retriever):
+    """Honcho-backed memory. Implements both ``MemoryStore`` and
+    ``Retriever`` — the managed service owns retrieval, so the split
+    collapses into one object. Instantiate once and pass to both
+    ``store=`` and ``retriever=`` fields of :class:`AgentConfig`.
+    """
+
     def __init__(
         self,
         app_id: str,
@@ -44,13 +50,41 @@ class HonchoMemory(AgentMemory):
         )
         return str(doc.id)
 
-    async def query(
+    async def get(self, id: str) -> MemoryEntry | None:
+        try:
+            doc = await self._client.apps.users.collections.documents.get(
+                app_id=self._app_id,
+                user_id=self._user_id,
+                document_id=id,
+            )
+        except Exception:
+            logger.warning("Honcho get failed (id=%s)", id, exc_info=True)
+            return None
+        return MemoryEntry(id=str(doc.id), content=doc.content, metadata=doc.metadata or {})
+
+    async def all(self) -> list[MemoryEntry]:
+        # Honcho doesn't expose a cheap "list everything" — return empty
+        # rather than paging through the whole collection. Callers that
+        # need iteration should use a MemoryStore backend that supports it.
+        return []
+
+    async def delete(self, id: str) -> None:
+        try:
+            await self._client.apps.users.collections.documents.delete(
+                app_id=self._app_id,
+                user_id=self._user_id,
+                document_id=id,
+            )
+        except Exception:
+            logger.warning("Honcho delete failed (id=%s)", id, exc_info=True)
+
+    async def retrieve(
         self,
         query: str,
-        limit: int = 5,
-        filter: dict[str, Any] | None = None,
-        session_id: str | None = None,
+        k: int = 5,
+        context: dict[str, Any] | None = None,
     ) -> list[MemoryEntry]:
+        filter_ = (context or {}).get("filter")
         try:
             collection = await self._client.apps.users.collections.get_by_name(
                 app_id=self._app_id,
@@ -62,8 +96,8 @@ class HonchoMemory(AgentMemory):
                 user_id=self._user_id,
                 collection_id=collection.id,
                 query=query,
-                top_k=limit,
-                filter=filter or {},
+                top_k=k,
+                filter=filter_ or {},
             )
         except Exception:
             logger.warning(

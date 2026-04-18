@@ -182,19 +182,29 @@ class LLMClient(ABC):
         return None
 
 
-class AgentMemory(ABC):
+class MemoryStore(ABC):
+    """Storage for agent memory entries and session history.
+
+    Retrieval strategy is a separate concern — see :class:`Retriever`.
+    Backends where storage and retrieval are inseparable (a managed
+    service, for instance) can implement both protocols on one class.
+    """
+
     @abstractmethod
     async def add(self, content: str, metadata: dict[str, Any] | None = None) -> str: ...
 
     @abstractmethod
-    async def query(
-        self,
-        query: str,
-        limit: int = 5,
-        filter: dict[str, Any] | None = None,
-        session_id: str | None = None,
-    ) -> list[MemoryEntry]: ...
+    async def get(self, id: str) -> MemoryEntry | None: ...
 
+    @abstractmethod
+    async def all(self) -> list[MemoryEntry]: ...
+
+    @abstractmethod
+    async def delete(self, id: str) -> None: ...
+
+    # Session history. Pragmatically lives on the store since sessions
+    # and memory entries share a backing resource in every concrete
+    # implementation we have.
     @abstractmethod
     async def get_session(self, session_id: str) -> list[Message]: ...
 
@@ -203,6 +213,25 @@ class AgentMemory(ABC):
 
     @abstractmethod
     async def clear(self, session_id: str | None = None, before: datetime | None = None) -> None: ...
+
+
+class Retriever(ABC):
+    """Swappable retrieval strategy — the axis sweeps iterate over.
+
+    Dense vectors, BM25, hybrid, reranking — all slot in here. Can be
+    composed (``RerankingRetriever(HybridRetriever(...))``) or wrap a
+    managed service that owns both storage and retrieval. Every call
+    produces a :attr:`SpanKind.MEMORY_QUERY` span in the trace with
+    the query and retrieved-id scores.
+    """
+
+    @abstractmethod
+    async def retrieve(
+        self,
+        query: str,
+        k: int = 5,
+        context: dict[str, Any] | None = None,
+    ) -> list[MemoryEntry]: ...
 
 
 class FeedbackLoop(ABC):

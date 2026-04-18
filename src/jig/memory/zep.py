@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from jig.core.types import AgentMemory, MemoryEntry, Message, Role
+from jig.core.types import MemoryEntry, MemoryStore, Message, Retriever, Role
 
 try:
     from zep_python.client import AsyncZep
@@ -18,7 +18,13 @@ _ROLE_TO_ZEP = {Role.USER: "human", Role.ASSISTANT: "ai", Role.TOOL: "tool"}
 _ZEP_TO_ROLE = {"human": Role.USER, "ai": Role.ASSISTANT, "tool": Role.TOOL}
 
 
-class ZepMemory(AgentMemory):
+class ZepMemory(MemoryStore, Retriever):
+    """Zep-backed memory. Implements both ``MemoryStore`` and ``Retriever``
+    — Zep's service couples storage and retrieval. Instantiate once and
+    pass to both ``store=`` and ``retriever=`` fields of
+    :class:`AgentConfig`.
+    """
+
     def __init__(self, session_id: str, **client_kwargs: Any):
         if AsyncZep is None:
             raise ImportError("Install zep: pip install 'jig[zep]'")
@@ -40,16 +46,29 @@ class ZepMemory(AgentMemory):
         )
         return entry_id
 
-    async def query(
+    async def get(self, id: str) -> MemoryEntry | None:
+        # Zep stores messages, not discrete entries with IDs — return
+        # None; use retrieve() for lookup.
+        return None
+
+    async def all(self) -> list[MemoryEntry]:
+        # Zep doesn't expose cheap full-collection iteration.
+        return []
+
+    async def delete(self, id: str) -> None:
+        # No per-entry delete in Zep's message model; clear() operates
+        # at the session level.
+        return None
+
+    async def retrieve(
         self,
         query: str,
-        limit: int = 5,
-        filter: dict[str, Any] | None = None,
-        session_id: str | None = None,
+        k: int = 5,
+        context: dict[str, Any] | None = None,
     ) -> list[MemoryEntry]:
-        sid = session_id or self._default_session_id
+        sid = (context or {}).get("session_id") or self._default_session_id
         try:
-            results = await self._client.memory.search(sid, query, limit=limit)
+            results = await self._client.memory.search(sid, query, limit=k)
         except Exception:
             logger.warning("Zep search failed (session_id=%s)", sid, exc_info=True)
             return []

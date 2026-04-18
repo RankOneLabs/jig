@@ -10,7 +10,8 @@ from pydantic import BaseModel
 
 from jig import AgentConfig, LLMResponse, Message, Score, ScoreSource
 from jig.core.types import (
-    AgentMemory,
+    MemoryStore,
+    Retriever,
     CompletionParams,
     FeedbackLoop,
     Grader,
@@ -30,9 +31,12 @@ class _FakeLLM(LLMClient):
         raise NotImplementedError
 
 
-class _FakeMemory(AgentMemory):
+class _FakeMemory(MemoryStore, Retriever):
     async def add(self, content, metadata=None): return "m"
-    async def query(self, query, limit=5, filter=None, session_id=None): return []
+    async def get(self, id): return None
+    async def all(self): return []
+    async def delete(self, id): pass
+    async def retrieve(self, query, k=5, context=None): return []
     async def get_session(self, session_id): return []
     async def add_to_session(self, session_id, message): pass
     async def clear(self, session_id=None, before=None): pass
@@ -63,7 +67,7 @@ def _base(**overrides: Any) -> AgentConfig:
         description="base agent",
         system_prompt="be helpful",
         llm=_FakeLLM(),
-        memory=_FakeMemory(),
+        store=_FakeMemory(), retriever=None,
         feedback=_FakeFeedback(),
         tracer=_FakeTracer(),
         tools=ToolRegistry(),
@@ -85,7 +89,8 @@ class TestWith:
         variant = base.with_(max_tool_calls=30)
         assert variant.system_prompt == "original prompt"
         assert variant.llm is base.llm
-        assert variant.memory is base.memory
+        assert variant.store is base.store
+        assert variant.retriever is base.retriever
 
     def test_overrides_multiple_fields(self):
         base = _base()
