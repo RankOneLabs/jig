@@ -46,6 +46,17 @@ from jig.core.types import TraceContext
 from jig.dispatch import DispatchError, JobTimeoutError
 from jig.dispatch import run as dispatch_run
 from jig.llm.factory import complete, from_model
+from jig.replay import (
+    ReplayConfigMissingError,
+    ReplayError,
+    ReplayMissError,
+    ReplaySchemaMismatchError,
+    TraceDiff,
+    ToolDiff,
+    ToolEvent,
+    replay,
+    trace_diff,
+)
 from jig.sweep import (
     CompareResult,
     CompareRun,
@@ -126,4 +137,14 @@ __all__ = [
     "JobTimeoutError",
     "TraceContext",
     "dispatch_run",
+    # Replay
+    "ReplayError",
+    "ReplayConfigMissingError",
+    "ReplayMissError",
+    "ReplaySchemaMismatchError",
+    "TraceDiff",
+    "ToolDiff",
+    "ToolEvent",
+    "replay",
+    "trace_diff",
 ]
