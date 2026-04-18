@@ -8,7 +8,14 @@ from typing import Any, Awaitable, Callable
 
 from pydantic import BaseModel, ValidationError
 
-from jig.core.errors import JigLLMError
+from jig.core.errors import (
+    AgentError,
+    AgentMaxLLMCallsError,
+    AgentMaxLLMRetriesError,
+    AgentSchemaNotCalledError,
+    AgentSchemaValidationError,
+    JigLLMError,
+)
 from jig.core.prompt import build_system_message
 from jig.core.types import (
     AgentMemory,
@@ -121,6 +128,11 @@ class AgentResult[T]:
     scores: list[Score] | None
     duration_ms: float
     parsed: T | None = None
+    # Structured termination reason. ``None`` on successful completion;
+    # a typed :class:`AgentError` (one of the category-tagged subclasses)
+    # when the runner gave up. Prefer this over string-matching
+    # ``output`` for ``[agent terminated: ...]`` markers.
+    error: AgentError | None = None
 
 
 def _validate_output_schema(schema: type) -> None:
@@ -221,13 +233,12 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
     parse_retries = 0
     final_output = ""
     parsed: T | None = None
+    agent_error: AgentError | None = None
 
     while True:
         if total_usage["llm_calls"] >= config.max_llm_calls:
-            final_output = (
-                f"[agent terminated: exceeded max_llm_calls "
-                f"({config.max_llm_calls})]"
-            )
+            agent_error = AgentMaxLLMCallsError(config.max_llm_calls)
+            final_output = f"[agent terminated: {agent_error}]"
             break
 
         llm_span = config.tracer.start_span(trace.id, SpanKind.LLM_CALL, "completion")
@@ -247,7 +258,8 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                 consecutive_llm_errors, config.max_llm_retries, e,
             )
             if consecutive_llm_errors >= config.max_llm_retries:
-                final_output = f"[agent terminated: {consecutive_llm_errors} consecutive LLM errors, last: {e}]"
+                agent_error = AgentMaxLLMRetriesError(consecutive_llm_errors, str(e))
+                final_output = f"[agent terminated: {agent_error}]"
                 break
             # Inject an error message so the model can see it on next turn
             messages.append(Message(
@@ -373,10 +385,8 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                         Message(role=Role.TOOL, content=content, tool_call_id=call.id)
                     )
                 if parse_retries > config.max_parse_retries:
-                    final_output = (
-                        f"[agent terminated: submit_output validation failed "
-                        f"{parse_retries} times, last error: {ve}]"
-                    )
+                    agent_error = AgentSchemaValidationError(parse_retries, str(ve))
+                    final_output = f"[agent terminated: {agent_error}]"
                     break
                 continue
 
@@ -403,12 +413,9 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                     # Fail closed: the caller explicitly asked for a typed
                     # output, so returning the model's free-form content
                     # would make a non-compliant run look successful. Leave
-                    # parsed as None and use a deterministic failure marker
-                    # — same shape as the validation-error path.
-                    final_output = (
-                        "[agent terminated: model did not call "
-                        f"{SUBMIT_OUTPUT_TOOL} within retry budget]"
-                    )
+                    # parsed as None and attach a structured AgentError.
+                    agent_error = AgentSchemaNotCalledError(parse_retries)
+                    final_output = f"[agent terminated: {agent_error}]"
                     break
                 messages.append(
                     Message(role=Role.ASSISTANT, content=response.content)
@@ -498,9 +505,21 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
             grade_span.id, [{"dim": s.dimension, "val": s.value} for s in scores]
         )
 
-    # 9. Close trace
+    # 9. Close trace — tag the root span with the termination category so
+    # downstream queries ("how often did Haiku hit schema_not_called?") can
+    # group by it without parsing the output string.
     duration = (time.time() - start) * 1000
-    config.tracer.end_span(trace.id, {"output": final_output[:200], "scores": scores})
+    trace_output: dict[str, Any] = {
+        "output": final_output[:200],
+        "scores": scores,
+    }
+    if agent_error is not None:
+        trace_output["error_category"] = agent_error.category
+    config.tracer.end_span(
+        trace.id,
+        trace_output,
+        error=str(agent_error) if agent_error is not None else None,
+    )
     await config.tracer.flush()
 
     return AgentResult(
@@ -510,4 +529,5 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
         scores=scores,
         duration_ms=duration,
         parsed=parsed,
+        error=agent_error,
     )

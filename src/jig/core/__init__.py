@@ -1,4 +1,15 @@
-from jig.core.errors import JigBudgetError, JigError, JigLLMError, JigMemoryError, JigToolError
+from jig.core.errors import (
+    AgentError,
+    AgentMaxLLMCallsError,
+    AgentMaxLLMRetriesError,
+    AgentSchemaNotCalledError,
+    AgentSchemaValidationError,
+    JigBudgetError,
+    JigError,
+    JigLLMError,
+    JigMemoryError,
+    JigToolError,
+)
 from jig.core.pipeline import MapResult, PipelineConfig, PipelineResult, Step
 from jig.core.types import (
     AgentMemory,
@@ -30,6 +41,11 @@ __all__ = [
     "EvalCase",
     "FeedbackLoop",
     "Grader",
+    "AgentError",
+    "AgentMaxLLMCallsError",
+    "AgentMaxLLMRetriesError",
+    "AgentSchemaNotCalledError",
+    "AgentSchemaValidationError",
     "JigBudgetError",
     "JigError",
     "JigLLMError",

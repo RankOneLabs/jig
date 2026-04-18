@@ -1,6 +1,11 @@
 from jig.budget import BudgetedLLMClient, BudgetTracker
 from jig.core import (
+    AgentError,
+    AgentMaxLLMCallsError,
+    AgentMaxLLMRetriesError,
     AgentMemory,
+    AgentSchemaNotCalledError,
+    AgentSchemaValidationError,
     CompletionParams,
     EvalCase,
     FeedbackLoop,
@@ -64,6 +69,11 @@ __all__ = [
     "TracingLogger",
     "Usage",
     # Errors
+    "AgentError",
+    "AgentMaxLLMCallsError",
+    "AgentMaxLLMRetriesError",
+    "AgentSchemaNotCalledError",
+    "AgentSchemaValidationError",
     "JigBudgetError",
     "JigError",
     "JigLLMError",
