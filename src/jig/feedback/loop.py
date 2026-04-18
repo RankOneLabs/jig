@@ -174,15 +174,21 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         caller set via :meth:`store_result`'s metadata.
         """
         db = await self._get_db()
-        rows = await (await db.execute(
-            "SELECT id, content, input, metadata, embedding, created_at "
-            "FROM results ORDER BY created_at DESC"
-        )).fetchall()
 
-        # Optional age cutoff
-        cutoff = None
+        # Push max_age into SQL; JSON metadata filters stay in Python
+        # since SQLite JSON support is uneven across builds and the
+        # filter shapes are simple enough to be fast in-memory.
+        base_sql = (
+            "SELECT id, content, input, metadata, embedding, created_at "
+            "FROM results"
+        )
+        params: list[Any] = []
         if q.max_age is not None:
-            cutoff = datetime.now() - q.max_age
+            cutoff_iso = (datetime.now() - q.max_age).isoformat()
+            base_sql += " WHERE created_at >= ?"
+            params.append(cutoff_iso)
+        base_sql += " ORDER BY created_at DESC"
+        rows = await (await db.execute(base_sql, params)).fetchall()
 
         # Optional similarity ranking
         query_emb: np.ndarray | None = None
@@ -197,8 +203,6 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         candidates: list[tuple[float, str, str, dict[str, Any], datetime]] = []
         for rid, content, _inp, meta_json, emb_bytes, created_str in rows:
             created = datetime.fromisoformat(created_str)
-            if cutoff is not None and created < cutoff:
-                continue
             meta = json.loads(meta_json) if meta_json else {}
             if q.agent_name is not None and meta.get("agent_name") != q.agent_name:
                 continue
@@ -225,16 +229,41 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         # Without similarity, the initial ORDER BY created_at DESC already
         # gave us recency order.
 
+        if not candidates:
+            return []
+
+        # Pre-slice candidates before the batch fetch. Two reasons:
+        #  1. SQLite has a bound-parameter limit (commonly 999); a very
+        #     large corpus would exceed it.
+        #  2. Most of ``candidates`` past the q.limit-th will get dropped
+        #     by the min_score filter anyway, so fetching their scores
+        #     is wasted work.
+        # The factor-of-10 cushion covers min_score rejections; if the
+        # filter is aggressive enough that we undershoot q.limit, that's
+        # acceptable for v1 — properly chunking with early exit is a
+        # follow-up when corpora grow past ~100 results.
+        window = min(len(candidates), max(q.limit * 10, 50), 900)
+        candidates = candidates[:window]
+
+        # Batch-fetch scores for every surviving candidate with a single
+        # IN-list SELECT. Eliminates the per-row N+1 that would grow
+        # linearly with corpus size.
+        rids = [rid for _, rid, _, _, _ in candidates]
+        placeholders = ",".join(["?"] * len(rids))
+        score_rows = await (await db.execute(
+            f"SELECT result_id, dimension, value, source FROM scores "
+            f"WHERE result_id IN ({placeholders})",
+            rids,
+        )).fetchall()
+        scores_by_rid: dict[str, list[Score]] = {}
+        for rid, dim, val, src in score_rows:
+            scores_by_rid.setdefault(rid, []).append(
+                Score(dimension=dim, value=val, source=ScoreSource(src))
+            )
+
         results: list[ScoredResult] = []
         for _sim, rid, content, meta, created in candidates:
-            score_rows = await (await db.execute(
-                "SELECT dimension, value, source FROM scores WHERE result_id = ?",
-                (rid,),
-            )).fetchall()
-            scores = [
-                Score(dimension=d, value=v, source=ScoreSource(s))
-                for d, v, s in score_rows
-            ]
+            scores = scores_by_rid.get(rid, [])
             if not scores:
                 continue
             avg = sum(s.value for s in scores) / len(scores)
