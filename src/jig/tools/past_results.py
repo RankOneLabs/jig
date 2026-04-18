@@ -64,13 +64,31 @@ class PastResults(Tool):
 
     async def execute(self, args: dict[str, Any]) -> str:
         hypothesis = args["hypothesis"]
-        k = int(args.get("k", self._default_k))
-        min_score = args.get("min_score")
+
+        k_raw = args.get("k", self._default_k)
+        try:
+            k = int(k_raw)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"k must be an integer, got {k_raw!r}") from e
+        if k < 1:
+            raise ValueError(f"k must be a positive integer, got {k}")
+
+        min_score_raw = args.get("min_score")
+        min_score: float | None
+        if min_score_raw is None:
+            min_score = None
+        else:
+            try:
+                min_score = float(min_score_raw)
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    f"min_score must be a number, got {min_score_raw!r}"
+                ) from e
 
         results = await self._feedback.query(FeedbackQuery(
             similar_to=hypothesis,
             agent_name=self._agent_name,
-            min_score=float(min_score) if min_score is not None else None,
+            min_score=min_score,
             limit=k,
         ))
 

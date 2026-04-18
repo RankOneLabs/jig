@@ -150,6 +150,11 @@ class TestCompare:
         with pytest.raises(ValueError, match="concurrency"):
             await compare("x", [_config("a")], concurrency=0)
 
+    async def test_duplicate_config_names_rejected(self):
+        configs = [_config("same"), _config("same"), _config("unique")]
+        with pytest.raises(ValueError, match="duplicates.*same"):
+            await compare("x", configs)
+
     async def test_concurrency_parallel(self):
         """concurrency=N runs configs in parallel (sanity — no timeout here)."""
         configs = [_config(f"c{i}") for i in range(4)]
@@ -219,6 +224,11 @@ class TestSweep:
     async def test_concurrency_validated(self):
         with pytest.raises(ValueError, match="concurrency"):
             await sweep(["x"], [_config("a")], concurrency=-1)
+
+    async def test_duplicate_config_names_rejected(self):
+        configs = [_config("a"), _config("b"), _config("a")]
+        with pytest.raises(ValueError, match="duplicates"):
+            await sweep(["case1"], configs)
 
 
 @pytest.mark.asyncio

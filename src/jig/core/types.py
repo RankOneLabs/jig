@@ -133,6 +133,12 @@ class FeedbackQuery:
     max_age: timedelta | None = None
     limit: int = 10
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.limit, int) or self.limit < 1:
+            raise ValueError(
+                f"FeedbackQuery.limit must be a positive int, got {self.limit!r}"
+            )
+
 
 class SpanKind(str, Enum):
     AGENT_RUN = "agent_run"

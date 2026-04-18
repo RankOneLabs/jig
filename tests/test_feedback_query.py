@@ -13,8 +13,16 @@ from jig.feedback.loop import SQLiteFeedbackLoop
 
 
 async def _fake_embed(text: str) -> np.ndarray:
-    """Deterministic fake embedding — no Ollama required."""
-    rng = np.random.default_rng(abs(hash(text)) % (2**32))
+    """Deterministic fake embedding — no Ollama required.
+
+    Seeds via ``hashlib.sha256`` so text → vector is stable across
+    processes (Python's built-in ``hash()`` is salted per-process,
+    which would make similarity-order assertions flaky).
+    """
+    import hashlib
+
+    seed = int.from_bytes(hashlib.sha256(text.encode()).digest()[:4], "big")
+    rng = np.random.default_rng(seed)
     return rng.random(128, dtype=np.float32)
 
 
@@ -191,3 +199,32 @@ class TestPastResultsTool:
         d = tool.definition
         assert d.name == "past_results"
         assert "hypothesis" in d.parameters["required"]
+
+    async def test_rejects_non_integer_k(self):
+        tool = PastResults(AsyncMock())
+        with pytest.raises(ValueError, match="k must be an integer"):
+            await tool.execute({"hypothesis": "x", "k": "three"})
+
+    async def test_rejects_non_positive_k(self):
+        tool = PastResults(AsyncMock())
+        with pytest.raises(ValueError, match="positive integer"):
+            await tool.execute({"hypothesis": "x", "k": 0})
+        with pytest.raises(ValueError, match="positive integer"):
+            await tool.execute({"hypothesis": "x", "k": -1})
+
+    async def test_rejects_non_numeric_min_score(self):
+        tool = PastResults(AsyncMock())
+        with pytest.raises(ValueError, match="min_score must be a number"):
+            await tool.execute({"hypothesis": "x", "min_score": "high"})
+
+
+class TestFeedbackQueryValidation:
+    def test_rejects_non_positive_limit(self):
+        with pytest.raises(ValueError, match="positive int"):
+            FeedbackQuery(limit=0)
+        with pytest.raises(ValueError, match="positive int"):
+            FeedbackQuery(limit=-5)
+
+    def test_rejects_non_integer_limit(self):
+        with pytest.raises(ValueError, match="positive int"):
+            FeedbackQuery(limit=1.5)  # type: ignore[arg-type]

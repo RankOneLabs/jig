@@ -116,6 +116,27 @@ def _case_to_input(case: EvalCase | str) -> str:
     return case if isinstance(case, str) else case.input
 
 
+def _ensure_unique_names(configs: list) -> None:
+    """Guard against duplicate config names.
+
+    Rollups key on ``config.name``. Duplicates would silently merge /
+    overwrite entries, losing data. Force callers to name variants
+    distinctly so the rollup maps back to a specific config.
+    """
+    seen: set[str] = set()
+    dupes: list[str] = []
+    for cfg in configs:
+        if cfg.name in seen:
+            dupes.append(cfg.name)
+        seen.add(cfg.name)
+    if dupes:
+        unique = sorted(set(dupes))
+        raise ValueError(
+            f"Config names must be unique for rollup keying; "
+            f"duplicates: {unique}"
+        )
+
+
 async def compare[T](
     input: str,
     configs: list[AgentConfig[T]],
@@ -130,6 +151,7 @@ async def compare[T](
     """
     if concurrency <= 0:
         raise ValueError(f"concurrency must be positive, got {concurrency}")
+    _ensure_unique_names(configs)
 
     sem = asyncio.Semaphore(concurrency)
 
@@ -162,6 +184,7 @@ async def sweep[T](
     """
     if concurrency <= 0:
         raise ValueError(f"concurrency must be positive, got {concurrency}")
+    _ensure_unique_names(configs)
 
     resolved_sweep_id = sweep_id or str(uuid.uuid4())
     sem = asyncio.Semaphore(concurrency)
