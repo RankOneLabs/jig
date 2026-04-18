@@ -20,13 +20,14 @@ from jig.core.errors import (
 )
 from jig.core.prompt import build_system_message
 from jig.core.types import (
-    AgentMemory,
     CompletionParams,
     FeedbackLoop,
     Grader,
     LLMClient,
     MemoryEntry,
+    MemoryStore,
     Message,
+    Retriever,
     Role,
     Score,
     ScoredResult,
@@ -70,10 +71,15 @@ class AgentConfig[T]:
     system_prompt: str | Callable[[], str | Awaitable[str]]
 
     llm: LLMClient
-    memory: AgentMemory
     feedback: FeedbackLoop
     tracer: TracingLogger
     tools: ToolRegistry
+
+    # Memory split: store owns persistence + session history; retriever
+    # owns the strategy for pulling context into the prompt. Both are
+    # optional — agents that don't need memory leave them as None.
+    store: MemoryStore | None = None
+    retriever: Retriever | None = None
 
     grader: Grader[T] | None = None
     max_tool_calls: int = 10
@@ -240,14 +246,25 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
         else:
             system_prompt = config.system_prompt
 
-        # 3. Query memory
+        # 3. Retrieve memory context via the swappable Retriever
         memory_context: list[MemoryEntry] = []
-        if config.include_memory_in_prompt:
+        if config.include_memory_in_prompt and config.retriever is not None:
             mem_span = config.tracer.start_span(
-                trace.id, SpanKind.MEMORY_QUERY, "query_memory", {"query": input}
+                trace.id, SpanKind.MEMORY_QUERY, "retrieve", {"query": input}
             )
-            memory_context = await config.memory.query(input, limit=5, session_id=config.session_id)
-            config.tracer.end_span(mem_span.id, [e.content for e in memory_context])
+            memory_context = await config.retriever.retrieve(input, k=5)
+            # Span output carries retrieved-id scores so downstream
+            # analytics can group "which retriever picked what?" without
+            # replaying the corpus.
+            config.tracer.end_span(
+                mem_span.id,
+                {
+                    "retrieved": [
+                        {"id": e.id, "score": e.score, "preview": e.content[:120]}
+                        for e in memory_context
+                    ],
+                },
+            )
 
         # 4. Query feedback signals
         feedback_signals: list[ScoredResult] = []
@@ -263,8 +280,8 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
         if config.output_schema is not None:
             system_message = _append_schema_instruction(system_message)
         messages: list[Message] = []
-        if config.session_id:
-            history = await config.memory.get_session(config.session_id)
+        if config.session_id and config.store is not None:
+            history = await config.store.get_session(config.session_id)
             messages.extend(history)
         messages.append(Message(role=Role.USER, content=input))
 
@@ -541,17 +558,22 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                 tool_call_count += 1
                 total_usage["tool_calls"] += 1
 
-        # 7. Store in memory
-        result_id = await config.memory.add(
-            final_output,
-            {"agent": config.name, "input": input, "trace_id": trace.trace_id},
-        )
+        # 7. Persist to the memory store (if one is configured).
+        # Agents without a store still need a result_id for grading; use
+        # the trace id as a stable fallback.
+        if config.store is not None:
+            result_id = await config.store.add(
+                final_output,
+                {"agent": config.name, "input": input, "trace_id": trace.trace_id},
+            )
+        else:
+            result_id = trace.trace_id
 
-        if config.session_id:
-            await config.memory.add_to_session(
+        if config.session_id and config.store is not None:
+            await config.store.add_to_session(
                 config.session_id, Message(role=Role.USER, content=input)
             )
-            await config.memory.add_to_session(
+            await config.store.add_to_session(
                 config.session_id, Message(role=Role.ASSISTANT, content=final_output)
             )
 

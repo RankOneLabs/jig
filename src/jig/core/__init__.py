@@ -14,7 +14,6 @@ from jig.core.errors import (
 )
 from jig.core.pipeline import MapResult, PipelineConfig, PipelineResult, Step
 from jig.core.types import (
-    AgentMemory,
     CompletionParams,
     EvalCase,
     FeedbackLoop,
@@ -23,7 +22,9 @@ from jig.core.types import (
     LLMClient,
     LLMResponse,
     MemoryEntry,
+    MemoryStore,
     Message,
+    Retriever,
     Role,
     Score,
     ScoredResult,
@@ -39,12 +40,13 @@ from jig.core.types import (
 )
 
 __all__ = [
-    "AgentMemory",
     "CompletionParams",
     "EvalCase",
     "FeedbackLoop",
     "FeedbackQuery",
     "Grader",
+    "MemoryStore",
+    "Retriever",
     "AgentAmbiguousTurnError",
     "AgentError",
     "AgentLLMPermanentError",

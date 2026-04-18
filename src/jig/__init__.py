@@ -5,7 +5,6 @@ from jig.core import (
     AgentLLMPermanentError,
     AgentMaxLLMCallsError,
     AgentMaxLLMRetriesError,
-    AgentMemory,
     AgentSchemaNotCalledError,
     AgentSchemaValidationError,
     CompletionParams,
@@ -22,7 +21,9 @@ from jig.core import (
     LLMResponse,
     MapResult,
     MemoryEntry,
+    MemoryStore,
     Message,
+    Retriever,
     PipelineConfig,
     PipelineResult,
     Role,
@@ -54,10 +55,11 @@ from jig.tools import PastResults, ToolRegistry
 
 __all__ = [
     # Core types
-    "AgentMemory",
     "MapResult",
+    "MemoryStore",
     "PipelineConfig",
     "PipelineResult",
+    "Retriever",
     "Step",
     "CompletionParams",
     "EvalCase",

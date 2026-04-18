@@ -21,12 +21,13 @@ from jig import (
     sweep,
 )
 from jig.core.types import (
-    AgentMemory,
     CompletionParams,
     FeedbackLoop,
     Grader,
     LLMClient,
     MemoryEntry,
+    MemoryStore,
+    Retriever,
     Span,
     SpanKind,
     TracingLogger,
@@ -53,9 +54,12 @@ class _FakeLLM(LLMClient):
         )
 
 
-class _FakeMem(AgentMemory):
+class _FakeMem(MemoryStore, Retriever):
     async def add(self, content, metadata=None): return "m"
-    async def query(self, q, limit=5, filter=None, session_id=None): return []
+    async def get(self, id): return None
+    async def all(self): return []
+    async def delete(self, id): pass
+    async def retrieve(self, query, k=5, context=None): return []
     async def get_session(self, sid): return []
     async def add_to_session(self, sid, m): pass
     async def clear(self, session_id=None, before=None): pass
@@ -99,7 +103,7 @@ def _config(
         description=f"{name} agent",
         system_prompt="be brief",
         llm=_FakeLLM(content, cost=cost),
-        memory=_FakeMem(),
+        store=_FakeMem(), retriever=None,
         feedback=_FakeFB(),
         tracer=_FakeTracer(),
         tools=ToolRegistry(),
@@ -238,7 +242,7 @@ class TestSweepErrorCounting:
             description="fails auth",
             system_prompt="x",
             llm=_ErrLLM(),
-            memory=_FakeMem(),
+            store=_FakeMem(), retriever=None,
             feedback=_FakeFB(),
             tracer=_FakeTracer(),
             tools=ToolRegistry(),

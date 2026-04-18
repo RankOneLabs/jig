@@ -30,7 +30,8 @@ from jig import (
     run_agent,
 )
 from jig.core.types import (
-    AgentMemory,
+    MemoryStore,
+    Retriever,
     FeedbackLoop,
     LLMClient,
     MemoryEntry,
@@ -58,9 +59,12 @@ class FakeLLM(LLMClient):
         return resp
 
 
-class FakeMemory(AgentMemory):
+class FakeMemory(MemoryStore, Retriever):
     async def add(self, content, metadata=None): return "m"
-    async def query(self, query, limit=5, filter=None, session_id=None): return []
+    async def get(self, id): return None
+    async def all(self): return []
+    async def delete(self, id): pass
+    async def retrieve(self, query, k=5, context=None): return []
     async def get_session(self, session_id): return []
     async def add_to_session(self, session_id, message): pass
     async def clear(self, session_id=None, before=None): pass
@@ -106,7 +110,7 @@ def _config(llm, **overrides: Any) -> AgentConfig:
         description="test",
         system_prompt="be brief",
         llm=llm,
-        memory=FakeMemory(),
+        store=FakeMemory(), retriever=None,
         feedback=FakeFeedback(),
         tracer=FakeTracer(),
         tools=ToolRegistry(),
@@ -441,7 +445,7 @@ class TestTracerFinalizationOnException:
             description="test",
             system_prompt="",
             llm=llm,
-            memory=FlakyMemory(),
+            store=FlakyMemory(), retriever=None,
             feedback=FakeFeedback(),
             tracer=tracer,
             tools=ToolRegistry(),
@@ -476,7 +480,7 @@ class TestTracerFinalizationOnException:
             description="test",
             system_prompt="",
             llm=llm,
-            memory=FlakyMemory(),
+            store=FlakyMemory(), retriever=None,
             feedback=FakeFeedback(),
             tracer=BrokenEndSpanTracer(),
             tools=ToolRegistry(),

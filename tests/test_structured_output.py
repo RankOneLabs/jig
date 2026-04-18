@@ -23,7 +23,8 @@ from jig import (
 )
 from jig.core.runner import SUBMIT_OUTPUT_TOOL
 from jig.core.types import (
-    AgentMemory,
+    MemoryStore,
+    Retriever,
     FeedbackLoop,
     Grader,
     LLMClient,
@@ -52,11 +53,20 @@ class FakeLLM(LLMClient):
         return resp
 
 
-class FakeMemory(AgentMemory):
+class FakeMemory(MemoryStore, Retriever):
     async def add(self, content: str, metadata: dict[str, Any] | None = None) -> str:
         return "mem-1"
 
-    async def query(self, query: str, limit: int = 5, filter=None, session_id=None) -> list[MemoryEntry]:
+    async def get(self, id: str) -> MemoryEntry | None:
+        return None
+
+    async def all(self) -> list[MemoryEntry]:
+        return []
+
+    async def delete(self, id: str) -> None:
+        pass
+
+    async def retrieve(self, query: str, k: int = 5, context=None) -> list[MemoryEntry]:
         return []
 
     async def get_session(self, session_id: str) -> list[Message]:
@@ -142,7 +152,7 @@ def _config(
         description="test agent",
         system_prompt="You are a test agent.",
         llm=llm,
-        memory=FakeMemory(),
+        store=FakeMemory(), retriever=None,
         feedback=FakeFeedback(),
         tracer=FakeTracer(),
         tools=ToolRegistry(tools or []),
