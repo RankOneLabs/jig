@@ -78,21 +78,21 @@ repo's main).
 
 ### Jig surfaces present (no changes needed)
 
-- `AgentConfig.with_(...)` at `jig/src/jig/core/runner.py:125`.
-- `jig.llm.from_model` at `jig/src/jig/llm/factory.py:27`. Prefix
+- `AgentConfig.with_(...)` at `src/jig/core/runner.py:125`.
+- `jig.llm.from_model` at `src/jig/llm/factory.py:27`. Prefix
   routing covers ta's models (`claude-sonnet-4-*` etc.).
 - `Tool.dispatch` + `Tool.dispatch_fn_ref` at
-  `jig/src/jig/core/types.py:385-400`. `ToolRegistry` already routes
-  them at `jig/src/jig/tools/registry.py:52`.
-- `jig.sweep(..., concurrency=...)` at `jig/src/jig/sweep.py:172`.
-- `Grader[T]` at `jig/src/jig/core/types.py:329`.
+  `src/jig/core/types.py:385-400`. `ToolRegistry` already routes
+  them at `src/jig/tools/registry.py:52`.
+- `jig.sweep(..., concurrency=...)` at `src/jig/sweep.py:172`.
+- `Grader[T]` at `src/jig/core/types.py:329`.
 
 ### Jig has no non-ta users of the deleted surfaces
 
-Grep for `CostTrackingLLM`, `create_llm(`, `_parse_strategy_types`
-across `/home/steve/codes/rol/jig/src` returned zero hits. Phase 12's
-"jig-side deletions" per the roadmap is a phrasing artifact — the
-deletions are entirely inside ta.
+From the jig repo root,
+`grep -R -nE 'CostTrackingLLM|create_llm\(|_parse_strategy_types' src/`
+returned zero hits. Phase 12's "jig-side deletions" per the roadmap
+is a phrasing artifact — the deletions are entirely inside ta.
 
 ### Smithers plumbing ready
 
@@ -281,8 +281,17 @@ run_signal_study = "backtester.training.generic_objective:run_signal_study"
 ```
 
 Extend `run_signal_study` signature: add `n_jobs: int = 1` (plumbed to
-`study.optimize`) and `study_storage_path: str | None = None`. Default
-n_jobs=1 preserves current behavior for local callers.
+`study.optimize`), `study_storage_path: str | None = None`, and
+`seed: int | None = None` (plumbed to `TPESampler(seed=seed)` if
+supplied; otherwise Optuna's default non-deterministic seed). The
+seed param lets the benchmark pin trial selection across before/after
+runs so best-sharpe variance comes from the parallelism change, not
+the sampler. Defaults preserve current behavior for local callers.
+
+> **Note:** the initial ta PR (gecko#111) landed `n_jobs` +
+> `study_storage_path` without `seed`. Follow-up commit on the same
+> branch threads `seed` through the signature, dispatched wrapper,
+> and tool schema.
 
 **Tests:** `test_run_backtest_dispatch.py` — attrs set, registry
 routes through dispatch instead of `execute()`.
@@ -399,7 +408,7 @@ typed grader.
   `specialist_cfg.output_schema is BacktestOutcome`.
 
 - **Phase 13 (scout + algerknown) doesn't share these surfaces** —
-  those repos live outside `/home/steve/codes/rol/` and don't consume
+  those repos live outside this workspace and don't consume
   `create_llm` / `CostTrackingLLM` (ta-local surfaces). Phase 12
   doesn't gate 13; they can run in parallel.
 
