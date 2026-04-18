@@ -14,9 +14,8 @@ from dataclasses import dataclass, field
 from itertools import zip_longest
 from typing import Any, Literal
 
+from jig.core.runner import SUBMIT_OUTPUT_TOOL as _SUBMIT_OUTPUT_TOOL
 from jig.core.types import Span, SpanKind, TracingLogger
-
-_SUBMIT_OUTPUT_TOOL = "submit_output"
 
 
 @dataclass
@@ -55,7 +54,16 @@ class TraceDiff:
 
     @property
     def identical(self) -> bool:
-        """True when the two traces show no meaningful divergence."""
+        """True when the two traces show no *behavioral* divergence.
+
+        "Behavioral" means tool-call sequence, final output, terminal
+        error category, and grader scores all match. ``cost_delta`` and
+        ``latency_ms_delta`` are deliberately excluded — swapping models
+        is the main use case, and a different model will almost always
+        have different token prices and latency, so folding those in
+        would make ``identical`` always False for the exact workflow
+        this property exists to support.
+        """
         return (
             not self.tool_divergence
             and self.output_diff is None
@@ -169,6 +177,22 @@ async def trace_diff(
     """
     a_spans = await tracer.get_trace(trace_a_id)
     b_spans = await tracer.get_trace(trace_b_id)
+
+    # Reject missing / malformed traces up front. Silently returning an
+    # empty diff (the previous behavior) made an ``identical`` report
+    # out of two unknown trace IDs, which is misleading for debugging.
+    if not a_spans:
+        raise ValueError(f"Trace {trace_a_id!r} not found or has no spans")
+    if not b_spans:
+        raise ValueError(f"Trace {trace_b_id!r} not found or has no spans")
+    if _root(a_spans) is None:
+        raise ValueError(
+            f"Trace {trace_a_id!r} has no AGENT_RUN root span"
+        )
+    if _root(b_spans) is None:
+        raise ValueError(
+            f"Trace {trace_b_id!r} has no AGENT_RUN root span"
+        )
 
     a_tools = _tool_spans(a_spans)
     b_tools = _tool_spans(b_spans)

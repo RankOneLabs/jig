@@ -60,13 +60,13 @@ class FakeMemory(MemoryStore, Retriever):
     async def add(self, content: str, metadata: dict[str, Any] | None = None) -> str:
         return "mem-1"
 
-    async def get(self, id: str) -> MemoryEntry | None:
+    async def get(self, id: str) -> MemoryEntry | None:  # noqa: A002
         return None
 
     async def all(self) -> list[MemoryEntry]:
         return []
 
-    async def delete(self, id: str) -> None:
+    async def delete(self, id: str) -> None:  # noqa: A002
         pass
 
     async def retrieve(self, query: str, k: int = 5, context: dict[str, Any] | None = None) -> list[MemoryEntry]:

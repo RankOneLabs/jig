@@ -43,7 +43,21 @@ def serialize_config(config: AgentConfig[Any]) -> dict[str, Any]:
 
 
 def _resolve_output_schema(fqn: str) -> type[BaseModel]:
-    """Import ``module:ClassName`` and verify it's a BaseModel subclass."""
+    """Import ``module:ClassName`` and verify it's a BaseModel subclass.
+
+    **Trust model.** This function calls :func:`importlib.import_module`
+    on a string sourced from recorded trace metadata. Jig treats the
+    trace store as trusted input — traces are written by the caller's
+    own agent runs against the caller's own tracer. Do **not** feed
+    :func:`jig.replay` a trace_id sourced from an untrusted user (e.g.
+    a shared multi-tenant database or a webhook payload) without an
+    import allowlist, because an attacker who can seed the tracer's
+    storage can pick any importable module to load.
+
+    In the homelab single-tenant use case this is fine; anyone
+    considering a broader deployment should wrap this with an
+    allowlist check on the ``fqn``'s module prefix.
+    """
     if ":" not in fqn:
         raise ReplaySchemaMismatchError(
             f"Recorded output_schema FQN {fqn!r} is malformed "
@@ -58,8 +72,9 @@ def _resolve_output_schema(fqn: str) -> type[BaseModel]:
         raise ReplaySchemaMismatchError(
             f"Recorded output_schema {fqn!r} is a function-local class "
             f"and is not replayable — move the pydantic model to module "
-            f"scope (or pass a module-scoped replacement via "
-            f"config_override)."
+            f"scope and re-record the trace. ``config_override`` cannot "
+            f"substitute a different output_schema, so there is no "
+            f"in-place fix."
         )
     try:
         module = importlib.import_module(module_name)

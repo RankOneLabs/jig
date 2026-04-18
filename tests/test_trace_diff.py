@@ -26,7 +26,7 @@ class _StubTracer(TracingLogger):
     def start_trace(self, name, metadata=None, kind=SpanKind.AGENT_RUN):  # pragma: no cover
         raise NotImplementedError
 
-    def start_span(self, parent_id, kind, name, input=None):  # pragma: no cover
+    def start_span(self, parent_id, kind, name, input=None):  # noqa: A002  # pragma: no cover
         raise NotImplementedError
 
     def end_span(self, span_id, output=None, error=None, usage=None):  # pragma: no cover
@@ -280,6 +280,24 @@ async def test_submit_output_spans_ignored_in_diff():
 
 
 # --- SQLite integration ---
+
+
+@pytest.mark.asyncio
+async def test_missing_trace_ids_raise():
+    tracer = _StubTracer({})
+    with pytest.raises(ValueError, match="not found or has no spans"):
+        await trace_diff("missing-a", "missing-b", tracer=tracer)
+
+
+@pytest.mark.asyncio
+async def test_trace_with_no_agent_run_root_raises():
+    # Trace has spans but none is the AGENT_RUN root
+    tracer = _StubTracer({
+        "a": [_root("a")],
+        "b": [_tool("b", 0, "echo", {"text": "x"}, "x")],  # no root!
+    })
+    with pytest.raises(ValueError, match="no AGENT_RUN root span"):
+        await trace_diff("a", "b", tracer=tracer)
 
 
 @pytest.mark.asyncio

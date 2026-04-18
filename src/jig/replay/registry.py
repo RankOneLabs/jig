@@ -31,13 +31,10 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
+from jig.core.runner import SUBMIT_OUTPUT_TOOL as _SUBMIT_OUTPUT_TOOL
 from jig.core.types import Span, SpanKind, Tool, ToolCall, ToolDefinition, ToolResult
 from jig.replay.errors import ReplayMissError
 from jig.tools.registry import ToolRegistry
-
-
-# Local re-export to avoid a circular-ish import on runner.py.
-_SUBMIT_OUTPUT_TOOL = "submit_output"
 
 
 @dataclass

@@ -54,10 +54,17 @@ async def replay(
     :func:`run_agent` against a :class:`ReplayToolRegistry` built from
     the recorded ``TOOL_CALL`` spans.
 
-    ``config_override`` applies on top of the snapshot. Pass a dict
-    of fields to tweak specific knobs (``{"max_tool_calls": 5}``) or a
-    full :class:`AgentConfig` to run under an entirely different config
-    (in which case this function just validates + delegates).
+    ``config_override`` applies during reconstruction of the recorded
+    snapshot. Pass a dict of fields to tweak specific knobs
+    (``{"max_tool_calls": 5}``) or a full :class:`AgentConfig` to
+    replace the reconstructed config broadly. In **either** case, replay
+    re-pins its own live components afterwards, so ``llm``, ``tools``,
+    ``tracer``, ``feedback``, ``store``, ``retriever``, and ``grader``
+    always come from this function's arguments — a full
+    :class:`AgentConfig` override can't swap out
+    :class:`ReplayToolRegistry` (that would defeat the whole point of
+    replay). Full-``AgentConfig`` overrides are not validated against
+    the recorded snapshot; tuning knobs dicts are.
 
     ``strict=True`` raises :class:`ReplayMissError` on any tool call
     without a recorded match — useful to verify a replay actually
