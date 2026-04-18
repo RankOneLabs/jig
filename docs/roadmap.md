@@ -22,7 +22,7 @@ replay; phases 12–13 migrate consumers.
 | 6     | Memory split (Store / Retriever)          | **merged**    | #17        | yes      |
 | 7     | Smithers dispatch — LLM                   | **merged**    | jig #19, smithers #18 | no |
 | 8     | Smithers dispatch — tools + steps         | **merged**    | jig #19, smithers #18 | no |
-| 9     | Trace propagation across dispatch         | **in flight** | see `phase-9-trace-propagation.md` | no |
+| 9     | Trace propagation across dispatch         | **ready**     | jig + smithers phase-9 branches ready to open PRs | no |
 | 10    | Callback-based sweep fan-out              | pending       | —          | no       |
 | 11    | Agent replay from trace                   | **merged**    | #20        | minor    |
 | 12    | Ta capstone migration                     | pending       | —          | —        |
