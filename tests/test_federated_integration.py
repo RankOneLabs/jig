@@ -162,9 +162,9 @@ async def test_trace_diff_operates_on_federated_view(local):
     live on the remote rollup, not local SQLite.
     """
     # Build trace A
-    trace_id_a, root_a, disp_a = await _seed_dispatched_agent_run(local)
+    trace_id_a, _root_a, disp_a = await _seed_dispatched_agent_run(local)
     # Build trace B (separate root span in local)
-    trace_id_b, root_b, disp_b = await _seed_dispatched_agent_run(local)
+    trace_id_b, _root_b, disp_b = await _seed_dispatched_agent_run(local)
 
     def _worker_tool(
         trace_id: str,

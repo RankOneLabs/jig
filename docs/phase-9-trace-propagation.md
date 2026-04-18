@@ -56,8 +56,8 @@ Verify these before writing code:
   span wraps `_make_inference_request`.
 - `smithers/worker/executors/function.py:157-163` — sync/async branch; wrap
   with a `TOOL_CALL` span.
-- `jig/src/jig/tracing/sqlite.py:32-53` — `_SCHEMA`. Worker's DB must match.
-- `jig/src/jig/core/types.py:149-204` — `SpanKind`, `Span`, `TraceContext`.
+- `src/jig/tracing/sqlite.py:32-53` — `_SCHEMA`. Worker's DB must match.
+- `src/jig/core/types.py:149-204` — `SpanKind`, `Span`, `TraceContext`.
 - `springfield/machines/willie/docker-compose.yml` — where the
   `trace-rollup` service is added. Image build context points at the
   smithers repo.
@@ -262,9 +262,10 @@ Endpoints:
 - `GET /traces?since=...&limit=...&name=...` — deferred unless
   scope-budget allows; requires a `list_traces` endpoint on workers too.
 
-Deploy: add `trace-rollup` service to willie's compose, port 8901 (adjacent
-to dispatch at 8900), network `springfield`. Dockerfile runs
-`uvicorn smithers.trace_rollup.server:app --port 8901`.
+Deploy: add `trace-rollup` service to willie's compose, port 8902.
+Workers already bind 8901, so rollup takes the next slot over —
+dispatch=8900, worker=8901, rollup=8902. Network `springfield`.
+Dockerfile runs `uvicorn smithers.trace_rollup.server:app --port 8902`.
 
 **Tests:** mock two worker endpoints (httpx respx). One returns spans, one
 raises ConnectError. Assert aggregated response includes both sources
@@ -273,7 +274,7 @@ logged.
 
 ### Step 8 — jig-side `FederatedTracer`
 
-New file `jig/src/jig/tracing/federated.py`:
+New file `src/jig/tracing/federated.py`:
 
 - `RollupClient` — thin httpx wrapper around
   `GET {rollup_url}/traces/{trace_id}`. Returns `list[Span]` parsed from
@@ -286,8 +287,8 @@ New file `jig/src/jig/tracing/federated.py`:
   - `list_traces` delegates to local (root AGENT_RUN spans are always
     caller-side).
 
-Default `rollup_url = "http://willie:8901"` matching the dispatch URL
-pattern. Export from `jig.tracing.__init__`.
+Default `rollup_url = "http://willie:8902"` matching the implemented
+rollup service port. Export from `jig.tracing.__init__`.
 
 **Tests:** seed local with caller spans, stub RollupClient with worker
 spans (same trace_id, parents pointing into local spans); `get_trace`

@@ -108,6 +108,32 @@ async def test_rollup_client_raises_unreachable_on_http_error():
             await client.get_trace("t-1")
 
 
+async def test_rollup_client_raises_unreachable_on_malformed_json():
+    """Invalid JSON from the rollup funnels through the unreachable path.
+
+    Otherwise a ValueError would bubble past FederatedTracer's
+    fallback-to-local branch and break reads any time the rollup
+    misbehaves.
+    """
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="not json at all")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = RollupClient(base_url="http://willie:8902", http=http)
+        with pytest.raises(RollupUnreachableError, match="malformed JSON"):
+            await client.get_trace("t-1")
+
+
+async def test_rollup_client_raises_unreachable_on_non_object_payload():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=["unexpected", "list"])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = RollupClient(base_url="http://willie:8902", http=http)
+        with pytest.raises(RollupUnreachableError, match="non-object"):
+            await client.get_trace("t-1")
+
+
 async def test_rollup_client_skips_malformed_rows():
     transport = _rollup_transport({
         "t-1": [
@@ -141,7 +167,8 @@ async def test_federated_returns_local_only_when_no_rollup(local):
     trace_id, root_id = await _seed_local(local)
     federated = FederatedTracer(local=local, rollup=None)
     spans = await federated.get_trace(trace_id)
-    assert {s.id for s in spans} == {root_id, spans[1].id}
+    assert len(spans) == 2
+    assert root_id in {s.id for s in spans}
 
 
 async def test_federated_unions_rollup_spans_into_local_trace(local):
@@ -184,7 +211,8 @@ async def test_federated_falls_back_to_local_on_rollup_failure(local, caplog):
             spans = await federated.get_trace(trace_id)
         await rollup.close()
     # Local spans returned; rollup failure logged but didn't raise.
-    assert {s.id for s in spans} == {root_id, spans[1].id}
+    assert len(spans) == 2
+    assert root_id in {s.id for s in spans}
     assert any("rollup unavailable" in r.message for r in caplog.records)
 
 

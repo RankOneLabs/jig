@@ -145,7 +145,23 @@ class RollupClient:
                 f"{response.status_code}",
             )
 
-        body = response.json()
+        # Any shape failure from the rollup funnels through
+        # RollupUnreachableError so the federated reader's fallback-to-
+        # local path catches it the same way a connection error would.
+        # Otherwise a malformed rollup response would bubble a raw
+        # ValueError / AttributeError out of get_trace and skip the
+        # "serve local-only + warn" branch.
+        try:
+            body = response.json()
+        except ValueError as e:
+            raise RollupUnreachableError(
+                f"rollup at {self._base_url!r} returned malformed JSON: {e}",
+            ) from e
+        if not isinstance(body, dict):
+            raise RollupUnreachableError(
+                f"rollup at {self._base_url!r} returned non-object "
+                f"payload: {type(body).__name__}",
+            )
         rows = body.get("spans") or []
         spans: list[Span] = []
         for row in rows:
