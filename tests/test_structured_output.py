@@ -221,8 +221,9 @@ class TestValidationRetry:
 
     async def test_gives_up_after_max_retries(self):
         """Exceeding max_parse_retries leaves parsed=None and bails out."""
-        # max_parse_retries=1 → 2 attempts (initial + 1 retry) allowed;
-        # 3rd failure exceeds the budget.
+        # max_parse_retries=1 → runner allows the initial attempt + 1 retry;
+        # the 2nd validation failure (parse_retries becomes 2 > 1) terminates.
+        # Buffer 3 responses but only the first two will be consumed.
         llm = FakeLLM([
             _submit_response({}, call_id="a"),  # missing required field
             _submit_response({}, call_id="b"),
@@ -261,6 +262,89 @@ class TestValidationRetry:
             if m.role == Role.USER and SUBMIT_OUTPUT_TOOL in m.content
         ]
         assert len(nudges) >= 1
+
+
+class TestAmbiguousTurn:
+    """submit_output must be the only tool call in its turn, else other
+    tool executions would vanish silently on termination."""
+
+    async def test_submit_output_with_other_tool_calls_nudged(self):
+        """Same-turn submit_output + other tools → reject, ask to retry."""
+        # First turn: model combines a user tool + submit_output.
+        # Second turn: model retries with submit_output alone.
+        mixed = LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCall(id="t1", name="echo", arguments={"text": "hi"}),
+                ToolCall(id="t2", name=SUBMIT_OUTPUT_TOOL,
+                         arguments={"strategy_types": ["x"]}),
+            ],
+            usage=Usage(1, 1),
+            latency_ms=1,
+            model="fake",
+        )
+        clean = _submit_response({"strategy_types": ["x"]})
+        llm = FakeLLM([mixed, clean])
+
+        result = await run_agent(
+            _config(llm, output_schema=StrategyOutput, max_parse_retries=2),
+            "go",
+        )
+
+        # Terminated on the clean turn, not the mixed one
+        assert result.parsed is not None
+        assert result.parsed.strategy_types == ["x"]
+        # Second turn's history must carry tool results for BOTH calls in
+        # the mixed turn (providers reject orphan tool_use blocks).
+        second = llm.calls[1]
+        tool_msgs = [m for m in second.messages if m.role == Role.TOOL]
+        assert any("only tool call" in m.content.lower() for m in tool_msgs)
+        assert any("separate turn" in m.content.lower() for m in tool_msgs)
+
+    async def test_multiple_submit_output_in_one_turn_nudged(self):
+        """Two submit_output calls in a turn → treated as ambiguous."""
+        doubled = LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCall(id="a", name=SUBMIT_OUTPUT_TOOL,
+                         arguments={"strategy_types": ["x"]}),
+                ToolCall(id="b", name=SUBMIT_OUTPUT_TOOL,
+                         arguments={"strategy_types": ["y"]}),
+            ],
+            usage=Usage(1, 1),
+            latency_ms=1,
+            model="fake",
+        )
+        clean = _submit_response({"strategy_types": ["ok"]})
+        llm = FakeLLM([doubled, clean])
+
+        result = await run_agent(
+            _config(llm, output_schema=StrategyOutput, max_parse_retries=2),
+            "go",
+        )
+        assert result.parsed is not None
+        assert result.parsed.strategy_types == ["ok"]
+
+    async def test_ambiguous_turn_exhausts_budget(self):
+        """Repeated ambiguous turns hit max_parse_retries and terminate."""
+        mixed = LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCall(id="t1", name="echo", arguments={"text": "hi"}),
+                ToolCall(id="t2", name=SUBMIT_OUTPUT_TOOL,
+                         arguments={"strategy_types": ["x"]}),
+            ],
+            usage=Usage(1, 1),
+            latency_ms=1,
+            model="fake",
+        )
+        llm = FakeLLM([mixed] * 3)
+        result = await run_agent(
+            _config(llm, output_schema=StrategyOutput, max_parse_retries=1),
+            "go",
+        )
+        assert result.parsed is None
+        assert "combined" in result.output
 
 
 class TestGraderIntegration:

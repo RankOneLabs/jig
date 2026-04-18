@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
 import time
 from dataclasses import dataclass
@@ -37,8 +38,15 @@ _MAX_LLM_RETRIES = 3
 SUBMIT_OUTPUT_TOOL = "submit_output"
 
 
-@dataclass
+@dataclass(frozen=True, kw_only=True)
 class AgentConfig[T]:
+    """Immutable agent configuration.
+
+    Keyword-only construction. Frozen so configs can be shared across
+    concurrent runs without aliasing bugs. Derive variants with
+    :meth:`with_` rather than mutating — the generic ``T`` is preserved.
+    """
+
     name: str
     description: str
     system_prompt: str | Callable[[], str | Awaitable[str]]
@@ -51,6 +59,11 @@ class AgentConfig[T]:
 
     grader: Grader[T] | None = None
     max_tool_calls: int = 10
+    # Absolute cap on LLM calls per run. ``max_tool_calls`` caps tool
+    # *execution*, but a model that keeps emitting tool_use blocks after
+    # being told "max reached" would otherwise loop forever. This bounds
+    # the outer loop so a misbehaving model can't burn unbounded spend.
+    max_llm_calls: int = 50
     max_llm_retries: int = _MAX_LLM_RETRIES
     include_memory_in_prompt: bool = True
     include_feedback_in_prompt: bool = True
@@ -64,6 +77,40 @@ class AgentConfig[T]:
     # ``AgentResult.parsed`` as None.
     output_schema: type[T] | None = None
     max_parse_retries: int = 2
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("AgentConfig.name must be non-empty.")
+        if self.max_tool_calls <= 0:
+            raise ValueError(
+                f"max_tool_calls must be positive, got {self.max_tool_calls}."
+            )
+        if self.max_llm_calls <= 0:
+            raise ValueError(
+                f"max_llm_calls must be positive, got {self.max_llm_calls}."
+            )
+        if self.max_llm_retries <= 0:
+            raise ValueError(
+                f"max_llm_retries must be positive, got {self.max_llm_retries}."
+            )
+        if self.max_parse_retries < 0:
+            raise ValueError(
+                f"max_parse_retries must be non-negative, got {self.max_parse_retries}."
+            )
+
+    def with_(self, **overrides: Any) -> AgentConfig[T]:
+        """Return a new config with the given fields replaced.
+
+        Preserves the generic parameter ``T`` so typed configs stay typed
+        across variants::
+
+            base = AgentConfig[StrategyOutput](..., grader=explore_grader)
+            refined = base.with_(llm=other_client, max_tool_calls=15, grader=strict_grader)
+
+        Any unknown field names raise ``TypeError`` (from ``dataclasses.replace``);
+        ``__post_init__`` validation runs on the new instance.
+        """
+        return dataclasses.replace(self, **overrides)
 
 
 @dataclass
@@ -176,6 +223,13 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
     parsed: T | None = None
 
     while True:
+        if total_usage["llm_calls"] >= config.max_llm_calls:
+            final_output = (
+                f"[agent terminated: exceeded max_llm_calls "
+                f"({config.max_llm_calls})]"
+            )
+            break
+
         llm_span = config.tracer.start_span(trace.id, SpanKind.LLM_CALL, "completion")
         params = CompletionParams(
             messages=messages,
@@ -215,14 +269,63 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
         total_usage["llm_calls"] += 1
 
         # --- Structured-output termination path ---
-        # When a schema is set, the model must call submit_output to finish.
-        # If it's present in this turn's tool calls, try to validate.
-        submit_call: ToolCall | None = None
+        # When a schema is set, submit_output must be the ONLY tool call in
+        # its turn. Otherwise, silently terminating on submit_output would
+        # drop the other tool executions the model just requested — bugs
+        # that look like "my RAG lookup result vanished."
+        submit_calls: list[ToolCall] = []
+        other_tool_calls: list[ToolCall] = []
         if config.output_schema is not None and response.tool_calls:
             for call in response.tool_calls:
                 if call.name == SUBMIT_OUTPUT_TOOL:
-                    submit_call = call
-                    break
+                    submit_calls.append(call)
+                else:
+                    other_tool_calls.append(call)
+
+        # Ambiguous turn: submit_output combined with other tool calls, or
+        # emitted more than once. Ask the model to retry with submit_output
+        # alone. Counts against max_parse_retries — same failure budget as
+        # invalid args, since both are "model didn't follow the schema
+        # contract."
+        if submit_calls and (len(submit_calls) > 1 or other_tool_calls):
+            parse_retries += 1
+            logger.info(
+                "submit_output emitted alongside other tool calls "
+                "(%d/%d)", parse_retries, config.max_parse_retries,
+            )
+            messages.append(
+                Message(
+                    role=Role.ASSISTANT,
+                    content=response.content,
+                    tool_calls=response.tool_calls,
+                )
+            )
+            for call in response.tool_calls:
+                if call.name == SUBMIT_OUTPUT_TOOL:
+                    content = (
+                        f"Ambiguous turn: when calling `{SUBMIT_OUTPUT_TOOL}`,"
+                        f" it must be the only tool call. Retry with "
+                        f"`{SUBMIT_OUTPUT_TOOL}` alone."
+                    )
+                else:
+                    content = (
+                        f"[skipped: `{SUBMIT_OUTPUT_TOOL}` must be the only "
+                        f"call in its turn. Run this tool in a separate turn "
+                        f"before submitting.]"
+                    )
+                messages.append(
+                    Message(role=Role.TOOL, content=content, tool_call_id=call.id)
+                )
+            if parse_retries > config.max_parse_retries:
+                final_output = (
+                    f"[agent terminated: model combined "
+                    f"{SUBMIT_OUTPUT_TOOL} with other tool calls "
+                    f"{parse_retries} times]"
+                )
+                break
+            continue
+
+        submit_call: ToolCall | None = submit_calls[0] if submit_calls else None
 
         if submit_call is not None:
             extract_span = config.tracer.start_span(

@@ -211,6 +211,45 @@ async def test_max_tool_calls_enforced():
     assert result.usage["tool_calls"] == 2
 
 
+async def test_max_llm_calls_caps_unbounded_tool_loop():
+    """Model that never stops emitting tool_calls still terminates cleanly.
+
+    Without this cap, a model that keeps emitting tool_calls past
+    max_tool_calls would loop forever — max_tool_calls only gates
+    tool *execution*, not the LLM round-trip itself.
+    """
+    tool_response = LLMResponse(
+        content="",
+        tool_calls=[ToolCall(id="tc-x", name="echo", arguments={"text": "x"})],
+        usage=Usage(1, 1),
+        latency_ms=1,
+        model="fake",
+    )
+    # Buffer exactly max_llm_calls responses — a 6th call would IndexError
+    # and fail the test.
+    llm = FakeLLM([tool_response] * 5)
+
+    result = await run_agent(
+        AgentConfig(
+            name="test",
+            description="runaway",
+            system_prompt="test",
+            llm=llm,
+            memory=FakeMemory(),
+            feedback=FakeFeedback(),
+            tracer=FakeTracer(),
+            tools=ToolRegistry([EchoTool()]),
+            max_tool_calls=2,
+            max_llm_calls=5,
+        ),
+        "go",
+    )
+    assert "max_llm_calls" in result.output
+    assert result.usage["llm_calls"] == 5
+    # Tool execution respects its own cap
+    assert result.usage["tool_calls"] == 2
+
+
 async def test_session_persistence():
     memory = FakeMemory()
     llm = FakeLLM([
