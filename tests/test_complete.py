@@ -114,6 +114,48 @@ class TestComplete:
                 [{"role": 123, "content": "hi"}],  # type: ignore[list-item]
             )
 
+    async def test_tool_calls_dict_coerced_to_toolcall(self):
+        """Assistant messages with dict-form tool_calls get proper ToolCall objects."""
+        with patch("jig.llm.anthropic.AnthropicClient") as mock_cls:
+            instance = mock_cls.return_value
+            instance.complete = AsyncMock(return_value=_mock_response())
+            instance.aclose = AsyncMock()
+
+            await complete(
+                "claude-sonnet-4-5",
+                [
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {"id": "tc-1", "name": "echo", "arguments": {"text": "x"}},
+                        ],
+                    },
+                ],
+            )
+
+            from jig.core.types import ToolCall
+
+            params: CompletionParams = instance.complete.call_args[0][0]
+            tc = params.messages[1].tool_calls[0]
+            assert isinstance(tc, ToolCall)
+            assert tc.name == "echo"
+            assert tc.arguments == {"text": "x"}
+
+    async def test_tool_calls_missing_field_rejected(self):
+        with pytest.raises(ValueError, match="missing required field"):
+            await complete(
+                "claude-sonnet-4-5",
+                [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{"name": "echo", "arguments": {}}],
+                    },
+                ],
+            )
+
     async def test_aclose_called_after_complete(self):
         """complete() releases adapter resources after use."""
         with patch("jig.llm.anthropic.AnthropicClient") as mock_cls:

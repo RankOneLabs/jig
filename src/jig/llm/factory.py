@@ -19,6 +19,7 @@ from jig.core.types import (
     LLMResponse,
     Message,
     Role,
+    ToolCall,
     ToolDefinition,
 )
 
@@ -95,8 +96,45 @@ def _coerce_message(m: Message | dict[str, Any]) -> Message:
         role=role,
         content=m.get("content", "") or "",
         tool_call_id=m.get("tool_call_id"),
-        tool_calls=m.get("tool_calls"),
+        tool_calls=_coerce_tool_calls(m.get("tool_calls")),
     )
+
+
+def _coerce_tool_calls(raw: Any) -> list[ToolCall] | None:
+    """Coerce a list that may contain ToolCall or dict into list[ToolCall].
+
+    ``Message.tool_calls`` is typed ``list[ToolCall]``; raw dicts would
+    pass silently through the dataclass constructor and break downstream
+    ``.name`` / ``.arguments`` access in the runner and adapters.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise ValueError(
+            f"tool_calls must be a list, got {type(raw).__name__}."
+        )
+    result: list[ToolCall] = []
+    for i, tc in enumerate(raw):
+        if isinstance(tc, ToolCall):
+            result.append(tc)
+        elif isinstance(tc, dict):
+            missing = [k for k in ("id", "name") if k not in tc]
+            if missing:
+                raise ValueError(
+                    f"tool_calls[{i}] missing required field(s): {missing}."
+                )
+            result.append(
+                ToolCall(
+                    id=tc["id"],
+                    name=tc["name"],
+                    arguments=tc.get("arguments") or {},
+                )
+            )
+        else:
+            raise ValueError(
+                f"tool_calls[{i}] must be ToolCall or dict, got {type(tc).__name__}."
+            )
+    return result
 
 
 async def complete(

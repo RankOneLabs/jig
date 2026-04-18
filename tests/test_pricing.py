@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import math
 
+import pytest
+
 from jig.core.types import Usage
 from jig.llm.pricing import compute_cost, get_pricing, stamp_cost
 
@@ -40,6 +42,15 @@ class TestComputeCost:
 
     def test_unknown_model_returns_none(self):
         assert compute_cost("unknown-model", 1000, 1000) is None
+
+    def test_negative_tokens_clamped_to_zero(self):
+        """Negative tokens shouldn't produce negative cost (budget bypass)."""
+        # Both negative → cost is zero, not negative
+        assert compute_cost("claude-sonnet-4-5", -1000, -1000) == 0.0
+        # Only input negative → input contributes 0, output normal
+        # 1000 output @ $15/Mtok = 0.015
+        cost = compute_cost("claude-sonnet-4-5", -500, 1000)
+        assert cost == pytest.approx(0.015, abs=1e-9)
 
 
 class TestStampCost:

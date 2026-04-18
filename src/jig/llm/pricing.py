@@ -62,12 +62,19 @@ def get_pricing(model: str) -> tuple[float, float] | None:
 
 
 def compute_cost(model: str, input_tokens: int, output_tokens: int) -> float | None:
-    """Compute USD cost for a completion, or None if the model isn't priced."""
+    """Compute USD cost for a completion, or None if the model isn't priced.
+
+    Negative token counts (from buggy adapters or corrupted usage data) are
+    clamped to zero rather than allowed to produce negative cost — negative
+    spend would silently weaken budget enforcement downstream.
+    """
     pricing = get_pricing(model)
     if pricing is None:
         return None
     input_rate, output_rate = pricing
-    return (input_tokens * input_rate + output_tokens * output_rate) / 1_000_000
+    safe_input = max(0, input_tokens)
+    safe_output = max(0, output_tokens)
+    return (safe_input * input_rate + safe_output * output_rate) / 1_000_000
 
 
 def stamp_cost(usage: Usage, model: str) -> Usage:
