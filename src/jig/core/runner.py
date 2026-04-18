@@ -105,7 +105,7 @@ class AgentConfig[T]:
         across variants::
 
             base = AgentConfig[StrategyOutput](..., grader=explore_grader)
-            refined = base.with_(model=..., max_tool_calls=15, grader=strict_grader)
+            refined = base.with_(llm=other_client, max_tool_calls=15, grader=strict_grader)
 
         Any unknown field names raise ``TypeError`` (from ``dataclasses.replace``);
         ``__post_init__`` validation runs on the new instance.
@@ -269,14 +269,63 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
         total_usage["llm_calls"] += 1
 
         # --- Structured-output termination path ---
-        # When a schema is set, the model must call submit_output to finish.
-        # If it's present in this turn's tool calls, try to validate.
-        submit_call: ToolCall | None = None
+        # When a schema is set, submit_output must be the ONLY tool call in
+        # its turn. Otherwise, silently terminating on submit_output would
+        # drop the other tool executions the model just requested — bugs
+        # that look like "my RAG lookup result vanished."
+        submit_calls: list[ToolCall] = []
+        other_tool_calls: list[ToolCall] = []
         if config.output_schema is not None and response.tool_calls:
             for call in response.tool_calls:
                 if call.name == SUBMIT_OUTPUT_TOOL:
-                    submit_call = call
-                    break
+                    submit_calls.append(call)
+                else:
+                    other_tool_calls.append(call)
+
+        # Ambiguous turn: submit_output combined with other tool calls, or
+        # emitted more than once. Ask the model to retry with submit_output
+        # alone. Counts against max_parse_retries — same failure budget as
+        # invalid args, since both are "model didn't follow the schema
+        # contract."
+        if submit_calls and (len(submit_calls) > 1 or other_tool_calls):
+            parse_retries += 1
+            logger.info(
+                "submit_output emitted alongside other tool calls "
+                "(%d/%d)", parse_retries, config.max_parse_retries,
+            )
+            messages.append(
+                Message(
+                    role=Role.ASSISTANT,
+                    content=response.content,
+                    tool_calls=response.tool_calls,
+                )
+            )
+            for call in response.tool_calls:
+                if call.name == SUBMIT_OUTPUT_TOOL:
+                    content = (
+                        f"Ambiguous turn: when calling `{SUBMIT_OUTPUT_TOOL}`,"
+                        f" it must be the only tool call. Retry with "
+                        f"`{SUBMIT_OUTPUT_TOOL}` alone."
+                    )
+                else:
+                    content = (
+                        f"[skipped: `{SUBMIT_OUTPUT_TOOL}` must be the only "
+                        f"call in its turn. Run this tool in a separate turn "
+                        f"before submitting.]"
+                    )
+                messages.append(
+                    Message(role=Role.TOOL, content=content, tool_call_id=call.id)
+                )
+            if parse_retries > config.max_parse_retries:
+                final_output = (
+                    f"[agent terminated: model combined "
+                    f"{SUBMIT_OUTPUT_TOOL} with other tool calls "
+                    f"{parse_retries} times]"
+                )
+                break
+            continue
+
+        submit_call: ToolCall | None = submit_calls[0] if submit_calls else None
 
         if submit_call is not None:
             extract_span = config.tracer.start_span(
