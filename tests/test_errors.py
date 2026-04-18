@@ -8,6 +8,7 @@ import pytest
 from pydantic import BaseModel
 
 from jig import (
+    AgentAmbiguousTurnError,
     AgentConfig,
     AgentError,
     AgentMaxLLMCallsError,
@@ -127,6 +128,7 @@ class TestErrorHierarchy:
         assert issubclass(AgentMaxLLMRetriesError, AgentError)
         assert issubclass(AgentSchemaValidationError, AgentError)
         assert issubclass(AgentSchemaNotCalledError, AgentError)
+        assert issubclass(AgentAmbiguousTurnError, AgentError)
 
 
 class TestJigMemoryError:
@@ -171,8 +173,14 @@ class TestAgentErrorCategories:
             AgentMaxLLMRetriesError(3, "x").category,
             AgentSchemaValidationError(2, "x").category,
             AgentSchemaNotCalledError(2).category,
+            AgentAmbiguousTurnError(2).category,
         }
-        assert len(cats) == 4
+        assert len(cats) == 5
+
+    def test_ambiguous_turn(self):
+        e = AgentAmbiguousTurnError(2)
+        assert e.category == "ambiguous_tool_turn"
+        assert e.retries == 2
 
     def test_max_llm_calls(self):
         e = AgentMaxLLMCallsError(50)
@@ -270,6 +278,64 @@ class TestAgentResultError:
         assert result.error.retries == 2
         assert result.parsed is None
 
+    async def test_ambiguous_turn_sets_error(self):
+        """When model keeps combining submit_output with other tool calls."""
+        class Out(BaseModel):
+            strategy_types: list[str]
+
+        mixed = LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCall(id="t1", name="echo", arguments={"text": "x"}),
+                ToolCall(id="t2", name="submit_output",
+                         arguments={"strategy_types": ["x"]}),
+            ],
+            usage=Usage(1, 1),
+            latency_ms=1,
+            model="fake",
+        )
+        llm = FakeLLM([mixed, mixed, mixed])
+        result = await run_agent(
+            _config(llm, output_schema=Out, max_parse_retries=1),
+            "go",
+        )
+
+        assert isinstance(result.error, AgentAmbiguousTurnError)
+        assert result.error.category == "ambiguous_tool_turn"
+        assert result.parsed is None
+
+    async def test_llm_calls_counts_attempts_not_successes(self):
+        """A flaky LLM must still hit max_llm_calls, not race past it."""
+        # Mix successes and failures. With max_llm_calls=3, we should
+        # terminate after 3 attempts regardless of how many succeeded.
+        err = JigLLMError("transient", "fake", retryable=True)
+        ok = LLMResponse(content="ok", tool_calls=None, usage=Usage(1, 1), latency_ms=1, model="fake")
+        # Sequence: err, err, ok — the 3rd attempt succeeds and returns
+        llm = FakeLLM([err, err, ok])
+        result = await run_agent(
+            _config(llm, max_llm_calls=3, max_llm_retries=5),
+            "go",
+        )
+        # Happy path: the 3rd attempt succeeded before hitting the cap
+        assert result.error is None
+        assert result.usage["llm_calls"] == 3
+
+    async def test_llm_calls_cap_trips_on_persistent_failures(self):
+        """All failures → max_llm_calls terminates before max_llm_retries."""
+        err = JigLLMError("always broken", "fake", retryable=True)
+        # max_llm_calls=2 < max_llm_retries=5, so the calls cap trips first
+        llm = FakeLLM([err] * 5)
+        result = await run_agent(
+            _config(llm, max_llm_calls=2, max_llm_retries=5),
+            "go",
+        )
+        # Attempts are counted; cap trips on the 3rd loop iteration
+        assert result.usage["llm_calls"] == 2
+        # Terminated via AgentMaxLLMCallsError (llm_calls cap) rather than
+        # AgentMaxLLMRetriesError (consecutive errors cap), because the
+        # calls cap is lower.
+        assert isinstance(result.error, AgentMaxLLMCallsError)
+
 
 @pytest.mark.asyncio
 class TestTraceErrorCategoryTagging:
@@ -297,3 +363,28 @@ class TestTraceErrorCategoryTagging:
         assert isinstance(root_span.output, dict)
         assert "error_category" not in root_span.output
         assert root_span.error is None
+
+
+@pytest.mark.asyncio
+class TestTracerFlushDefault:
+    """TracingLogger.flush is a no-op by default so run_agent can call it
+    on any tracer implementation without AttributeError."""
+
+    async def test_stdout_tracer_flush_default_is_noop(self):
+        from jig.tracing.stdout import StdoutTracer
+
+        tracer = StdoutTracer(color=False)
+        # Should not raise — inherited default on TracingLogger
+        await tracer.flush()
+
+    async def test_run_agent_with_stdout_tracer_does_not_raise(self):
+        """End-to-end sanity: run_agent calls tracer.flush() at the end; with
+        the no-op default on TracingLogger, StdoutTracer works unchanged."""
+        from jig.tracing.stdout import StdoutTracer
+
+        llm = FakeLLM([
+            LLMResponse(content="ok", tool_calls=None, usage=Usage(1, 1), latency_ms=1, model="fake"),
+        ])
+        # Must not raise AttributeError on tracer.flush()
+        result = await run_agent(_config(llm, tracer=StdoutTracer(color=False)), "hi")
+        assert result.output == "ok"

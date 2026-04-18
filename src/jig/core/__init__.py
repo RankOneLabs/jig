@@ -1,4 +1,5 @@
 from jig.core.errors import (
+    AgentAmbiguousTurnError,
     AgentError,
     AgentMaxLLMCallsError,
     AgentMaxLLMRetriesError,
@@ -41,6 +42,7 @@ __all__ = [
     "EvalCase",
     "FeedbackLoop",
     "Grader",
+    "AgentAmbiguousTurnError",
     "AgentError",
     "AgentMaxLLMCallsError",
     "AgentMaxLLMRetriesError",

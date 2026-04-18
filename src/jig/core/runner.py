@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable
 from pydantic import BaseModel, ValidationError
 
 from jig.core.errors import (
+    AgentAmbiguousTurnError,
     AgentError,
     AgentMaxLLMCallsError,
     AgentMaxLLMRetriesError,
@@ -241,6 +242,10 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
             final_output = f"[agent terminated: {agent_error}]"
             break
 
+        # Count every attempted round-trip so the cap applies to failures
+        # too, not just successes. A flaky LLM would otherwise be able to
+        # race past max_llm_calls via the consecutive-errors retry path.
+        total_usage["llm_calls"] += 1
         llm_span = config.tracer.start_span(trace.id, SpanKind.LLM_CALL, "completion")
         params = CompletionParams(
             messages=messages,
@@ -278,7 +283,6 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
         total_usage["total_input_tokens"] += response.usage.input_tokens
         total_usage["total_output_tokens"] += response.usage.output_tokens
         total_usage["total_cost"] += response.usage.cost or 0.0
-        total_usage["llm_calls"] += 1
 
         # --- Structured-output termination path ---
         # When a schema is set, submit_output must be the ONLY tool call in
@@ -329,11 +333,8 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                     Message(role=Role.TOOL, content=content, tool_call_id=call.id)
                 )
             if parse_retries > config.max_parse_retries:
-                final_output = (
-                    f"[agent terminated: model combined "
-                    f"{SUBMIT_OUTPUT_TOOL} with other tool calls "
-                    f"{parse_retries} times]"
-                )
+                agent_error = AgentAmbiguousTurnError(parse_retries)
+                final_output = f"[agent terminated: {agent_error}]"
                 break
             continue
 

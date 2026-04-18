@@ -15,7 +15,9 @@ Three layers:
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
+
+ToolErrorPhase = Literal["schema", "execute", "serialize"]
 
 
 class JigError(Exception):
@@ -59,20 +61,27 @@ class JigMemoryError(JigError):
 
 
 class JigToolError(JigError):
-    """Raised by tool execution or schema validation."""
+    """Raised by tool execution or schema validation.
+
+    ``phase`` marks *where* in the tool lifecycle the error occurred:
+    ``"schema"`` (arg validation before execute), ``"execute"`` (the
+    tool's own code), or ``"serialize"`` (encoding the result back).
+    The ``Literal`` typing keeps the contract honest at the type-checker
+    level without adding runtime overhead.
+    """
 
     def __init__(
         self,
         message: str,
         *,
         tool_name: str,
-        phase: str,
+        phase: ToolErrorPhase,
         retryable: bool = False,
         underlying: BaseException | None = None,
     ):
         super().__init__(message)
         self.tool_name = tool_name
-        self.phase = phase          # one of "schema" | "execute" | "serialize"
+        self.phase: ToolErrorPhase = phase
         self.retryable = retryable
         self.underlying = underlying
 
@@ -158,6 +167,24 @@ class AgentSchemaNotCalledError(AgentError):
     def __init__(self, retries: int):
         super().__init__(
             f"Model did not call submit_output within {retries} retries",
+            retries=retries,
+        )
+        self.retries = retries
+
+
+class AgentAmbiguousTurnError(AgentError):
+    """Model kept emitting submit_output alongside other tool calls.
+
+    The runner rejects these turns (terminating would silently drop the
+    other requested tool executions). Repeated ambiguity past
+    ``max_parse_retries`` gives up.
+    """
+
+    category = "ambiguous_tool_turn"
+
+    def __init__(self, retries: int):
+        super().__init__(
+            f"Model combined submit_output with other tool calls {retries} times",
             retries=retries,
         )
         self.retries = retries

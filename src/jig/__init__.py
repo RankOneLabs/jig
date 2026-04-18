@@ -1,5 +1,6 @@
 from jig.budget import BudgetedLLMClient, BudgetTracker
 from jig.core import (
+    AgentAmbiguousTurnError,
     AgentError,
     AgentMaxLLMCallsError,
     AgentMaxLLMRetriesError,
@@ -69,6 +70,7 @@ __all__ = [
     "TracingLogger",
     "Usage",
     # Errors
+    "AgentAmbiguousTurnError",
     "AgentError",
     "AgentMaxLLMCallsError",
     "AgentMaxLLMRetriesError",
