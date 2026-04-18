@@ -1,10 +1,18 @@
-"""Smithers dispatch adapter — routes inference to the Springfield homelab fleet."""
+"""Smithers dispatch adapter — routes inference to the Springfield homelab fleet.
+
+Thin wrapper around :func:`jig.dispatch.client._submit_and_poll` that
+translates jig's :class:`CompletionParams` into the ``inference`` task
+payload (and parses results back into :class:`LLMResponse`). Tool use
+is supported — adapters serialize tools in the OpenAI-compatible shape
+smithers executors expect, and parse ``tool_calls`` out of the response.
+"""
 from __future__ import annotations
 
-import asyncio
+import json
 import logging
 import math
 import time
+import uuid
 from typing import Any
 
 import httpx
@@ -15,13 +23,19 @@ from jig.core.types import (
     LLMClient,
     LLMResponse,
     Role,
+    ToolCall,
+    ToolDefinition,
+    TraceContext,
     Usage,
+)
+from jig.dispatch.client import (
+    DispatchError,
+    JobTimeoutError,
+    _PollConfig,
+    _submit_and_poll,
 )
 
 logger = logging.getLogger(__name__)
-
-# Smithers job statuses that mean "still working"
-_PENDING_STATUSES = frozenset({"queued", "waking_machine", "dispatched", "running"})
 
 
 def _safe_int(value: Any) -> int:
@@ -59,6 +73,74 @@ def _safe_cost(value: Any) -> float | None:
     return parsed
 
 
+def _tools_payload(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
+    """Serialize :class:`ToolDefinition` list to the OpenAI-style shape
+    smithers executors (vLLM, Ollama) accept natively."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters,
+            },
+        }
+        for t in tools
+    ]
+
+
+def _parse_tool_calls(raw: Any) -> list[ToolCall] | None:
+    """Parse tool_calls from smithers result into jig's :class:`ToolCall`.
+
+    Workers return the list in OpenAI shape::
+
+        [{"id": "...", "function": {"name": "...", "arguments": "{...}"}}]
+
+    where ``arguments`` is a JSON-encoded string. Malformed entries are
+    skipped with a warning; we'd rather lose one tool call than crash
+    the whole completion.
+    """
+    if not raw or not isinstance(raw, list):
+        return None
+    calls: list[ToolCall] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        fn = entry.get("function") or {}
+        name = fn.get("name")
+        if not name:
+            continue
+        args_raw = fn.get("arguments")
+        if isinstance(args_raw, str):
+            try:
+                parsed = json.loads(args_raw) if args_raw else {}
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Malformed tool-call arguments from dispatch: %r", args_raw,
+                )
+                continue
+        elif isinstance(args_raw, dict):
+            parsed = args_raw
+        else:
+            parsed = {}
+        # ``ToolCall.arguments`` is a ``dict[str, Any]`` — workers that
+        # emit scalar/list JSON (``"1"``, ``"[]"``, ``'"x"'``) would
+        # otherwise sneak a non-dict past the type and blow up deeper in
+        # the tool registry. Drop them with the same warning shape as
+        # a JSON decode failure.
+        if not isinstance(parsed, dict):
+            logger.warning(
+                "Non-object tool-call arguments from dispatch: %r", args_raw,
+            )
+            continue
+        calls.append(ToolCall(
+            id=entry.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+            name=name,
+            arguments=parsed,
+        ))
+    return calls or None
+
+
 class DispatchClient(LLMClient):
     """jig LLMClient that submits inference jobs to a smithers dispatch server.
 
@@ -66,6 +148,15 @@ class DispatchClient(LLMClient):
         DispatchClient()                              # router picks model + machine
         DispatchClient(model="llama-70b")             # router picks machine
         DispatchClient(model="llama-70b", machine="mcbain")  # explicit
+
+    Tool use is supported: when :class:`CompletionParams` carries
+    ``tools``, they're serialized into the smithers payload and
+    ``tool_calls`` are parsed back from the worker's response. Workers
+    must be running an executor (vLLM, recent Ollama) whose backend
+    model supports structured tool calling.
+
+    Pass ``trace_context`` to propagate the caller's trace identity —
+    phase 9 wires workers to reparent their spans under it.
     """
 
     def __init__(
@@ -77,14 +168,18 @@ class DispatchClient(LLMClient):
         timeout_seconds: int = 300,
         poll_interval: float = 0.5,
         poll_max_interval: float = 5.0,
+        trace_context: TraceContext | None = None,
     ) -> None:
         self._model = model
         self._machine = machine
         self._dispatch_url = dispatch_url.rstrip("/")
         self._requester = requester
-        self._timeout_seconds = timeout_seconds
-        self._poll_interval = poll_interval
-        self._poll_max_interval = poll_max_interval
+        self._trace_context = trace_context
+        self._poll_config = _PollConfig(
+            timeout_seconds=timeout_seconds,
+            poll_interval=poll_interval,
+            poll_max_interval=poll_max_interval,
+        )
         self._http = httpx.AsyncClient(timeout=30.0)
 
     async def aclose(self) -> None:
@@ -93,144 +188,88 @@ class DispatchClient(LLMClient):
 
     def _build_payload(self, params: CompletionParams) -> dict[str, Any]:
         """Convert CompletionParams to smithers executor payload format."""
-        if params.tools:
-            raise JigLLMError(
-                "Tool use is not supported through smithers dispatch",
-                "dispatch",
-            )
-
-        messages: list[dict[str, str]] = []
+        messages: list[dict[str, Any]] = []
         if params.system:
             messages.append({"role": "system", "content": params.system})
         for msg in params.messages:
             if msg.role == Role.SYSTEM:
                 continue
-            messages.append({"role": msg.role.value, "content": msg.content})
+            m: dict[str, Any] = {"role": msg.role.value, "content": msg.content}
+            if msg.tool_call_id is not None:
+                m["tool_call_id"] = msg.tool_call_id
+            if msg.tool_calls:
+                # Echo the assistant's prior tool calls back in the shape
+                # smithers workers parse (OpenAI-compatible JSON string args).
+                m["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.arguments),
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ]
+            messages.append(m)
 
         payload: dict[str, Any] = {"messages": messages}
+        if params.tools:
+            payload["tools"] = _tools_payload(params.tools)
         if params.temperature is not None:
             payload["temperature"] = params.temperature
         if params.max_tokens is not None:
             payload["max_tokens"] = params.max_tokens
+        if params.provider_params:
+            payload.update(params.provider_params)
         return payload
 
     async def complete(self, params: CompletionParams) -> LLMResponse:
         payload = self._build_payload(params)
         start = time.time()
-
-        # Submit job
-        submission = {
-            "task_type": "inference",
-            "payload": payload,
-            "requester": self._requester,
-            "priority": "normal",
-            "timeout_seconds": self._timeout_seconds,
-        }
-        if self._model is not None:
-            submission["model"] = self._model
-        if self._machine is not None:
-            submission["machine"] = self._machine
-
         try:
-            resp = await self._http.post(f"{self._dispatch_url}/jobs", json=submission)
-            resp.raise_for_status()
-        except httpx.ConnectError:
-            raise JigLLMError(
-                f"Cannot reach dispatch server at {self._dispatch_url}",
-                "dispatch",
-                retryable=True,
+            data = await _submit_and_poll(
+                http=self._http,
+                dispatch_url=self._dispatch_url,
+                task_type="inference",
+                payload=payload,
+                requester=self._requester,
+                model=self._model,
+                machine=self._machine,
+                trace_context=(
+                    self._trace_context.to_dict()
+                    if self._trace_context is not None else None
+                ),
+                poll_config=self._poll_config,
             )
-        except httpx.HTTPStatusError as e:
+        except JobTimeoutError as e:
             raise JigLLMError(
-                f"Dispatch submission failed: {e.response.status_code} {e.response.text}",
-                "dispatch",
-            )
-        except httpx.RequestError as e:
+                str(e), "dispatch", retryable=True,
+            ) from e
+        except DispatchError as e:
+            # Honor the DispatchError's own retryability — transient
+            # submission failures (ConnectError, 5xx, network timeouts)
+            # should let the agent loop retry instead of killing the run.
             raise JigLLMError(
-                f"Dispatch request error: {e}",
-                "dispatch",
-                retryable=True,
-            )
+                str(e), "dispatch", retryable=e.retryable,
+            ) from e
 
-        try:
-            job_id = resp.json()["job_id"]
-        except (ValueError, KeyError) as e:
-            raise JigLLMError(
-                f"Unexpected dispatch response: {resp.text}",
-                "dispatch",
-            )
+        latency_ms = (time.time() - start) * 1000
+        result = data.get("result") or {}
+        content = result.get("content", "")
+        model = data.get("model") or self._model or "dispatch"
+        raw_usage = result.get("usage")
+        usage_data = raw_usage if isinstance(raw_usage, dict) else {}
+        tool_calls = _parse_tool_calls(result.get("tool_calls"))
 
-        logger.info(f"Dispatch job {job_id} submitted (model={self._model})")
-
-        # Poll for completion
-        interval = self._poll_interval
-        while True:
-            remaining = self._timeout_seconds - (time.time() - start)
-            if remaining <= 0:
-                raise JigLLMError(
-                    f"Dispatch job {job_id} timed out after {self._timeout_seconds}s",
-                    "dispatch",
-                    retryable=True,
-                )
-
-            await asyncio.sleep(min(interval, remaining))
-            interval = min(interval * 2, self._poll_max_interval)
-
-            try:
-                poll = await self._http.get(f"{self._dispatch_url}/jobs/{job_id}")
-                poll.raise_for_status()
-            except httpx.ConnectError:
-                logger.warning(f"Lost connection polling job {job_id}, retrying...")
-                continue
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 404:
-                    raise JigLLMError(
-                        f"Dispatch job {job_id} not found (expired or invalid)",
-                        "dispatch",
-                    )
-                logger.warning(f"HTTP {e.response.status_code} polling job {job_id}, retrying...")
-                continue
-            except httpx.RequestError:
-                logger.warning(f"Request error polling job {job_id}, retrying...")
-                continue
-
-            try:
-                data = poll.json()
-            except ValueError:
-                logger.warning(f"Malformed JSON polling job {job_id}, retrying...")
-                continue
-            status = data.get("status", "") if isinstance(data, dict) else ""
-
-            if status in _PENDING_STATUSES:
-                continue
-
-            latency_ms = (time.time() - start) * 1000
-
-            if status == "complete":
-                result = data.get("result") or {}
-                content = result.get("content", "")
-                model = data.get("model") or self._model or "dispatch"
-                raw_usage = result.get("usage")
-                usage_data = raw_usage if isinstance(raw_usage, dict) else {}
-                logger.info(f"Dispatch job {job_id} complete ({latency_ms:.0f}ms)")
-                return LLMResponse(
-                    content=content,
-                    tool_calls=None,
-                    usage=Usage(
-                        input_tokens=_safe_int(usage_data.get("input_tokens")),
-                        output_tokens=_safe_int(usage_data.get("output_tokens")),
-                        cost=_safe_cost(usage_data.get("cost")),
-                    ),
-                    latency_ms=latency_ms,
-                    model=model,
-                )
-
-            if status == "failed":
-                error = data.get("error") or "Unknown dispatch error"
-                raise JigLLMError(error, "dispatch")
-
-            if status == "cancelled":
-                raise JigLLMError("Dispatch job was cancelled", "dispatch")
-
-            # Unknown status — keep polling
-            logger.warning(f"Unexpected job status: {status}")
+        return LLMResponse(
+            content=content,
+            tool_calls=tool_calls,
+            usage=Usage(
+                input_tokens=_safe_int(usage_data.get("input_tokens")),
+                output_tokens=_safe_int(usage_data.get("output_tokens")),
+                cost=_safe_cost(usage_data.get("cost")),
+            ),
+            latency_ms=latency_ms,
+            model=model,
+        )

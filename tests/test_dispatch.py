@@ -76,14 +76,23 @@ class TestBuildPayload:
         assert payload["temperature"] == 0.7
         assert payload["max_tokens"] == 1024
 
-    def test_tools_rejected(self):
+    def test_tools_included_in_payload(self):
+        """Phase 7+8: tools pass through in OpenAI-compatible shape."""
         client = DispatchClient()
         params = CompletionParams(
             messages=[Message(role=Role.USER, content="Hi")],
-            tools=[ToolDefinition(name="test", description="test", parameters={})],
+            tools=[ToolDefinition(
+                name="echo",
+                description="echoes input",
+                parameters={"type": "object", "properties": {"text": {"type": "string"}}},
+            )],
         )
-        with pytest.raises(JigLLMError, match="Tool use is not supported"):
-            client._build_payload(params)
+        payload = client._build_payload(params)
+        assert "tools" in payload
+        assert payload["tools"][0]["type"] == "function"
+        assert payload["tools"][0]["function"]["name"] == "echo"
+        assert payload["tools"][0]["function"]["description"] == "echoes input"
+        assert payload["tools"][0]["function"]["parameters"]["type"] == "object"
 
     def test_skips_system_role_in_messages(self):
         client = DispatchClient()
