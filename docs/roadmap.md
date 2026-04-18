@@ -13,24 +13,29 @@ replay; phases 12–13 migrate consumers.
 
 | Phase | Name                                      | Status        | PR   | Breaking |
 | ----- | ----------------------------------------- | ------------- | ---- | -------- |
-| 0     | LLM layer ergonomics                      | **merged**    | #12  | no       |
-| 1     | Typed agent outputs                       | **merged**    | #13  | yes      |
-| 2     | `AgentConfig` variant derivation          | **merged**    | #14  | yes      |
-| 3     | Error taxonomy                            | **merged**    | #15  | minor    |
-| 4     | Feedback query API + `PastResults`        | **open**      | #16  | minor    |
-| 5     | `jig.compare` + `jig.sweep`               | **open**      | #16  | no       |
-| 6     | Memory split (Store / Retriever)          | **in flight** | —    | yes      |
-| 7     | Smithers dispatch — LLM                   | pending       | —    | no       |
-| 8     | Smithers dispatch — tools + steps         | pending       | —    | no       |
-| 9     | Trace propagation across dispatch         | pending       | —    | no       |
-| 10    | Callback-based sweep fan-out              | pending       | —    | no       |
-| 11    | Agent replay from trace                   | **open**      | #20  | minor    |
-| 12    | Ta capstone migration                     | pending       | —    | —        |
-| 13    | Scout + algerknown lift                   | pending       | —    | —        |
+| 0     | LLM layer ergonomics                      | **merged**    | #12        | no       |
+| 1     | Typed agent outputs                       | **merged**    | #13        | yes      |
+| 2     | `AgentConfig` variant derivation          | **merged**    | #14        | yes      |
+| 3     | Error taxonomy                            | **merged**    | #15        | minor    |
+| 4     | Feedback query API + `PastResults`        | **merged**    | #16        | minor    |
+| 5     | `jig.compare` + `jig.sweep`               | **merged**    | #16        | no       |
+| 6     | Memory split (Store / Retriever)          | **merged**    | #17        | yes      |
+| 7     | Smithers dispatch — LLM                   | **merged**    | jig #19, smithers #18 | no |
+| 8     | Smithers dispatch — tools + steps         | **merged**    | jig #19, smithers #18 | no |
+| 9     | Trace propagation across dispatch         | **ready**     | jig + smithers phase-9 branches ready to open PRs | no |
+| 10    | Callback-based sweep fan-out              | pending       | —          | no       |
+| 11    | Agent replay from trace                   | **merged**    | #20        | minor    |
+| 12    | Ta capstone migration                     | pending       | —          | —        |
+| 13    | Scout + algerknown lift                   | pending       | —          | —        |
 
 Phases 4+5 are bundled in one PR because their surfaces pair naturally
 (feedback query ↔ sweep auto-persist). Phase 6 is independent and runs
-in a parallel agent session.
+in a parallel agent session. Phases 7+8 were bundled in one pair of
+PRs (jig #19 + smithers #18) because they tell the same dispatch
+story.
+
+**Next critical-path work: phase 9.** Detailed plan at
+[`phase-9-trace-propagation.md`](phase-9-trace-propagation.md).
 
 ## Locked design decisions
 
