@@ -173,6 +173,31 @@ class Span:
     usage: Usage | None = None
 
 
+@dataclass
+class TraceContext:
+    """Carries trace identity across a dispatch boundary.
+
+    Serialized into smithers job payloads so workers can start their
+    spans as children of the caller's span. Phase 7+8 establishes the
+    protocol (payload propagation); phase 9 wires the reader side on
+    workers so the spans actually reparent.
+    """
+
+    trace_id: str
+    parent_span_id: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"trace_id": self.trace_id, "parent_span_id": self.parent_span_id}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TraceContext | None:
+        tid = data.get("trace_id")
+        pid = data.get("parent_span_id")
+        if not isinstance(tid, str) or not isinstance(pid, str):
+            return None
+        return cls(trace_id=tid, parent_span_id=pid)
+
+
 # --- Abstract interfaces ---
 
 
@@ -352,6 +377,22 @@ class TracingLogger(ABC):
 
 
 class Tool(ABC):
+    # Route execution through ``jig.dispatch.run`` instead of calling
+    # ``execute()`` locally. Subclasses override to True for work that
+    # belongs on a smithers worker (backtests, embeddings, reindexes).
+    # :attr:`dispatch_fn_ref` must be set when this is True.
+    dispatch: bool = False
+
+    @property
+    def dispatch_fn_ref(self) -> str | None:
+        """Entry-point identifier the smithers worker resolves.
+
+        Format: ``"package.module:function"``. The worker looks this up
+        via the ``jig.smithers_fn`` entry-point group. Only required
+        (and only used) when :attr:`dispatch` is True.
+        """
+        return None
+
     @property
     @abstractmethod
     def definition(self) -> ToolDefinition: ...

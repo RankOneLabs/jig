@@ -42,6 +42,9 @@ from jig.core import (
 )
 from jig.core.pipeline import map_pipeline, run_pipeline
 from jig.core.runner import AgentConfig, AgentResult, run_agent
+from jig.core.types import TraceContext
+from jig.dispatch import DispatchError, JobTimeoutError
+from jig.dispatch import run as dispatch_run
 from jig.llm.factory import complete, from_model
 from jig.sweep import (
     CompareResult,
@@ -118,4 +121,9 @@ __all__ = [
     "SweepRun",
     "compare",
     "sweep",
+    # Dispatch
+    "DispatchError",
+    "JobTimeoutError",
+    "TraceContext",
+    "dispatch_run",
 ]
