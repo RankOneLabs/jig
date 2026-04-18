@@ -11,6 +11,7 @@ from jig import (
     AgentAmbiguousTurnError,
     AgentConfig,
     AgentError,
+    AgentLLMPermanentError,
     AgentMaxLLMCallsError,
     AgentMaxLLMRetriesError,
     AgentSchemaNotCalledError,
@@ -129,6 +130,7 @@ class TestErrorHierarchy:
         assert issubclass(AgentSchemaValidationError, AgentError)
         assert issubclass(AgentSchemaNotCalledError, AgentError)
         assert issubclass(AgentAmbiguousTurnError, AgentError)
+        assert issubclass(AgentLLMPermanentError, AgentError)
 
 
 class TestJigMemoryError:
@@ -174,13 +176,25 @@ class TestAgentErrorCategories:
             AgentSchemaValidationError(2, "x").category,
             AgentSchemaNotCalledError(2).category,
             AgentAmbiguousTurnError(2).category,
+            AgentLLMPermanentError("p", "m", 500).category,
         }
-        assert len(cats) == 5
+        assert len(cats) == 6
 
     def test_ambiguous_turn(self):
         e = AgentAmbiguousTurnError(2)
         assert e.category == "ambiguous_tool_turn"
         assert e.retries == 2
+
+    def test_llm_permanent_error(self):
+        e = AgentLLMPermanentError(
+            provider="anthropic",
+            message="invalid api key",
+            status_code=401,
+        )
+        assert e.category == "llm_permanent_error"
+        assert e.provider == "anthropic"
+        assert e.status_code == 401
+        assert "invalid api key" in str(e)
 
     def test_max_llm_calls(self):
         e = AgentMaxLLMCallsError(50)
@@ -336,12 +350,117 @@ class TestAgentResultError:
         # calls cap is lower.
         assert isinstance(result.error, AgentMaxLLMCallsError)
 
+    async def test_non_retryable_llm_error_terminates_fast(self):
+        """retryable=False → one attempt, AgentLLMPermanentError, no retry burn."""
+        err = JigLLMError(
+            "invalid api key", "anthropic", status_code=401, retryable=False,
+        )
+        # Buffer many retries; if the runner ignored retryable it would
+        # consume several before hitting max_llm_retries
+        llm = FakeLLM([err] * 5)
+        result = await run_agent(
+            _config(llm, max_llm_retries=5, max_llm_calls=10),
+            "go",
+        )
+
+        assert isinstance(result.error, AgentLLMPermanentError)
+        assert result.error.provider == "anthropic"
+        assert result.error.status_code == 401
+        # Only one attempt was made — budget preserved
+        assert result.usage["llm_calls"] == 1
+
+    async def test_retryable_llm_error_uses_retry_path(self):
+        """retryable=True preserves existing consecutive-retries behavior."""
+        err = JigLLMError("rate limit", "fake", retryable=True)
+        ok = LLMResponse(content="ok", tool_calls=None, usage=Usage(1, 1), latency_ms=1, model="fake")
+        llm = FakeLLM([err, err, ok])
+        result = await run_agent(_config(llm, max_llm_retries=5), "go")
+
+        assert result.error is None
+        assert result.output == "ok"
+        assert result.usage["llm_calls"] == 3
+
+
+@pytest.mark.asyncio
+class TestTracerFinalizationOnException:
+    """run_agent's try/finally ensures buffered tracers flush even when an
+    exception propagates from memory.add / grading / etc. mid-run."""
+
+    async def test_flush_called_when_memory_add_raises(self):
+        class FlakyMemory(FakeMemory):
+            async def add(self, content, metadata=None):
+                raise RuntimeError("memory write failed")
+
+        class FlushTrackingTracer(FakeTracer):
+            def __init__(self):
+                super().__init__()
+                self.flush_count = 0
+
+            async def flush(self):
+                self.flush_count += 1
+
+        tracer = FlushTrackingTracer()
+        llm = FakeLLM([
+            LLMResponse(content="ok", tool_calls=None, usage=Usage(1, 1), latency_ms=1, model="fake"),
+        ])
+        config = AgentConfig(
+            name="t",
+            description="test",
+            system_prompt="",
+            llm=llm,
+            memory=FlakyMemory(),
+            feedback=FakeFeedback(),
+            tracer=tracer,
+            tools=ToolRegistry(),
+        )
+
+        with pytest.raises(RuntimeError, match="memory write failed"):
+            await run_agent(config, "hi")
+
+        # flush must have run despite the memory exception propagating
+        assert tracer.flush_count == 1
+        # Root span must be ended
+        root = tracer.spans[0]
+        assert root.ended_at is not None
+
+    async def test_finalization_swallows_end_span_errors(self):
+        """A broken tracer.end_span must not shadow the original exception."""
+        class FlakyMemory(FakeMemory):
+            async def add(self, content, metadata=None):
+                raise RuntimeError("original error")
+
+        class BrokenEndSpanTracer(FakeTracer):
+            def end_span(self, span_id, output=None, error=None, usage=None):
+                if span_id == "t":  # root trace id in the fake
+                    raise RuntimeError("tracer corrupt")
+                super().end_span(span_id, output, error, usage)
+
+        llm = FakeLLM([
+            LLMResponse(content="ok", tool_calls=None, usage=Usage(1, 1), latency_ms=1, model="fake"),
+        ])
+        config = AgentConfig(
+            name="t",
+            description="test",
+            system_prompt="",
+            llm=llm,
+            memory=FlakyMemory(),
+            feedback=FakeFeedback(),
+            tracer=BrokenEndSpanTracer(),
+            tools=ToolRegistry(),
+        )
+
+        # Original exception bubbles up; tracer error is logged and swallowed
+        with pytest.raises(RuntimeError, match="original error"):
+            await run_agent(config, "hi")
+
 
 @pytest.mark.asyncio
 class TestTraceErrorCategoryTagging:
     async def test_trace_span_metadata_carries_category(self):
         """Root span output includes error_category for rollup queries."""
-        err = JigLLMError("boom", "fake")
+        # Retryable=True so the error feeds the max_llm_retries path
+        # rather than the new permanent-error fast-fail.
+        err = JigLLMError("boom", "fake", retryable=True)
         llm = FakeLLM([err, err])
         tracer = FakeTracer()
         await run_agent(_config(llm, tracer=tracer, max_llm_retries=2), "go")

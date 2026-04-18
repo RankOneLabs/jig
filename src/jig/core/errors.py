@@ -188,3 +188,27 @@ class AgentAmbiguousTurnError(AgentError):
             retries=retries,
         )
         self.retries = retries
+
+
+class AgentLLMPermanentError(AgentError):
+    """Runner terminated because the LLM raised a non-retryable error.
+
+    Adapters set ``JigLLMError.retryable = False`` for permanent failures
+    (auth, invalid model, bad request). Retrying those burns call budget
+    and would surface as ``AgentMaxLLMRetriesError`` even though only one
+    attempt was needed to diagnose. Surface the provider error directly
+    so rollups can distinguish "Haiku auth broken" from "Haiku rate-limit
+    exhausted."
+    """
+
+    category = "llm_permanent_error"
+
+    def __init__(self, provider: str, message: str, status_code: int | None = None):
+        super().__init__(
+            f"Non-retryable LLM error from {provider}: {message}",
+            provider=provider,
+            status_code=status_code,
+        )
+        self.provider = provider
+        self.status_code = status_code
+        self.last_error = message
