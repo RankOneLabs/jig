@@ -24,7 +24,15 @@ _PENDING_STATUSES = frozenset({"queued", "waking_machine", "dispatched", "runnin
 
 
 class DispatchError(JigError):
-    """A smithers dispatch call failed terminally (non-retryable)."""
+    """A smithers dispatch call failed.
+
+    ``retryable=True`` signals a transient failure the caller may retry —
+    primarily submission-time connection / network errors. Worker-side
+    terminal outcomes (``failed``, ``cancelled``, HTTP 4xx, malformed
+    response) stay non-retryable because retrying them just reproduces
+    the same result. :class:`JobTimeoutError` is retryable by default
+    since a hung worker can succeed on a fresh submission.
+    """
 
     def __init__(
         self,
@@ -32,17 +40,21 @@ class DispatchError(JigError):
         *,
         job_id: str | None = None,
         status: str | None = None,
+        retryable: bool = False,
     ):
         super().__init__(message)
         self.job_id = job_id
         self.status = status
+        self.retryable = retryable
 
 
 class JobTimeoutError(DispatchError):
     """Dispatched job exceeded the configured timeout."""
 
     def __init__(self, message: str, *, job_id: str, timeout_seconds: int):
-        super().__init__(message, job_id=job_id, status="timeout")
+        super().__init__(
+            message, job_id=job_id, status="timeout", retryable=True,
+        )
         self.timeout_seconds = timeout_seconds
 
 
@@ -100,15 +112,27 @@ async def _submit_and_poll(
         resp = await http.post(f"{url}/jobs", json=submission)
         resp.raise_for_status()
     except httpx.ConnectError as e:
+        # Transient: dispatch server may be momentarily unreachable
+        # (restart, network blip). Mark retryable so agent loops can
+        # retry instead of terminating the run.
         raise DispatchError(
             f"Cannot reach dispatch server at {url}",
+            retryable=True,
         ) from e
     except httpx.HTTPStatusError as e:
+        # 4xx = terminal (bad submission), 5xx = transient (server
+        # overloaded / misconfigured, worth a retry).
+        retryable = e.response.status_code >= 500
         raise DispatchError(
             f"Dispatch submission failed: {e.response.status_code} {e.response.text}",
+            retryable=retryable,
         ) from e
     except httpx.RequestError as e:
-        raise DispatchError(f"Dispatch request error: {e}") from e
+        # Timeouts, DNS failures, mid-request disconnects — all transient.
+        raise DispatchError(
+            f"Dispatch request error: {e}",
+            retryable=True,
+        ) from e
 
     try:
         job_id = resp.json()["job_id"]
@@ -196,15 +220,50 @@ async def _submit_and_poll(
 # Shared httpx client for one-off run() calls. Most callers should use
 # an LLMClient-style instance with its own lifecycle; this exists so
 # tool-level dispatch (Tool(dispatch=True)) can fire off calls without
-# asking each tool to manage its own transport.
+# asking each tool to manage its own transport. Callers that run
+# multiple event loops in a process lifetime (tests calling
+# ``asyncio.run`` repeatedly, long-running services that tear down and
+# rebuild) should invoke :func:`aclose` at shutdown; otherwise the
+# interpreter reaps the client at exit.
 _shared_http: httpx.AsyncClient | None = None
+_shared_http_loop: asyncio.AbstractEventLoop | None = None
 
 
 def _get_shared_http() -> httpx.AsyncClient:
-    global _shared_http
+    """Return a lazily-created shared httpx client.
+
+    Rebinds the client when the running event loop differs from the one
+    the client was created on — an ``AsyncClient`` bound to a closed
+    loop raises on use, so ``asyncio.run`` being called twice in the
+    same process would otherwise break dispatch on the second call.
+    """
+    global _shared_http, _shared_http_loop
+    loop = asyncio.get_running_loop()
+    if _shared_http is not None and _shared_http_loop is not loop:
+        # Loop changed out from under us. Detach the old client rather
+        # than awaiting its close here — we're in a sync helper and the
+        # old loop may already be closed. Let GC handle the transport.
+        _shared_http = None
     if _shared_http is None:
         _shared_http = httpx.AsyncClient(timeout=30.0)
+        _shared_http_loop = loop
     return _shared_http
+
+
+async def aclose() -> None:
+    """Close the shared httpx client used by :func:`run`.
+
+    Safe to call multiple times and safe when nothing was ever
+    dispatched. Tests should call this in teardown; long-running
+    services should call it at shutdown. No-op in short-lived scripts
+    (interpreter exit tears the client down anyway).
+    """
+    global _shared_http, _shared_http_loop
+    client = _shared_http
+    _shared_http = None
+    _shared_http_loop = None
+    if client is not None:
+        await client.aclose()
 
 
 async def run(
@@ -248,7 +307,10 @@ async def run(
             poll_max_interval=poll_max_interval,
         ),
     )
-    result = data.get("result") or {}
+    # Don't ``or {}`` here — that rewrites legitimate falsy returns
+    # (``0``, ``False``, ``[]``, ``""``) into an empty dict and breaks
+    # any dispatched function whose natural result is falsy.
+    result = data.get("result")
     if isinstance(result, dict) and "value" in result:
         return result["value"]
     return result

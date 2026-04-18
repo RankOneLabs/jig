@@ -1,6 +1,7 @@
 """Tests for jig.dispatch.run and Tool(dispatch=True) routing."""
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -8,6 +9,7 @@ import httpx
 import pytest
 
 from jig import DispatchError, JobTimeoutError, dispatch_run
+from jig.core.errors import JigLLMError
 from jig.core.types import Tool, ToolCall, ToolDefinition
 from jig.dispatch.client import _PollConfig
 from jig.tools import ToolRegistry
@@ -281,3 +283,281 @@ class TestDispatchClientToolPayload:
         # Tool turn carries tool_call_id
         tool_msg = next(m for m in payload["messages"] if m["role"] == "tool")
         assert tool_msg["tool_call_id"] == "tc-1"
+
+
+# --- PR #19 review fixes ---
+
+
+@pytest.mark.asyncio
+class TestDispatchErrorRetryable:
+    """DispatchError carries a ``retryable`` flag so callers can tell
+    transient submission failures from terminal worker outcomes."""
+
+    async def test_connect_error_is_retryable(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.side_effect = httpx.ConnectError("unreachable")
+
+        with pytest.raises(DispatchError) as exc:
+            await dispatch_run("m:f", http=http, poll_interval=0.01)
+        assert exc.value.retryable is True
+
+    async def test_5xx_is_retryable(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        r = MagicMock(spec=httpx.Response)
+        r.status_code = 503
+        r.text = "overloaded"
+        r.raise_for_status = MagicMock(
+            side_effect=httpx.HTTPStatusError("503", request=MagicMock(), response=r),
+        )
+        http.post.return_value = r
+
+        with pytest.raises(DispatchError) as exc:
+            await dispatch_run("m:f", http=http, poll_interval=0.01)
+        assert exc.value.retryable is True
+
+    async def test_4xx_is_not_retryable(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        r = MagicMock(spec=httpx.Response)
+        r.status_code = 400
+        r.text = "bad task_type"
+        r.raise_for_status = MagicMock(
+            side_effect=httpx.HTTPStatusError("400", request=MagicMock(), response=r),
+        )
+        http.post.return_value = r
+
+        with pytest.raises(DispatchError) as exc:
+            await dispatch_run("m:f", http=http, poll_interval=0.01)
+        assert exc.value.retryable is False
+
+    async def test_worker_failed_is_not_retryable(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        r = MagicMock(spec=httpx.Response)
+        r.status_code = 200
+        r.json.return_value = {"status": "failed", "error": "boom"}
+        r.raise_for_status = MagicMock()
+        http.get.return_value = r
+
+        with pytest.raises(DispatchError) as exc:
+            await dispatch_run("m:f", http=http, poll_interval=0.01)
+        assert exc.value.retryable is False
+
+    async def test_timeout_is_retryable(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.get.return_value = _poll_resp(status="running")
+
+        with pytest.raises(JobTimeoutError) as exc:
+            await dispatch_run(
+                "m:f", http=http, timeout_seconds=1,
+                poll_interval=0.01, poll_max_interval=0.02,
+            )
+        assert exc.value.retryable is True
+
+
+@pytest.mark.asyncio
+class TestDispatchClientRetryablePropagation:
+    """JigLLMError.retryable must mirror the underlying DispatchError."""
+
+    async def test_retryable_connect_surfaces_as_retryable_jig_error(self, monkeypatch):
+        from jig.core.types import CompletionParams, Message, Role
+        from jig.llm import dispatch as llm_dispatch
+
+        async def boom(**_):
+            raise DispatchError("unreachable", retryable=True)
+
+        monkeypatch.setattr(llm_dispatch, "_submit_and_poll", boom)
+        client = llm_dispatch.DispatchClient(model="llama-70b")
+        try:
+            with pytest.raises(JigLLMError) as exc:
+                await client.complete(CompletionParams(
+                    messages=[Message(role=Role.USER, content="hi")],
+                ))
+            assert exc.value.retryable is True
+        finally:
+            await client.aclose()
+
+    async def test_terminal_dispatch_error_stays_terminal(self, monkeypatch):
+        from jig.core.types import CompletionParams, Message, Role
+        from jig.llm import dispatch as llm_dispatch
+
+        async def boom(**_):
+            raise DispatchError("worker failed", retryable=False)
+
+        monkeypatch.setattr(llm_dispatch, "_submit_and_poll", boom)
+        client = llm_dispatch.DispatchClient(model="llama-70b")
+        try:
+            with pytest.raises(JigLLMError) as exc:
+                await client.complete(CompletionParams(
+                    messages=[Message(role=Role.USER, content="hi")],
+                ))
+            assert exc.value.retryable is False
+        finally:
+            await client.aclose()
+
+
+@pytest.mark.asyncio
+class TestFalsyResultPreserved:
+    """``dispatch_run`` must not collapse 0 / False / [] / '' into {}."""
+
+    @pytest.mark.parametrize("falsy", [0, False, [], "", 0.0])
+    async def test_falsy_value_survives(self, falsy):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.get.return_value = _poll_resp(
+            status="complete", result={"value": falsy},
+        )
+        out = await dispatch_run("m:f", http=http, poll_interval=0.01)
+        assert out == falsy
+        assert type(out) is type(falsy)
+
+    async def test_missing_result_returns_none(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        r = MagicMock(spec=httpx.Response)
+        r.status_code = 200
+        r.json.return_value = {"status": "complete"}  # no "result" key
+        r.raise_for_status = MagicMock()
+        http.get.return_value = r
+
+        out = await dispatch_run("m:f", http=http, poll_interval=0.01)
+        assert out is None
+
+
+class TestTraceContextFromDict:
+    """TraceContext.from_dict must never raise on malformed input."""
+
+    def test_none_returns_none(self):
+        from jig.core.types import TraceContext
+        assert TraceContext.from_dict(None) is None
+
+    def test_non_dict_returns_none(self):
+        from jig.core.types import TraceContext
+        for bad in ["str", 42, [1, 2], True]:
+            assert TraceContext.from_dict(bad) is None
+
+    def test_missing_fields_returns_none(self):
+        from jig.core.types import TraceContext
+        assert TraceContext.from_dict({}) is None
+        assert TraceContext.from_dict({"trace_id": "t"}) is None
+
+    def test_non_string_fields_returns_none(self):
+        from jig.core.types import TraceContext
+        assert TraceContext.from_dict(
+            {"trace_id": 1, "parent_span_id": "s"},
+        ) is None
+
+    def test_valid_dict_round_trips(self):
+        from jig.core.types import TraceContext
+        tc = TraceContext.from_dict({"trace_id": "t", "parent_span_id": "s"})
+        assert tc is not None
+        assert tc.trace_id == "t"
+
+
+class TestParseToolCallsRejectsNonDict:
+    """Non-object JSON in tool-call arguments must be dropped, not passed."""
+
+    def test_scalar_json_string_dropped(self):
+        from jig.llm.dispatch import _parse_tool_calls
+        raw = [{
+            "id": "tc-1",
+            "function": {"name": "echo", "arguments": "42"},
+        }]
+        assert _parse_tool_calls(raw) is None
+
+    def test_list_json_string_dropped(self):
+        from jig.llm.dispatch import _parse_tool_calls
+        raw = [{
+            "id": "tc-1",
+            "function": {"name": "echo", "arguments": "[1, 2]"},
+        }]
+        assert _parse_tool_calls(raw) is None
+
+    def test_valid_dict_string_accepted(self):
+        from jig.llm.dispatch import _parse_tool_calls
+        raw = [{
+            "id": "tc-1",
+            "function": {"name": "echo", "arguments": '{"k": "v"}'},
+        }]
+        calls = _parse_tool_calls(raw)
+        assert calls is not None
+        assert calls[0].arguments == {"k": "v"}
+
+
+@pytest.mark.asyncio
+class TestRegistryTimeoutPlumbed:
+    """ToolRegistry(execute_timeout=...) must reach dispatch_run."""
+
+    async def test_timeout_passed_to_dispatch_run(self, monkeypatch):
+        captured: dict[str, Any] = {}
+
+        async def fake_run(fn_ref, payload=None, **kwargs):
+            captured.update(kwargs)
+            return {"value": 1}
+
+        import jig.dispatch
+        monkeypatch.setattr(jig.dispatch, "run", fake_run)
+
+        reg = ToolRegistry([_DispatchedTool()], execute_timeout=42.5)
+        await reg.execute(ToolCall(
+            id="c1", name="backtest", arguments={},
+        ))
+        # int-coerced, matching dispatch_run's signature
+        assert captured["timeout_seconds"] == 42
+
+    async def test_no_timeout_omits_kwarg(self, monkeypatch):
+        captured: dict[str, Any] = {}
+
+        async def fake_run(fn_ref, payload=None, **kwargs):
+            captured.update(kwargs)
+            return {"value": 1}
+
+        import jig.dispatch
+        monkeypatch.setattr(jig.dispatch, "run", fake_run)
+
+        reg = ToolRegistry([_DispatchedTool()])  # no execute_timeout
+        await reg.execute(ToolCall(
+            id="c1", name="backtest", arguments={},
+        ))
+        assert "timeout_seconds" not in captured
+
+
+@pytest.mark.asyncio
+class TestSharedHttpLifecycle:
+    """``jig.dispatch.aclose`` closes the shared client; the client
+    gets rebound when the running event loop changes."""
+
+    async def test_aclose_safe_when_never_used(self):
+        import jig.dispatch
+        # Shouldn't raise, shouldn't hang
+        await jig.dispatch.aclose()
+        await jig.dispatch.aclose()  # idempotent
+
+    async def test_aclose_closes_shared_client(self):
+        import jig.dispatch
+        from jig.dispatch import client as dc
+
+        # Force creation
+        client = dc._get_shared_http()
+        assert not client.is_closed
+
+        await jig.dispatch.aclose()
+        assert client.is_closed
+        # Module globals cleared so next call creates a fresh client
+        assert dc._shared_http is None
+
+    async def test_rebind_on_loop_change(self):
+        """A client bound to a closed loop must not be reused."""
+        from jig.dispatch import client as dc
+
+        # Simulate a prior loop binding: plant a sentinel loop that
+        # isn't the one we're running on.
+        dc._shared_http = MagicMock(spec=httpx.AsyncClient)
+        dc._shared_http_loop = asyncio.new_event_loop()
+        try:
+            fresh = dc._get_shared_http()
+            # Got a real client bound to the current loop
+            assert isinstance(fresh, httpx.AsyncClient)
+            assert dc._shared_http_loop is asyncio.get_running_loop()
+        finally:
+            await dc.aclose()

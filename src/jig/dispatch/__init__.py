@@ -12,7 +12,8 @@ one polling coroutine per in-flight job.
 from jig.dispatch.client import (
     DispatchError,
     JobTimeoutError,
+    aclose,
     run,
 )
 
-__all__ = ["DispatchError", "JobTimeoutError", "run"]
+__all__ = ["DispatchError", "JobTimeoutError", "aclose", "run"]

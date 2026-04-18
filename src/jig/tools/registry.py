@@ -83,6 +83,14 @@ class ToolRegistry:
         kwargs: dict[str, object] = {}
         if self._dispatch_url is not None:
             kwargs["dispatch_url"] = self._dispatch_url
+        # Plumb the registry timeout through so the dispatch-side poll
+        # loop uses the same budget the local wait_for enforces. Without
+        # this, ``dispatch_run``'s default 300s cap would clip any
+        # registry timeout larger than 5 minutes. ``wait_for`` is still
+        # kept as a belt-and-suspenders guard — if the worker hangs on
+        # a non-poll branch, we still exit on time.
+        if self._execute_timeout is not None:
+            kwargs["timeout_seconds"] = max(1, int(self._execute_timeout))
 
         try:
             if self._execute_timeout is not None:

@@ -113,20 +113,30 @@ def _parse_tool_calls(raw: Any) -> list[ToolCall] | None:
         args_raw = fn.get("arguments")
         if isinstance(args_raw, str):
             try:
-                args = json.loads(args_raw) if args_raw else {}
+                parsed = json.loads(args_raw) if args_raw else {}
             except json.JSONDecodeError:
                 logger.warning(
                     "Malformed tool-call arguments from dispatch: %r", args_raw,
                 )
                 continue
         elif isinstance(args_raw, dict):
-            args = args_raw
+            parsed = args_raw
         else:
-            args = {}
+            parsed = {}
+        # ``ToolCall.arguments`` is a ``dict[str, Any]`` — workers that
+        # emit scalar/list JSON (``"1"``, ``"[]"``, ``'"x"'``) would
+        # otherwise sneak a non-dict past the type and blow up deeper in
+        # the tool registry. Drop them with the same warning shape as
+        # a JSON decode failure.
+        if not isinstance(parsed, dict):
+            logger.warning(
+                "Non-object tool-call arguments from dispatch: %r", args_raw,
+            )
+            continue
         calls.append(ToolCall(
             id=entry.get("id") or f"call_{uuid.uuid4().hex[:12]}",
             name=name,
-            arguments=args,
+            arguments=parsed,
         ))
     return calls or None
 
@@ -237,7 +247,12 @@ class DispatchClient(LLMClient):
                 str(e), "dispatch", retryable=True,
             ) from e
         except DispatchError as e:
-            raise JigLLMError(str(e), "dispatch") from e
+            # Honor the DispatchError's own retryability — transient
+            # submission failures (ConnectError, 5xx, network timeouts)
+            # should let the agent loop retry instead of killing the run.
+            raise JigLLMError(
+                str(e), "dispatch", retryable=e.retryable,
+            ) from e
 
         latency_ms = (time.time() - start) * 1000
         result = data.get("result") or {}

@@ -190,7 +190,13 @@ class TraceContext:
         return {"trace_id": self.trace_id, "parent_span_id": self.parent_span_id}
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> TraceContext | None:
+    def from_dict(cls, data: Any) -> TraceContext | None:
+        # Accept ``Any`` rather than ``dict`` because this is usually
+        # called on JSON straight off the wire, which can arrive as null,
+        # a string, a list, etc. when a worker misbehaves. Return None
+        # for everything that isn't a well-formed mapping of strings.
+        if not isinstance(data, dict):
+            return None
         tid = data.get("trace_id")
         pid = data.get("parent_span_id")
         if not isinstance(tid, str) or not isinstance(pid, str):
