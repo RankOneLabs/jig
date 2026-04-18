@@ -334,3 +334,77 @@ class TestBackwardCompatibility:
         params = llm.calls[0]
         if params.tools:
             assert SUBMIT_OUTPUT_TOOL not in [t.name for t in params.tools]
+
+
+class TestReservedToolName:
+    async def test_user_tool_named_submit_output_rejected(self):
+        """When schema is set, user tools can't shadow the reserved name."""
+
+        class CollidingTool:
+            @property
+            def definition(self):
+                return ToolDefinition(
+                    name=SUBMIT_OUTPUT_TOOL,
+                    description="colliding",
+                    parameters={"type": "object", "properties": {}},
+                )
+
+            async def execute(self, args):
+                return ""
+
+        llm = FakeLLM([_submit_response({"strategy_types": []})])
+        with pytest.raises(ValueError, match="reserved"):
+            await run_agent(
+                _config(llm, output_schema=StrategyOutput, tools=[CollidingTool()]),
+                "go",
+            )
+
+    async def test_user_tool_named_submit_output_allowed_without_schema(self):
+        """Without a schema the name isn't reserved — user can own it."""
+
+        class UserSubmit:
+            @property
+            def definition(self):
+                return ToolDefinition(
+                    name=SUBMIT_OUTPUT_TOOL,
+                    description="user-owned",
+                    parameters={"type": "object", "properties": {}},
+                )
+
+            async def execute(self, args):
+                return "ok"
+
+        llm = FakeLLM([
+            LLMResponse(
+                content="done",
+                tool_calls=None,
+                usage=Usage(5, 5),
+                latency_ms=1,
+                model="fake",
+            ),
+        ])
+        # Should complete without raising
+        result = await run_agent(_config(llm, tools=[UserSubmit()]), "hi")
+        assert result.output == "done"
+
+
+class TestFailClosedOnPlainText:
+    async def test_plain_text_exhaustion_fails_closed(self):
+        """Schema set + model never calls submit_output → deterministic failure message,
+        not the last free-form content (which would look successful).
+        """
+        llm = FakeLLM([
+            LLMResponse(content="free form 1", tool_calls=None, usage=Usage(1, 1), latency_ms=1, model="fake"),
+            LLMResponse(content="free form 2", tool_calls=None, usage=Usage(1, 1), latency_ms=1, model="fake"),
+            LLMResponse(content="free form 3", tool_calls=None, usage=Usage(1, 1), latency_ms=1, model="fake"),
+            LLMResponse(content="free form 4", tool_calls=None, usage=Usage(1, 1), latency_ms=1, model="fake"),
+        ])
+        result = await run_agent(
+            _config(llm, output_schema=StrategyOutput, max_parse_retries=1),
+            "go",
+        )
+
+        assert result.parsed is None
+        # Must be the deterministic marker, not any of the free-form responses
+        assert "retry budget" in result.output
+        assert "free form" not in result.output

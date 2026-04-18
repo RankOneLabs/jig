@@ -49,7 +49,7 @@ class AgentConfig[T]:
     tracer: TracingLogger
     tools: ToolRegistry
 
-    grader: Grader[T] | Grader[str] | None = None
+    grader: Grader[T] | None = None
     max_tool_calls: int = 10
     max_llm_retries: int = _MAX_LLM_RETRIES
     include_memory_in_prompt: bool = True
@@ -153,6 +153,11 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
     user_tools = config.tools.list()
     extra_tools: list[ToolDefinition] = []
     if config.output_schema is not None:
+        if any(t.name == SUBMIT_OUTPUT_TOOL for t in user_tools):
+            raise ValueError(
+                f"Tool name {SUBMIT_OUTPUT_TOOL!r} is reserved by the runner "
+                f"when output_schema is set. Rename the user tool."
+            )
         extra_tools.append(_build_submit_output_tool(config.output_schema))
     tools_for_llm = (user_tools + extra_tools) or None
 
@@ -292,7 +297,12 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                 # to max_parse_retries attempts.
                 parse_retries += 1
                 if parse_retries > config.max_parse_retries:
-                    final_output = response.content or (
+                    # Fail closed: the caller explicitly asked for a typed
+                    # output, so returning the model's free-form content
+                    # would make a non-compliant run look successful. Leave
+                    # parsed as None and use a deterministic failure marker
+                    # — same shape as the validation-error path.
+                    final_output = (
                         "[agent terminated: model did not call "
                         f"{SUBMIT_OUTPUT_TOOL} within retry budget]"
                     )
