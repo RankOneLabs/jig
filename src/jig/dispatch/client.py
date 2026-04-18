@@ -169,7 +169,7 @@ async def _submit_and_poll(
                     f"Dispatch job {job_id} not found (expired or invalid)",
                     job_id=job_id,
                     status="not_found",
-                )
+                ) from e
             logger.warning(
                 "HTTP %s polling job %s, retrying...",
                 e.response.status_code, job_id,
