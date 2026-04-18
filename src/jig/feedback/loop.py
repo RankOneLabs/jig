@@ -232,11 +232,24 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         if not candidates:
             return []
 
+        # Pre-slice candidates before the batch fetch. Two reasons:
+        #  1. SQLite has a bound-parameter limit (commonly 999); a very
+        #     large corpus would exceed it.
+        #  2. Most of ``candidates`` past the q.limit-th will get dropped
+        #     by the min_score filter anyway, so fetching their scores
+        #     is wasted work.
+        # The factor-of-10 cushion covers min_score rejections; if the
+        # filter is aggressive enough that we undershoot q.limit, that's
+        # acceptable for v1 — properly chunking with early exit is a
+        # follow-up when corpora grow past ~100 results.
+        window = min(len(candidates), max(q.limit * 10, 50), 900)
+        candidates = candidates[:window]
+
         # Batch-fetch scores for every surviving candidate with a single
         # IN-list SELECT. Eliminates the per-row N+1 that would grow
         # linearly with corpus size.
         rids = [rid for _, rid, _, _, _ in candidates]
-        placeholders = ",".join("?" * len(rids))
+        placeholders = ",".join(["?"] * len(rids))
         score_rows = await (await db.execute(
             f"SELECT result_id, dimension, value, source FROM scores "
             f"WHERE result_id IN ({placeholders})",

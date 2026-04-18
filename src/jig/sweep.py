@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -116,7 +117,7 @@ def _case_to_input(case: EvalCase | str) -> str:
     return case if isinstance(case, str) else case.input
 
 
-def _ensure_unique_names(configs: list) -> None:
+def _ensure_unique_names(configs: Sequence[AgentConfig[Any]]) -> None:
     """Guard against duplicate config names.
 
     Rollups key on ``config.name``. Duplicates would silently merge /

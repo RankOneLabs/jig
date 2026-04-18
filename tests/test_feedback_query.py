@@ -217,6 +217,30 @@ class TestPastResultsTool:
         with pytest.raises(ValueError, match="min_score must be a number"):
             await tool.execute({"hypothesis": "x", "min_score": "high"})
 
+    async def test_rejects_bool_k(self):
+        """bool is an int subclass; True would silently mean k=1."""
+        tool = PastResults(AsyncMock())
+        with pytest.raises(ValueError, match="k must be an integer"):
+            await tool.execute({"hypothesis": "x", "k": True})
+
+    async def test_rejects_non_integral_float_k(self):
+        """2.7 silently becoming 2 is a footgun."""
+        tool = PastResults(AsyncMock())
+        with pytest.raises(ValueError, match="k must be an integer"):
+            await tool.execute({"hypothesis": "x", "k": 2.7})
+
+    async def test_accepts_integral_float_k(self):
+        """5.0 is fine — intent is unambiguous."""
+        feedback = AsyncMock()
+        feedback.query = AsyncMock(return_value=[])
+        tool = PastResults(feedback)
+        await tool.execute({"hypothesis": "x", "k": 5.0})
+
+    async def test_rejects_bool_min_score(self):
+        tool = PastResults(AsyncMock())
+        with pytest.raises(ValueError, match="min_score must be a number"):
+            await tool.execute({"hypothesis": "x", "min_score": True})
+
 
 class TestFeedbackQueryValidation:
     def test_rejects_non_positive_limit(self):
@@ -228,3 +252,8 @@ class TestFeedbackQueryValidation:
     def test_rejects_non_integer_limit(self):
         with pytest.raises(ValueError, match="positive int"):
             FeedbackQuery(limit=1.5)  # type: ignore[arg-type]
+
+    def test_rejects_bool_limit(self):
+        """True/False should never be accepted as a limit value."""
+        with pytest.raises(ValueError, match="positive int"):
+            FeedbackQuery(limit=True)  # type: ignore[arg-type]

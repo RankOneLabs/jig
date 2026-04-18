@@ -65,18 +65,32 @@ class PastResults(Tool):
     async def execute(self, args: dict[str, Any]) -> str:
         hypothesis = args["hypothesis"]
 
+        # Strict int parsing: reject bool (subclass of int, would silently
+        # mean k=1), reject non-integral floats (2.7 → 2 is a footgun).
         k_raw = args.get("k", self._default_k)
-        try:
+        if isinstance(k_raw, bool):
+            raise ValueError(f"k must be an integer, got {k_raw!r}")
+        if isinstance(k_raw, int):
+            k = k_raw
+        elif isinstance(k_raw, float):
+            if not k_raw.is_integer():
+                raise ValueError(f"k must be an integer, got {k_raw!r}")
             k = int(k_raw)
-        except (TypeError, ValueError) as e:
-            raise ValueError(f"k must be an integer, got {k_raw!r}") from e
+        else:
+            try:
+                k = int(k_raw)
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"k must be an integer, got {k_raw!r}") from e
         if k < 1:
             raise ValueError(f"k must be a positive integer, got {k}")
 
+        # min_score: accept numeric, reject bool (True would silently become 1.0).
         min_score_raw = args.get("min_score")
         min_score: float | None
         if min_score_raw is None:
             min_score = None
+        elif isinstance(min_score_raw, bool):
+            raise ValueError(f"min_score must be a number, got {min_score_raw!r}")
         else:
             try:
                 min_score = float(min_score_raw)
