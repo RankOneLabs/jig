@@ -324,6 +324,36 @@ class TestComplete:
         assert response.usage.cost is None
 
     @pytest.mark.asyncio
+    async def test_usage_non_finite_cost_rejected(self):
+        """NaN/Inf cost (from string inputs or otherwise) becomes None."""
+        client = DispatchClient(model="llama-70b", poll_interval=0.01)
+
+        client._http = AsyncMock(spec=httpx.AsyncClient)
+        client._http.post.return_value = _mock_submit_response()
+        client._http.get.return_value = _mock_poll_response(
+            result={
+                "content": "hi",
+                "usage": {"input_tokens": 1, "output_tokens": 1, "cost": "nan"},
+            },
+        )
+
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hi")],
+        )
+        response = await client.complete(params)
+        # "nan" parses to float('nan') which is non-finite → treated as unknown.
+        assert response.usage.cost is None
+
+    @pytest.mark.asyncio
+    async def test_aclose_releases_http(self):
+        """aclose closes the underlying httpx client."""
+        client = DispatchClient(model="llama-70b")
+        client._http = AsyncMock(spec=httpx.AsyncClient)
+
+        await client.aclose()
+        client._http.aclose.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_usage_numeric_string_cost_accepted(self):
         """Cost reported as a numeric string coerces cleanly to float."""
         client = DispatchClient(model="llama-70b", poll_interval=0.01)

@@ -12,6 +12,7 @@ Or wrap a client so every call is tallied automatically::
 """
 from __future__ import annotations
 
+import math
 from typing import AsyncIterator
 
 from jig.core.errors import JigBudgetError
@@ -29,14 +30,23 @@ class BudgetTracker:
     """
 
     def __init__(self, limit_usd: float) -> None:
-        if limit_usd <= 0:
-            raise ValueError("limit_usd must be positive")
+        # Non-finite limits (NaN/Inf) make every comparison with spent_usd
+        # produce False, which would silently disable the cap.
+        if not math.isfinite(limit_usd) or limit_usd <= 0:
+            raise ValueError(
+                f"limit_usd must be a positive finite number, got {limit_usd!r}"
+            )
         self.limit_usd = limit_usd
         self.spent_usd = 0.0
 
     def record(self, usage: Usage) -> None:
         if usage.cost is None:
             return
+        # NaN bypasses <0 and >limit checks both; Inf poisons spent_usd.
+        if not math.isfinite(usage.cost):
+            raise ValueError(
+                f"usage.cost must be finite, got {usage.cost!r}"
+            )
         if usage.cost < 0:
             raise ValueError(
                 f"usage.cost must be non-negative, got {usage.cost!r}"
@@ -74,6 +84,14 @@ class BudgetedLLMClient(LLMClient):
         return response
 
     async def stream(self, params: CompletionParams) -> AsyncIterator[str]:
-        self._budget.check()
-        async for chunk in self._inner.stream(params):
-            yield chunk
+        # Streaming can't be budget-enforced because LLMClient.stream yields
+        # only content chunks — no post-call Usage is surfaced, so spend
+        # would silently escape the tally. Fail closed until the streaming
+        # interface carries usage at completion.
+        raise NotImplementedError(
+            "BudgetedLLMClient.stream() is unsupported because the streaming "
+            "interface does not surface usage for budget accounting. Use "
+            "complete(), or wire a streaming interface that exposes final "
+            "usage before re-enabling."
+        )
+        yield  # pragma: no cover — makes this a generator for the return type

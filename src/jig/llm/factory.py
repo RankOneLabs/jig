@@ -29,7 +29,14 @@ def from_model(model: str, **overrides: Any) -> LLMClient:
         from jig.llm.anthropic import AnthropicClient
         return AnthropicClient(model=model, **overrides)
 
-    if model.startswith(("gpt-", "o1", "o3", "o4", "chatgpt-")):
+    # o-series: accept bare "o1"/"o3"/"o4" and their suffixed variants
+    # ("o3-mini", "o4-mini-2025-04-16"), but not unrelated names that happen
+    # to share a prefix ("o11-mini" is not an OpenAI model).
+    if (
+        model.startswith(("gpt-", "chatgpt-"))
+        or model in {"o1", "o3", "o4"}
+        or model.startswith(("o1-", "o3-", "o4-"))
+    ):
         from jig.llm.openai import OpenAIClient
         return OpenAIClient(model=model, **overrides)
 
@@ -61,10 +68,16 @@ def from_model(model: str, **overrides: Any) -> LLMClient:
 def _coerce_message(m: Message | dict[str, Any]) -> Message:
     if isinstance(m, Message):
         return m
+    if not isinstance(m, dict):
+        raise ValueError(
+            f"Each message must be a Message or dict, got {type(m).__name__}."
+        )
     if "role" not in m:
         raise ValueError("Message dict must include a 'role' field.")
     role = m["role"]
-    if isinstance(role, str):
+    if isinstance(role, Role):
+        pass
+    elif isinstance(role, str):
         try:
             role = Role(role)
         except ValueError as e:
@@ -72,6 +85,12 @@ def _coerce_message(m: Message | dict[str, Any]) -> Message:
             raise ValueError(
                 f"Invalid message role {m['role']!r}; expected one of {valid}."
             ) from e
+    else:
+        valid = [r.value for r in Role]
+        raise ValueError(
+            f"Invalid message role type {type(role).__name__}; "
+            f"expected str or Role (one of {valid})."
+        )
     return Message(
         role=role,
         content=m.get("content", "") or "",
@@ -110,4 +129,10 @@ async def complete(
         max_tokens=max_tokens,
         provider_params=provider_params,
     )
-    return await client.complete(params)
+    try:
+        return await client.complete(params)
+    finally:
+        # Release connections held by clients that own their transport
+        # (notably DispatchClient's httpx.AsyncClient). No-op on adapters
+        # whose SDKs self-manage pooling (Anthropic, OpenAI, Gemini).
+        await client.aclose()

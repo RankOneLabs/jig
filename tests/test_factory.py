@@ -34,6 +34,18 @@ class TestFromModel:
             from_model("o4-mini")
             mock_cls.assert_called_once_with(model="o4-mini")
 
+    def test_bare_o_series_routes_to_openai(self):
+        with patch("jig.llm.openai.OpenAIClient") as mock_cls:
+            from_model("o1")
+            mock_cls.assert_called_once_with(model="o1")
+
+    def test_o_series_does_not_match_unrelated_names(self):
+        """'o11-mini' (hypothetical non-OpenAI model) should not route to OpenAI."""
+        with pytest.raises(ValueError, match="No provider matches"):
+            from_model("o11-mini")
+        with pytest.raises(ValueError, match="No provider matches"):
+            from_model("o2-whatever")
+
     def test_gemini_routes_to_google(self):
         with patch("jig.llm.google.GeminiClient") as mock_cls:
             from_model("gemini-2.5-pro")

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from typing import Any
 
@@ -42,14 +43,20 @@ def _safe_cost(value: Any) -> float | None:
 
     ``None`` semantically means the backend didn't report spend — that's
     distinct from a confirmed free call (``0.0``), and ``BudgetTracker``
-    deliberately ignores the former.
+    deliberately ignores the former. Non-finite floats (``NaN``/``Inf``,
+    possibly from ``"nan"``/``"inf"`` string inputs) are treated as
+    unknown rather than propagated, because they silently defeat budget
+    comparisons downstream.
     """
     if value is None:
         return None
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
 
 
 class DispatchClient(LLMClient):
@@ -79,6 +86,10 @@ class DispatchClient(LLMClient):
         self._poll_interval = poll_interval
         self._poll_max_interval = poll_max_interval
         self._http = httpx.AsyncClient(timeout=30.0)
+
+    async def aclose(self) -> None:
+        """Close the underlying httpx.AsyncClient. Safe to call multiple times."""
+        await self._http.aclose()
 
     def _build_payload(self, params: CompletionParams) -> dict[str, Any]:
         """Convert CompletionParams to smithers executor payload format."""

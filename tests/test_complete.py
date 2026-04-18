@@ -25,6 +25,7 @@ class TestComplete:
         with patch("jig.llm.anthropic.AnthropicClient") as mock_cls:
             instance = mock_cls.return_value
             instance.complete = AsyncMock(return_value=_mock_response())
+            instance.aclose = AsyncMock()
 
             response = await complete(
                 "claude-sonnet-4-5",
@@ -41,6 +42,7 @@ class TestComplete:
         with patch("jig.llm.anthropic.AnthropicClient") as mock_cls:
             instance = mock_cls.return_value
             instance.complete = AsyncMock(return_value=_mock_response())
+            instance.aclose = AsyncMock()
 
             msg = Message(role=Role.USER, content="hello")
             await complete("claude-sonnet-4-5", [msg])
@@ -52,6 +54,7 @@ class TestComplete:
         with patch("jig.llm.anthropic.AnthropicClient") as mock_cls:
             instance = mock_cls.return_value
             instance.complete = AsyncMock(return_value=_mock_response())
+            instance.aclose = AsyncMock()
 
             await complete(
                 "claude-sonnet-4-5",
@@ -70,6 +73,7 @@ class TestComplete:
         with patch("jig.llm.ollama.OllamaClient") as mock_cls:
             instance = mock_cls.return_value
             instance.complete = AsyncMock(return_value=_mock_response())
+            instance.aclose = AsyncMock()
 
             await complete(
                 "ollama/llama3.1",
@@ -95,3 +99,43 @@ class TestComplete:
                 "claude-sonnet-4-5",
                 [{"role": "bot", "content": "hi"}],
             )
+
+    async def test_non_dict_message_rejected(self):
+        with pytest.raises(ValueError, match="Message or dict"):
+            await complete(
+                "claude-sonnet-4-5",
+                [None],  # type: ignore[list-item]
+            )
+
+    async def test_non_string_role_type_rejected(self):
+        with pytest.raises(ValueError, match="Invalid message role type int"):
+            await complete(
+                "claude-sonnet-4-5",
+                [{"role": 123, "content": "hi"}],  # type: ignore[list-item]
+            )
+
+    async def test_aclose_called_after_complete(self):
+        """complete() releases adapter resources after use."""
+        with patch("jig.llm.anthropic.AnthropicClient") as mock_cls:
+            instance = mock_cls.return_value
+            instance.complete = AsyncMock(return_value=_mock_response())
+            instance.aclose = AsyncMock()
+
+            await complete("claude-sonnet-4-5", [{"role": "user", "content": "hi"}])
+
+            instance.aclose.assert_awaited_once()
+
+    async def test_aclose_called_even_when_complete_raises(self):
+        """complete() cleans up even if the underlying call fails."""
+        with patch("jig.llm.anthropic.AnthropicClient") as mock_cls:
+            instance = mock_cls.return_value
+            instance.complete = AsyncMock(side_effect=RuntimeError("boom"))
+            instance.aclose = AsyncMock()
+
+            with pytest.raises(RuntimeError, match="boom"):
+                await complete(
+                    "claude-sonnet-4-5",
+                    [{"role": "user", "content": "hi"}],
+                )
+
+            instance.aclose.assert_awaited_once()

@@ -68,6 +68,28 @@ class TestBudgetTracker:
         # Tally is not modified by the rejected record
         assert budget.spent_usd == 0.5
 
+    def test_nan_cost_rejected(self):
+        """NaN bypasses <0 and >limit comparisons — reject outright."""
+        budget = BudgetTracker(limit_usd=1.0)
+        with pytest.raises(ValueError, match="finite"):
+            budget.record(Usage(input_tokens=10, output_tokens=10, cost=float("nan")))
+
+    def test_inf_cost_rejected(self):
+        """Inf would poison spent_usd — reject outright."""
+        budget = BudgetTracker(limit_usd=1.0)
+        with pytest.raises(ValueError, match="finite"):
+            budget.record(Usage(input_tokens=10, output_tokens=10, cost=float("inf")))
+
+    def test_nan_limit_rejected(self):
+        """NaN limit would disable enforcement — reject at construction."""
+        with pytest.raises(ValueError, match="finite"):
+            BudgetTracker(limit_usd=float("nan"))
+
+    def test_inf_limit_rejected(self):
+        """Inf limit effectively disables the cap — reject."""
+        with pytest.raises(ValueError, match="finite"):
+            BudgetTracker(limit_usd=float("inf"))
+
 
 @pytest.mark.asyncio
 class TestBudgetedLLMClient:
@@ -120,3 +142,14 @@ class TestBudgetedLLMClient:
         with pytest.raises(JigBudgetError):
             await client.complete(params)
         inner.complete.assert_not_called()
+
+    async def test_stream_fails_closed(self):
+        """Streaming can't be enforced until usage is surfaced — refuse."""
+        inner = AsyncMock()
+        budget = BudgetTracker(limit_usd=1.0)
+        client = BudgetedLLMClient(inner=inner, budget=budget)
+
+        params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
+        with pytest.raises(NotImplementedError, match="streaming"):
+            async for _ in client.stream(params):
+                pass
