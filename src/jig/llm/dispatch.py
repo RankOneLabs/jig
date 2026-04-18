@@ -23,6 +23,35 @@ logger = logging.getLogger(__name__)
 _PENDING_STATUSES = frozenset({"queued", "waking_machine", "dispatched", "running"})
 
 
+def _safe_int(value: Any) -> int:
+    """Coerce arbitrary JSON values to int, defaulting to 0 on None/garbage.
+
+    Smithers is a moving target and tokens may land as null, strings, or
+    missing entirely; we don't want that to crash the caller's agent loop.
+    """
+    if value is None:
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _safe_cost(value: Any) -> float | None:
+    """Coerce cost to float, preserving None for 'unknown'.
+
+    ``None`` semantically means the backend didn't report spend — that's
+    distinct from a confirmed free call (``0.0``), and ``BudgetTracker``
+    deliberately ignores the former.
+    """
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class DispatchClient(LLMClient):
     """jig LLMClient that submits inference jobs to a smithers dispatch server.
 
@@ -170,15 +199,16 @@ class DispatchClient(LLMClient):
                 result = data.get("result") or {}
                 content = result.get("content", "")
                 model = data.get("model") or self._model or "dispatch"
-                usage_data = result.get("usage") or {}
+                raw_usage = result.get("usage")
+                usage_data = raw_usage if isinstance(raw_usage, dict) else {}
                 logger.info(f"Dispatch job {job_id} complete ({latency_ms:.0f}ms)")
                 return LLMResponse(
                     content=content,
                     tool_calls=None,
                     usage=Usage(
-                        input_tokens=int(usage_data.get("input_tokens", 0)),
-                        output_tokens=int(usage_data.get("output_tokens", 0)),
-                        cost=usage_data.get("cost", 0.0),
+                        input_tokens=_safe_int(usage_data.get("input_tokens")),
+                        output_tokens=_safe_int(usage_data.get("output_tokens")),
+                        cost=_safe_cost(usage_data.get("cost")),
                     ),
                     latency_ms=latency_ms,
                     model=model,

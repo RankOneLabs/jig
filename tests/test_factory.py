@@ -69,6 +69,11 @@ class TestFromModel:
                 machine="mcbain",
             )
 
+    def test_chatgpt_routes_to_openai(self):
+        with patch("jig.llm.openai.OpenAIClient") as mock_cls:
+            from_model("chatgpt-4o-latest")
+            mock_cls.assert_called_once_with(model="chatgpt-4o-latest")
+
     def test_unknown_prefix_raises(self):
         with pytest.raises(ValueError, match="No provider matches"):
             from_model("llama3.1")
@@ -76,3 +81,11 @@ class TestFromModel:
     def test_empty_model_raises(self):
         with pytest.raises(ValueError, match="No provider matches"):
             from_model("")
+
+    def test_empty_ollama_suffix_raises(self):
+        with pytest.raises(ValueError, match="Model name required after 'ollama/'"):
+            from_model("ollama/")
+
+    def test_empty_dispatch_suffix_raises(self):
+        with pytest.raises(ValueError, match="Model name required after 'dispatch/'"):
+            from_model("dispatch/")

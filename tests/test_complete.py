@@ -84,3 +84,14 @@ class TestComplete:
     async def test_unknown_model_raises(self):
         with pytest.raises(ValueError, match="No provider matches"):
             await complete("no-such-model", [{"role": "user", "content": "x"}])
+
+    async def test_message_dict_missing_role_raises(self):
+        with pytest.raises(ValueError, match="'role' field"):
+            await complete("claude-sonnet-4-5", [{"content": "hi"}])
+
+    async def test_message_dict_invalid_role_raises(self):
+        with pytest.raises(ValueError, match="Invalid message role 'bot'"):
+            await complete(
+                "claude-sonnet-4-5",
+                [{"role": "bot", "content": "hi"}],
+            )

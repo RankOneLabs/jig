@@ -59,6 +59,15 @@ class TestBudgetTracker:
         with pytest.raises(JigBudgetError):
             budget.check()
 
+    def test_negative_cost_rejected(self):
+        """Negative cost is always a bug — reject rather than allow bypass."""
+        budget = BudgetTracker(limit_usd=1.0)
+        budget.record(Usage(input_tokens=10, output_tokens=10, cost=0.5))
+        with pytest.raises(ValueError, match="non-negative"):
+            budget.record(Usage(input_tokens=10, output_tokens=10, cost=-0.1))
+        # Tally is not modified by the rejected record
+        assert budget.spent_usd == 0.5
+
 
 @pytest.mark.asyncio
 class TestBudgetedLLMClient:

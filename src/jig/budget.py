@@ -37,6 +37,10 @@ class BudgetTracker:
     def record(self, usage: Usage) -> None:
         if usage.cost is None:
             return
+        if usage.cost < 0:
+            raise ValueError(
+                f"usage.cost must be non-negative, got {usage.cost!r}"
+            )
         self.spent_usd += usage.cost
         self.check()
 

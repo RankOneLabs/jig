@@ -278,7 +278,7 @@ class TestComplete:
 
     @pytest.mark.asyncio
     async def test_usage_defaults_when_result_lacks_it(self):
-        """Dispatch should default usage fields when smithers omits them."""
+        """Missing smithers usage → tokens=0, cost=None (unknown, not free)."""
         client = DispatchClient(model="llama-70b", poll_interval=0.01)
 
         client._http = AsyncMock(spec=httpx.AsyncClient)
@@ -293,7 +293,57 @@ class TestComplete:
         response = await client.complete(params)
         assert response.usage.input_tokens == 0
         assert response.usage.output_tokens == 0
-        assert response.usage.cost == 0.0
+        # None preserves "unknown" vs. 0.0 which would mean "confirmed free";
+        # BudgetTracker deliberately ignores None-cost usages.
+        assert response.usage.cost is None
+
+    @pytest.mark.asyncio
+    async def test_usage_tolerates_malformed_fields(self):
+        """Non-numeric or null token/cost fields don't crash the adapter."""
+        client = DispatchClient(model="llama-70b", poll_interval=0.01)
+
+        client._http = AsyncMock(spec=httpx.AsyncClient)
+        client._http.post.return_value = _mock_submit_response()
+        client._http.get.return_value = _mock_poll_response(
+            result={
+                "content": "hi",
+                "usage": {
+                    "input_tokens": None,
+                    "output_tokens": "not-a-number",
+                    "cost": "garbage",
+                },
+            },
+        )
+
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hi")],
+        )
+        response = await client.complete(params)
+        assert response.usage.input_tokens == 0
+        assert response.usage.output_tokens == 0
+        assert response.usage.cost is None
+
+    @pytest.mark.asyncio
+    async def test_usage_numeric_string_cost_accepted(self):
+        """Cost reported as a numeric string coerces cleanly to float."""
+        client = DispatchClient(model="llama-70b", poll_interval=0.01)
+
+        client._http = AsyncMock(spec=httpx.AsyncClient)
+        client._http.post.return_value = _mock_submit_response()
+        client._http.get.return_value = _mock_poll_response(
+            result={
+                "content": "hi",
+                "usage": {"input_tokens": "10", "output_tokens": "5", "cost": "0.125"},
+            },
+        )
+
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hi")],
+        )
+        response = await client.complete(params)
+        assert response.usage.input_tokens == 10
+        assert response.usage.output_tokens == 5
+        assert response.usage.cost == 0.125
 
     @pytest.mark.asyncio
     async def test_no_model_omits_field(self):

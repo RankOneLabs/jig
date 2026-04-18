@@ -38,12 +38,18 @@ def from_model(model: str, **overrides: Any) -> LLMClient:
         return GeminiClient(model=model, **overrides)
 
     if model.startswith("ollama/"):
+        provider_model = model[len("ollama/"):]
+        if not provider_model:
+            raise ValueError("Model name required after 'ollama/' prefix.")
         from jig.llm.ollama import OllamaClient
-        return OllamaClient(model=model[len("ollama/"):], **overrides)
+        return OllamaClient(model=provider_model, **overrides)
 
     if model.startswith("dispatch/"):
+        provider_model = model[len("dispatch/"):]
+        if not provider_model:
+            raise ValueError("Model name required after 'dispatch/' prefix.")
         from jig.llm.dispatch import DispatchClient
-        return DispatchClient(model=model[len("dispatch/"):], **overrides)
+        return DispatchClient(model=provider_model, **overrides)
 
     raise ValueError(
         f"No provider matches model '{model}'. "
@@ -55,9 +61,17 @@ def from_model(model: str, **overrides: Any) -> LLMClient:
 def _coerce_message(m: Message | dict[str, Any]) -> Message:
     if isinstance(m, Message):
         return m
+    if "role" not in m:
+        raise ValueError("Message dict must include a 'role' field.")
     role = m["role"]
     if isinstance(role, str):
-        role = Role(role)
+        try:
+            role = Role(role)
+        except ValueError as e:
+            valid = [r.value for r in Role]
+            raise ValueError(
+                f"Invalid message role {m['role']!r}; expected one of {valid}."
+            ) from e
     return Message(
         role=role,
         content=m.get("content", "") or "",
@@ -84,9 +98,12 @@ async def complete(
     dicts. ``client_kwargs`` forwards to the adapter constructor (e.g.
     ``{"host": "http://mcbain:11434"}`` for Ollama).
     """
+    # Validate and coerce input before constructing the client — gives useful
+    # errors even when the provider SDK isn't installed.
+    coerced = [_coerce_message(m) for m in messages]
     client = from_model(model, **(client_kwargs or {}))
     params = CompletionParams(
-        messages=[_coerce_message(m) for m in messages],
+        messages=coerced,
         system=system,
         tools=tools,
         temperature=temperature,
