@@ -64,10 +64,21 @@ def _span_from_row(row: dict[str, Any]) -> Span | None:
         )
         kind = SpanKind.TOOL_CALL
 
-    ended_at = (
-        datetime.fromisoformat(row["ended_at"])
-        if row.get("ended_at") else None
-    )
+    # ``ended_at`` is outside the initial guard above; a corrupt ISO
+    # value would otherwise break the entire trace read instead of
+    # just losing the duration on one row. Treat parse failure as an
+    # open span and keep going.
+    ended_at: datetime | None = None
+    raw_ended = row.get("ended_at")
+    if raw_ended:
+        try:
+            ended_at = datetime.fromisoformat(raw_ended)
+        except (TypeError, ValueError) as e:
+            logger.warning(
+                "federated: invalid ended_at on worker span %s (%r); "
+                "treating as open: %s",
+                sid, raw_ended, e,
+            )
     usage: Usage | None = None
     if row.get("usage_input_tokens") is not None or row.get("usage_output_tokens") is not None:
         usage = Usage(
@@ -162,7 +173,18 @@ class RollupClient:
                 f"rollup at {self._base_url!r} returned non-object "
                 f"payload: {type(body).__name__}",
             )
-        rows = body.get("spans") or []
+        rows = body.get("spans")
+        if rows is None:
+            rows = []
+        # Guard non-list ``spans``: iterating a dict yields keys, which
+        # would silently drop every row and give the caller a misleading
+        # "no spans" result. Route through the fallback so the federated
+        # reader logs + serves local-only, same as a connection error.
+        if not isinstance(rows, list):
+            raise RollupUnreachableError(
+                f"rollup at {self._base_url!r} returned 'spans' of type "
+                f"{type(rows).__name__}, expected list",
+            )
         spans: list[Span] = []
         for row in rows:
             if not isinstance(row, dict):

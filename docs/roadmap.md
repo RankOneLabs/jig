@@ -35,9 +35,7 @@ PRs (jig #19 + smithers #18) because they tell the same dispatch
 story.
 
 **Next critical-path work: phase 9.** Detailed plan at
-[`phase-9-trace-propagation.md`](phase-9-trace-propagation.md) on
-branch `feat/phase-9-trace-propagation`. Phase 11 (PR #20) is parallel
-and does not gate 9/10/12/13.
+[`phase-9-trace-propagation.md`](phase-9-trace-propagation.md).
 
 ## Locked design decisions
 

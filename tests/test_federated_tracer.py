@@ -1,7 +1,6 @@
 """Tests for :class:`jig.tracing.FederatedTracer` + :class:`RollupClient`."""
 from __future__ import annotations
 
-from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -132,6 +131,45 @@ async def test_rollup_client_raises_unreachable_on_non_object_payload():
         client = RollupClient(base_url="http://willie:8902", http=http)
         with pytest.raises(RollupUnreachableError, match="non-object"):
             await client.get_trace("t-1")
+
+
+async def test_rollup_client_raises_unreachable_on_non_list_spans():
+    """Non-list ``spans`` (e.g., dict) must funnel through the fallback.
+
+    Silently iterating a dict yields keys, which would skip every row
+    and pretend the trace was empty — worst of both worlds. The
+    unreachable error routes us through FederatedTracer's local-only
+    warning path instead.
+    """
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"spans": {"wrong": "shape"}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = RollupClient(base_url="http://willie:8902", http=http)
+        with pytest.raises(RollupUnreachableError, match="expected list"):
+            await client.get_trace("t-1")
+
+
+async def test_rollup_client_tolerates_corrupt_ended_at():
+    """A bad ``ended_at`` on one row must not break the whole read."""
+    bad_row = _worker_span("w-bad", trace_id="t-1", parent_id="p")
+    bad_row["ended_at"] = "not-a-datetime"
+    good_row = _worker_span("w-good", trace_id="t-1", parent_id="p")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "trace_id": "t-1", "spans": [bad_row, good_row], "sources": [],
+        })
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = RollupClient(base_url="http://willie:8902", http=http)
+        spans = await client.get_trace("t-1")
+
+    # Both rows returned; bad row's ended_at is None (treated as open)
+    # while good row parses normally.
+    by_id = {s.id: s for s in spans}
+    assert by_id["w-bad"].ended_at is None
+    assert by_id["w-good"].ended_at is not None
 
 
 async def test_rollup_client_skips_malformed_rows():
