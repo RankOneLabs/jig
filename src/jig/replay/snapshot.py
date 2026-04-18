@@ -64,6 +64,15 @@ def _resolve_output_schema(fqn: str) -> type[BaseModel]:
             f"(expected 'module:ClassName')"
         )
     module_name, _, qualname = fqn.partition(":")
+    # Guard against ``:Schema`` / ``os:`` style inputs. Reaching
+    # importlib.import_module("") raises ``ValueError`` (not
+    # ``ImportError``), which would bypass the handler below and leak a
+    # raw exception.
+    if not module_name or not qualname:
+        raise ReplaySchemaMismatchError(
+            f"Recorded output_schema FQN {fqn!r} is malformed "
+            f"(expected 'module:ClassName')"
+        )
     # PEP 3155: function-local classes have ``<locals>`` segments in
     # their qualname and cannot be reached via getattr after the
     # defining function returns. Detect up front so the caller sees a

@@ -62,13 +62,28 @@ class TraceDiff:
         is the main use case, and a different model will almost always
         have different token prices and latency, so folding those in
         would make ``identical`` always False for the exact workflow
-        this property exists to support.
+        this property exists to support. Use :attr:`fully_identical`
+        when you want to detect any change at all.
         """
         return (
             not self.tool_divergence
             and self.output_diff is None
             and self.error_category_change is None
             and not self.score_deltas
+        )
+
+    @property
+    def fully_identical(self) -> bool:
+        """True when :attr:`identical` holds *and* cost/latency also match.
+
+        Stricter sibling of :attr:`identical`. Useful when you're not
+        swapping models — e.g. verifying a deterministic replay of the
+        same config reproduces the recording down to spend.
+        """
+        return (
+            self.identical
+            and self.cost_delta == 0.0
+            and self.latency_ms_delta == 0.0
         )
 
 

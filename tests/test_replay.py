@@ -374,6 +374,20 @@ def test_resolve_output_schema_rejects_function_local():
         _resolve_output_schema("some.module:outer.<locals>.Schema")
 
 
+@pytest.mark.parametrize("fqn", [":Schema", "os:", ":", "foo"])
+def test_resolve_output_schema_rejects_malformed_fqn(fqn: str):
+    """Empty module_name or qualname must raise ReplaySchemaMismatchError.
+
+    Without the emptiness guard, ``importlib.import_module("")`` raises
+    ``ValueError`` (not ``ImportError``) and bypasses the handler, leaking
+    a raw exception instead of a typed replay error.
+    """
+    from jig.replay.snapshot import _resolve_output_schema
+
+    with pytest.raises(ReplaySchemaMismatchError, match="malformed"):
+        _resolve_output_schema(fqn)
+
+
 # --- ReplayToolRegistry ---
 
 
@@ -451,6 +465,32 @@ async def test_replay_registry_args_canonicalized_by_key_order():
         id="c-1", name="echo", arguments={"b": 2, "a": 1},
     ))
     assert out.output == "matched"
+
+
+async def test_replay_registry_advertises_only_observed_tools():
+    """``list()`` must only surface tools that appeared in the trace.
+
+    Exposing fallback tools that never ran originally would let the
+    replay model pick brand-new tools and diverge silently from the
+    recording.
+    """
+    recorded = [_tool_span("echo", {"text": "x"}, "x")]
+    fallback = ToolRegistry([EchoTool()])
+    # Extra definition the fallback advertises that was never in the trace.
+    extra = ToolDefinition(
+        name="brand_new", description="not in trace",
+        parameters={"type": "object", "properties": {}},
+    )
+    reg = ReplayToolRegistry(recorded, definitions=[
+        ToolDefinition(
+            name="echo", description="e",
+            parameters={"type": "object", "properties": {}},
+        ),
+        extra,
+    ], fallback=fallback)
+
+    names = {d.name for d in reg.list()}
+    assert names == {"echo"}
 
 
 async def test_replay_registry_skips_submit_output_span():

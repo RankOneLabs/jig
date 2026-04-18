@@ -102,27 +102,40 @@ class ReplayToolRegistry(ToolRegistry):
                 _CannedResult(output=output, error=span.error),
             )
 
+        # Only advertise tools that actually appeared in the recording.
+        # Exposing the full fallback registry would let the model pick a
+        # brand-new tool that never existed in the original run, which
+        # then becomes either a strict miss or a live fallback execution
+        # — either way, a replay that silently diverges from the recording.
+        observed_names: list[str] = []
+        seen: set[str] = set()
+        for span in _extract_tool_spans(recorded_spans):
+            if span.name in seen:
+                continue
+            seen.add(span.name)
+            observed_names.append(span.name)
+
         if definitions is not None:
-            self._definitions = list(definitions)
+            source_defs = {d.name: d for d in definitions}
         elif fallback is not None:
-            self._definitions = fallback.list()
+            source_defs = {d.name: d for d in fallback.list()}
         else:
-            # Last resort: synthesize minimal definitions from observed
-            # names. LLMs need *some* tool list to call against; empty-
-            # schema params mean the model can still emit calls but
-            # won't get rich parameter hints. Usually the caller passes
-            # a fallback or explicit definitions, so this is fine.
-            seen: set[str] = set()
-            self._definitions = []
-            for span in _extract_tool_spans(recorded_spans):
-                if span.name in seen:
-                    continue
-                seen.add(span.name)
-                self._definitions.append(ToolDefinition(
-                    name=span.name,
-                    description=f"Replay stub for {span.name!r}",
+            source_defs = {}
+
+        # Rich schema when the caller supplied one for the observed name;
+        # minimal stub otherwise. Empty-schema params mean the model can
+        # still emit calls but won't get rich parameter hints.
+        self._definitions = [
+            source_defs.get(
+                name,
+                ToolDefinition(
+                    name=name,
+                    description=f"Replay stub for {name!r}",
                     parameters={"type": "object", "properties": {}},
-                ))
+                ),
+            )
+            for name in observed_names
+        ]
 
     def list(self) -> list[ToolDefinition]:
         return list(self._definitions)

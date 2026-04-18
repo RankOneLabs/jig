@@ -229,6 +229,36 @@ async def test_score_deltas_surface_added_and_dropped_dimensions():
 
 
 @pytest.mark.asyncio
+async def test_fully_identical_requires_cost_and_latency_match():
+    """``identical`` tolerates cost/latency drift; ``fully_identical`` doesn't.
+
+    Same-behavior traces with different spend should report
+    ``identical=True`` (behavioral match, the model-swap use case) but
+    ``fully_identical=False`` (stricter full-equality sibling).
+    """
+    tracer = _StubTracer({
+        "a": [_root("a", output="done", duration_ms=10.0), _llm("a", 0, cost=0.01)],
+        "b": [_root("b", output="done", duration_ms=50.0), _llm("b", 0, cost=0.05)],
+    })
+    diff = await trace_diff("a", "b", tracer=tracer)
+    assert diff.identical is True
+    assert diff.fully_identical is False
+    assert diff.cost_delta == pytest.approx(0.04)
+    assert diff.latency_ms_delta == pytest.approx(40.0)
+
+
+@pytest.mark.asyncio
+async def test_fully_identical_true_on_byte_for_byte_match():
+    tracer = _StubTracer({
+        "a": [_root("a", output="done", duration_ms=10.0)],
+        "b": [_root("b", output="done", duration_ms=10.0)],
+    })
+    diff = await trace_diff("a", "b", tracer=tracer)
+    assert diff.identical is True
+    assert diff.fully_identical is True
+
+
+@pytest.mark.asyncio
 async def test_cost_and_latency_delta():
     tracer = _StubTracer({
         "a": [
