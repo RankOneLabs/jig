@@ -19,6 +19,7 @@ from jig.core.types import (
     ToolDefinition,
     Usage,
 )
+from jig.llm.pricing import stamp_cost
 
 try:
     from google import genai
@@ -188,10 +189,12 @@ class GeminiClient(LLMClient):
         input_tokens = usage_meta.prompt_token_count if usage_meta else 0
         output_tokens = usage_meta.candidates_token_count if usage_meta else 0
 
+        usage = Usage(input_tokens=input_tokens, output_tokens=output_tokens)
+        stamp_cost(usage, self._model)
         return LLMResponse(
             content="\n".join(text_parts),
             tool_calls=tool_calls or None,
-            usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens),
+            usage=usage,
             latency_ms=latency_ms,
             model=self._model,
         )

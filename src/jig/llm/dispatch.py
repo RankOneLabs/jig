@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from typing import Any
 
@@ -21,6 +22,41 @@ logger = logging.getLogger(__name__)
 
 # Smithers job statuses that mean "still working"
 _PENDING_STATUSES = frozenset({"queued", "waking_machine", "dispatched", "running"})
+
+
+def _safe_int(value: Any) -> int:
+    """Coerce arbitrary JSON values to int, defaulting to 0 on None/garbage.
+
+    Smithers is a moving target and tokens may land as null, strings, or
+    missing entirely; we don't want that to crash the caller's agent loop.
+    """
+    if value is None:
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _safe_cost(value: Any) -> float | None:
+    """Coerce cost to float, preserving None for 'unknown'.
+
+    ``None`` semantically means the backend didn't report spend — that's
+    distinct from a confirmed free call (``0.0``), and ``BudgetTracker``
+    deliberately ignores the former. Non-finite floats (``NaN``/``Inf``,
+    possibly from ``"nan"``/``"inf"`` string inputs) are treated as
+    unknown rather than propagated, because they silently defeat budget
+    comparisons downstream.
+    """
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
 
 
 class DispatchClient(LLMClient):
@@ -50,6 +86,10 @@ class DispatchClient(LLMClient):
         self._poll_interval = poll_interval
         self._poll_max_interval = poll_max_interval
         self._http = httpx.AsyncClient(timeout=30.0)
+
+    async def aclose(self) -> None:
+        """Close the underlying httpx.AsyncClient. Safe to call multiple times."""
+        await self._http.aclose()
 
     def _build_payload(self, params: CompletionParams) -> dict[str, Any]:
         """Convert CompletionParams to smithers executor payload format."""
@@ -170,14 +210,16 @@ class DispatchClient(LLMClient):
                 result = data.get("result") or {}
                 content = result.get("content", "")
                 model = data.get("model") or self._model or "dispatch"
+                raw_usage = result.get("usage")
+                usage_data = raw_usage if isinstance(raw_usage, dict) else {}
                 logger.info(f"Dispatch job {job_id} complete ({latency_ms:.0f}ms)")
                 return LLMResponse(
                     content=content,
                     tool_calls=None,
                     usage=Usage(
-                        input_tokens=0,
-                        output_tokens=0,
-                        cost=None,
+                        input_tokens=_safe_int(usage_data.get("input_tokens")),
+                        output_tokens=_safe_int(usage_data.get("output_tokens")),
+                        cost=_safe_cost(usage_data.get("cost")),
                     ),
                     latency_ms=latency_ms,
                     model=model,

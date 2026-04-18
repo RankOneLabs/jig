@@ -148,6 +148,15 @@ class LLMClient(ABC):
         raise NotImplementedError("Streaming not implemented for this provider")
         yield  # noqa: unreachable — makes this a generator
 
+    async def aclose(self) -> None:
+        """Release any resources held by the client.
+
+        Default is a no-op. Providers that manage their own connections
+        (e.g. ``DispatchClient`` holds an ``httpx.AsyncClient``) should
+        override this to close them. Safe to call multiple times.
+        """
+        return None
+
 
 class AgentMemory(ABC):
     @abstractmethod

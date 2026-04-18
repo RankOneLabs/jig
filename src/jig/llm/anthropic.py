@@ -15,6 +15,7 @@ from jig.core.types import (
     ToolDefinition,
     Usage,
 )
+from jig.llm.pricing import stamp_cost
 
 try:
     import anthropic
@@ -129,13 +130,15 @@ class AnthropicClient(LLMClient):
                     ToolCall(id=block.id, name=block.name, arguments=block.input)
                 )
 
+        usage = Usage(
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+        )
+        stamp_cost(usage, response.model)
         return LLMResponse(
             content="\n".join(text_parts),
             tool_calls=tool_calls or None,
-            usage=Usage(
-                input_tokens=response.usage.input_tokens,
-                output_tokens=response.usage.output_tokens,
-            ),
+            usage=usage,
             latency_ms=latency_ms,
             model=response.model,
         )
