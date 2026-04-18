@@ -11,6 +11,7 @@ from jig.core import (
     CompletionParams,
     EvalCase,
     FeedbackLoop,
+    FeedbackQuery,
     Grader,
     JigBudgetError,
     JigError,
@@ -41,7 +42,7 @@ from jig.core import (
 from jig.core.pipeline import map_pipeline, run_pipeline
 from jig.core.runner import AgentConfig, AgentResult, run_agent
 from jig.llm.factory import complete, from_model
-from jig.tools import ToolRegistry
+from jig.tools import PastResults, ToolRegistry
 
 __all__ = [
     # Core types
@@ -53,6 +54,7 @@ __all__ = [
     "CompletionParams",
     "EvalCase",
     "FeedbackLoop",
+    "FeedbackQuery",
     "Grader",
     "LLMClient",
     "LLMResponse",
@@ -91,6 +93,7 @@ __all__ = [
     "run_pipeline",
     "map_pipeline",
     # Tools
+    "PastResults",
     "ToolRegistry",
     # LLM factory + one-shot
     "complete",

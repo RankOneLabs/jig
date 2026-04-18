@@ -12,6 +12,7 @@ from jig._embed import ollama_embed
 from jig.core.types import (
     EvalCase,
     FeedbackLoop,
+    FeedbackQuery,
     Score,
     ScoreSource,
     ScoredResult,
@@ -160,6 +161,95 @@ class SQLiteFeedbackLoop(FeedbackLoop):
                 )
             )
             if len(results) >= limit:
+                break
+
+        return results
+
+    async def query(self, q: FeedbackQuery) -> list[ScoredResult]:
+        """Similarity + metadata filter search.
+
+        Embedding similarity ranks candidates when ``q.similar_to`` is
+        set; otherwise rows are ordered by ``created_at`` descending.
+        ``agent_name``, ``model``, and ``tags`` filter on fields the
+        caller set via :meth:`store_result`'s metadata.
+        """
+        db = await self._get_db()
+        rows = await (await db.execute(
+            "SELECT id, content, input, metadata, embedding, created_at "
+            "FROM results ORDER BY created_at DESC"
+        )).fetchall()
+
+        # Optional age cutoff
+        cutoff = None
+        if q.max_age is not None:
+            cutoff = datetime.now() - q.max_age
+
+        # Optional similarity ranking
+        query_emb: np.ndarray | None = None
+        query_norm = 0.0
+        if q.similar_to is not None:
+            query_emb = await self._embed(q.similar_to)
+            query_norm = float(np.linalg.norm(query_emb))
+            if query_norm == 0:
+                return []
+
+        # (similarity, rid, content, meta, created_at) — similarity=0 when not ranking
+        candidates: list[tuple[float, str, str, dict[str, Any], datetime]] = []
+        for rid, content, _inp, meta_json, emb_bytes, created_str in rows:
+            created = datetime.fromisoformat(created_str)
+            if cutoff is not None and created < cutoff:
+                continue
+            meta = json.loads(meta_json) if meta_json else {}
+            if q.agent_name is not None and meta.get("agent_name") != q.agent_name:
+                continue
+            if q.model is not None and meta.get("model") != q.model:
+                continue
+            if q.tags:
+                row_tags = meta.get("tags") or []
+                if not set(q.tags).intersection(row_tags):
+                    continue
+
+            similarity = 0.0
+            if query_emb is not None:
+                if not emb_bytes:
+                    continue
+                row_emb = np.frombuffer(emb_bytes, dtype=np.float32)
+                row_norm = float(np.linalg.norm(row_emb))
+                if row_norm == 0:
+                    continue
+                similarity = float(np.dot(query_emb, row_emb) / (query_norm * row_norm))
+            candidates.append((similarity, rid, content, meta, created))
+
+        if query_emb is not None:
+            candidates.sort(key=lambda x: x[0], reverse=True)
+        # Without similarity, the initial ORDER BY created_at DESC already
+        # gave us recency order.
+
+        results: list[ScoredResult] = []
+        for _sim, rid, content, meta, created in candidates:
+            score_rows = await (await db.execute(
+                "SELECT dimension, value, source FROM scores WHERE result_id = ?",
+                (rid,),
+            )).fetchall()
+            scores = [
+                Score(dimension=d, value=v, source=ScoreSource(s))
+                for d, v, s in score_rows
+            ]
+            if not scores:
+                continue
+            avg = sum(s.value for s in scores) / len(scores)
+            if q.min_score is not None and avg < q.min_score:
+                continue
+
+            results.append(ScoredResult(
+                result_id=rid,
+                content=content,
+                scores=scores,
+                avg_score=avg,
+                metadata=meta,
+                created_at=created,
+            ))
+            if len(results) >= q.limit:
                 break
 
         return results
