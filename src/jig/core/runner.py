@@ -51,6 +51,11 @@ class AgentConfig[T]:
 
     grader: Grader[T] | None = None
     max_tool_calls: int = 10
+    # Absolute cap on LLM calls per run. ``max_tool_calls`` caps tool
+    # *execution*, but a model that keeps emitting tool_use blocks after
+    # being told "max reached" would otherwise loop forever. This bounds
+    # the outer loop so a misbehaving model can't burn unbounded spend.
+    max_llm_calls: int = 50
     max_llm_retries: int = _MAX_LLM_RETRIES
     include_memory_in_prompt: bool = True
     include_feedback_in_prompt: bool = True
@@ -176,6 +181,13 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
     parsed: T | None = None
 
     while True:
+        if total_usage["llm_calls"] >= config.max_llm_calls:
+            final_output = (
+                f"[agent terminated: exceeded max_llm_calls "
+                f"({config.max_llm_calls})]"
+            )
+            break
+
         llm_span = config.tracer.start_span(trace.id, SpanKind.LLM_CALL, "completion")
         params = CompletionParams(
             messages=messages,
