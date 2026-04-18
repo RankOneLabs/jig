@@ -68,10 +68,16 @@ class FakeFeedback(FeedbackLoop):
     def __init__(self) -> None:
         self.scored: list[tuple[str, list[Score]]] = []
 
+    async def store_result(self, content, input_text, metadata=None):
+        return "r-0"
+
     async def score(self, result_id: str, scores: list[Score]) -> None:
         self.scored.append((result_id, scores))
 
     async def get_signals(self, query: str, limit: int = 3, min_score: float | None = None, source: ScoreSource | None = None) -> list[ScoredResult]:
+        return []
+
+    async def query(self, q):
         return []
 
     async def export_eval_set(self, since: datetime | None = None, min_score: float | None = None, max_score: float | None = None, limit: int | None = None) -> list[EvalCase]:

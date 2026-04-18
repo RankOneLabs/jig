@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, AsyncIterator
 
@@ -110,6 +110,30 @@ class EvalCase:
     metadata: dict[str, Any] | None = None
 
 
+@dataclass
+class FeedbackQuery:
+    """Filter spec for :meth:`FeedbackLoop.query`.
+
+    All fields are optional; unset fields are no-ops. When ``similar_to``
+    is provided, the backend orders candidates by embedding similarity
+    before applying metadata filters. Without it, results are ordered by
+    ``created_at`` descending.
+
+    ``tags`` matches any overlap with the stored list in
+    ``metadata["tags"]``. ``agent_name`` and ``model`` match exact keys
+    in ``metadata`` — set those keys at ``store_result`` time for them
+    to be filterable.
+    """
+
+    similar_to: str | None = None
+    agent_name: str | None = None
+    model: str | None = None
+    tags: list[str] | None = None
+    min_score: float | None = None
+    max_age: timedelta | None = None
+    limit: int = 10
+
+
 class SpanKind(str, Enum):
     AGENT_RUN = "agent_run"
     PIPELINE_RUN = "pipeline_run"
@@ -183,6 +207,22 @@ class AgentMemory(ABC):
 
 class FeedbackLoop(ABC):
     @abstractmethod
+    async def store_result(
+        self,
+        content: str,
+        input_text: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        """Persist an agent result and return its ID.
+
+        The returned ID is the key ``score`` writes against. Metadata
+        keys that ``FeedbackQuery`` filters on — ``agent_name``,
+        ``model``, ``tags`` — should be populated here so later queries
+        can match them.
+        """
+        ...
+
+    @abstractmethod
     async def score(self, result_id: str, scores: list[Score]) -> None: ...
 
     @abstractmethod
@@ -193,6 +233,16 @@ class FeedbackLoop(ABC):
         min_score: float | None = None,
         source: ScoreSource | None = None,
     ) -> list[ScoredResult]: ...
+
+    @abstractmethod
+    async def query(self, q: FeedbackQuery) -> list[ScoredResult]:
+        """Find prior results matching a :class:`FeedbackQuery`.
+
+        Combines embedding similarity (when ``similar_to`` is set) with
+        metadata filters. Returns up to ``q.limit`` results ranked by
+        similarity (or recency when no similarity query is given).
+        """
+        ...
 
     @abstractmethod
     async def export_eval_set(

@@ -39,8 +39,10 @@ class _FakeMemory(AgentMemory):
 
 
 class _FakeFeedback(FeedbackLoop):
+    async def store_result(self, content, input_text, metadata=None): return "r"
     async def score(self, result_id, scores): pass
     async def get_signals(self, query, limit=3, min_score=None, source=None): return []
+    async def query(self, q): return []
     async def export_eval_set(self, since=None, min_score=None, max_score=None, limit=None): return []
 
 
