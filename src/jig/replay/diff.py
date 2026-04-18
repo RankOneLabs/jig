@@ -217,8 +217,13 @@ async def trace_diff(
     a_scores = _avg_scores(a_spans)
     b_scores = _avg_scores(b_spans)
     score_deltas: dict[str, float] = {}
-    for dim in set(a_scores) & set(b_scores):
-        delta = b_scores[dim] - a_scores[dim]
+    # Iterate the union so a grader dimension that exists in only one
+    # trace still shows up — a dropped or added dimension is a real
+    # regression the diff must surface. Missing side contributes 0.0
+    # (so an added dim appears as a positive delta, a dropped one
+    # negative).
+    for dim in set(a_scores) | set(b_scores):
+        delta = b_scores.get(dim, 0.0) - a_scores.get(dim, 0.0)
         if delta != 0:
             score_deltas[dim] = delta
 

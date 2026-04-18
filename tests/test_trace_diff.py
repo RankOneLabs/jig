@@ -198,6 +198,37 @@ async def test_score_deltas_computed_per_dimension():
 
 
 @pytest.mark.asyncio
+async def test_score_deltas_surface_added_and_dropped_dimensions():
+    """A dimension present in only one trace must show up in the diff —
+    otherwise a grader change (adding/removing a rubric entry) would
+    silently look identical and `identical` would wrongly return True."""
+    tracer = _StubTracer({
+        "a": [
+            _root("a"),
+            _grading("a", [
+                {"dimension": "quality", "value": 0.7},
+                {"dimension": "accuracy", "value": 0.5},
+            ]),
+        ],
+        "b": [
+            _root("b"),
+            _grading("b", [
+                {"dimension": "quality", "value": 0.7},
+                {"dimension": "relevance", "value": 0.9},
+            ]),
+        ],
+    })
+    diff = await trace_diff("a", "b", tracer=tracer)
+    # accuracy was dropped (present in A, missing in B → negative delta)
+    # relevance was added (missing in A, present in B → positive delta)
+    # quality identical → omitted
+    assert "quality" not in diff.score_deltas
+    assert diff.score_deltas["accuracy"] == pytest.approx(-0.5)
+    assert diff.score_deltas["relevance"] == pytest.approx(0.9)
+    assert diff.identical is False
+
+
+@pytest.mark.asyncio
 async def test_cost_and_latency_delta():
     tracer = _StubTracer({
         "a": [

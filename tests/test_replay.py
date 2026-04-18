@@ -295,7 +295,7 @@ def test_reconstruct_config_schema_override_mismatch_rejected():
         "session_id": None,
         "output_schema": f"{_SchemaA.__module__}:{_SchemaA.__qualname__}",
     }
-    with pytest.raises(ReplaySchemaMismatchError, match="shape changes"):
+    with pytest.raises(ReplaySchemaMismatchError, match="out of replay scope"):
         reconstruct_config(
             snap, {"output_schema": _SchemaB},
             llm=FakeLLM([]),
@@ -322,6 +322,56 @@ def test_reconstruct_config_schema_fqn_missing_raises():
             tracer=SQLiteTracer(db_path=":memory:"),
             feedback=FakeFeedback(),
         )
+
+
+def test_reconstruct_config_override_rejects_adding_schema():
+    """Adding an output_schema to a trace recorded without one is a
+    semantic shift (flips whether submit_output is injected)."""
+    snap = {
+        "agent_name": "x", "description": "", "system_prompt": "p",
+        "system_prompt_is_callable": False, "max_tool_calls": 10,
+        "max_llm_calls": 50, "max_llm_retries": 3, "max_parse_retries": 2,
+        "include_memory_in_prompt": True, "include_feedback_in_prompt": True,
+        "session_id": None, "output_schema": None,
+    }
+    with pytest.raises(ReplaySchemaMismatchError, match="out of replay scope"):
+        reconstruct_config(
+            snap, {"output_schema": _SchemaA},
+            llm=FakeLLM([]),
+            tools=ToolRegistry(),
+            tracer=SQLiteTracer(db_path=":memory:"),
+            feedback=FakeFeedback(),
+        )
+
+
+def test_reconstruct_config_override_rejects_dropping_schema():
+    """Removing the recorded output_schema is equally disallowed."""
+    snap = {
+        "agent_name": "x", "description": "", "system_prompt": "p",
+        "system_prompt_is_callable": False, "max_tool_calls": 10,
+        "max_llm_calls": 50, "max_llm_retries": 3, "max_parse_retries": 2,
+        "include_memory_in_prompt": True, "include_feedback_in_prompt": True,
+        "session_id": None,
+        "output_schema": f"{_SchemaA.__module__}:{_SchemaA.__qualname__}",
+    }
+    with pytest.raises(ReplaySchemaMismatchError, match="out of replay scope"):
+        reconstruct_config(
+            snap, {"output_schema": None},
+            llm=FakeLLM([]),
+            tools=ToolRegistry(),
+            tracer=SQLiteTracer(db_path=":memory:"),
+            feedback=FakeFeedback(),
+        )
+
+
+def test_resolve_output_schema_rejects_function_local():
+    """PEP 3155: <locals> in qualname means the class isn't reachable
+    by getattr walk. Resolver surfaces a clear error instead of a
+    generic AttributeError."""
+    from jig.replay.snapshot import _resolve_output_schema
+
+    with pytest.raises(ReplaySchemaMismatchError, match="function-local"):
+        _resolve_output_schema("some.module:outer.<locals>.Schema")
 
 
 # --- ReplayToolRegistry ---
@@ -473,6 +523,53 @@ async def test_replay_honors_config_override(tracer: SQLiteTracer):
         feedback=FakeFeedback(),
     )
     assert result_r.usage["tool_calls"] == 1
+
+
+async def test_replay_override_cannot_swap_tools(tracer: SQLiteTracer):
+    """The core contract: replay must always use ``ReplayToolRegistry``.
+    A caller passing ``tools`` in ``config_override`` (or a full
+    AgentConfig replacement) must not defeat that — otherwise replay
+    silently falls back to real tool execution.
+
+    We use a live tool registry as the override and record what runs:
+    if replay honored the override, the real EchoTool would emit a
+    different output than what was recorded. The canned recording wins.
+    """
+    # Record: echo "hello" → recorded output "hello"
+    llm_a = _llm_with_echo_then_final(text_to_echo="hello", final="done")
+    result_a = await run_agent(_make_config(llm_a, tracer), "go")
+    await tracer.flush()
+
+    # Build a "live" registry whose EchoTool emits a sentinel; if replay
+    # used it, the replay tool span output would be "LIVE-NOT-CANNED".
+    class SentinelEcho(Tool):
+        @property
+        def definition(self) -> ToolDefinition:
+            return ToolDefinition(
+                name="echo",
+                description="sentinel",
+                parameters={"type": "object", "properties": {}},
+            )
+
+        async def execute(self, args: dict[str, Any]) -> str:
+            return "LIVE-NOT-CANNED"
+
+    live_registry = ToolRegistry([SentinelEcho()])
+
+    llm_b = _llm_with_echo_then_final(text_to_echo="hello", final="done-b")
+    result_b = await replay(
+        trace_id=result_a.trace_id,
+        config_override={"tools": live_registry},  # tries to swap!
+        tracer=tracer,
+        llm=llm_b,
+        feedback=FakeFeedback(),
+    )
+
+    replay_spans = await tracer.get_trace(result_b.trace_id)
+    tool_spans = [s for s in replay_spans if s.kind == SpanKind.TOOL_CALL]
+    assert len(tool_spans) == 1
+    # Canned "hello" wins; SentinelEcho was NOT invoked.
+    assert tool_spans[0].output == "hello"
 
 
 async def test_replay_rejects_old_trace_without_snapshot(tracer: SQLiteTracer):

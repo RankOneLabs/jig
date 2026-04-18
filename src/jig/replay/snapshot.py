@@ -50,6 +50,17 @@ def _resolve_output_schema(fqn: str) -> type[BaseModel]:
             f"(expected 'module:ClassName')"
         )
     module_name, _, qualname = fqn.partition(":")
+    # PEP 3155: function-local classes have ``<locals>`` segments in
+    # their qualname and cannot be reached via getattr after the
+    # defining function returns. Detect up front so the caller sees a
+    # clear error instead of an opaque AttributeError on the walk.
+    if "<locals>" in qualname:
+        raise ReplaySchemaMismatchError(
+            f"Recorded output_schema {fqn!r} is a function-local class "
+            f"and is not replayable — move the pydantic model to module "
+            f"scope (or pass a module-scoped replacement via "
+            f"config_override)."
+        )
     try:
         module = importlib.import_module(module_name)
     except ImportError as e:
@@ -107,15 +118,22 @@ def reconstruct_config(
     recorded_schema_fqn = snapshot.get("output_schema")
     override_schema = override_dict.get("output_schema", _SENTINEL)
     if override_schema is not _SENTINEL:
-        # Explicit override — honor it, but reject shape changes.
-        if recorded_schema_fqn is not None and override_schema is not None:
-            recorded_cls = _resolve_output_schema(recorded_schema_fqn)
-            if override_schema is not recorded_cls:
-                raise ReplaySchemaMismatchError(
-                    f"override changes output_schema from {recorded_schema_fqn!r} "
-                    f"to {override_schema!r}; parsed-output shape changes are "
-                    f"out of replay scope"
-                )
+        # Any presence change (adding a schema to a plain-text recording,
+        # or dropping the recorded schema) flips whether ``submit_output``
+        # gets injected. That's a semantic shift, not just a shape swap —
+        # reject the override so the replay stays comparable to the
+        # recording.
+        recorded_cls = (
+            _resolve_output_schema(recorded_schema_fqn)
+            if recorded_schema_fqn is not None
+            else None
+        )
+        if override_schema is not recorded_cls:
+            raise ReplaySchemaMismatchError(
+                f"override changes output_schema from {recorded_schema_fqn!r} "
+                f"to {override_schema!r}; adding, removing, or swapping the "
+                f"parsed-output schema is out of replay scope"
+            )
         output_schema = override_schema
         override_dict.pop("output_schema")
     elif recorded_schema_fqn is not None:

@@ -110,4 +110,20 @@ async def replay(
         grader=grader,
     )
 
+    # Pin replay-owned live components last. ``reconstruct_config``
+    # honors a full-``AgentConfig`` override verbatim and a dict
+    # override can still carry ``tools``/``tracer``/``feedback``/etc.
+    # — either route would silently let real tools run, defeating the
+    # whole point of replay. Re-apply replay's components after
+    # reconstruction so they always win.
+    config = config.with_(
+        llm=llm,
+        tools=replay_tools,
+        tracer=tracer,
+        feedback=feedback,
+        store=store,
+        retriever=retriever,
+        grader=grader,
+    )
+
     return await run_agent(config, recorded_input)
