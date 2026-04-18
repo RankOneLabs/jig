@@ -181,6 +181,48 @@ def _append_schema_instruction(system_message: str) -> str:
     )
 
 
+def _serialize_config_snapshot(config: AgentConfig[Any]) -> dict[str, Any]:
+    """Capture the state fields of an :class:`AgentConfig` for replay.
+
+    Live objects (``llm``, ``tracer``, ``tools``, ``store``, ``retriever``,
+    ``feedback``, ``grader``) are skipped — replay's caller supplies those
+    fresh. Everything else is kept so :func:`jig.replay` can reconstruct
+    an equivalent config.
+
+    ``system_prompt`` is stored verbatim when it's a string; if a callable
+    was used, we stash a sentinel and let replay force the caller to
+    supply a new one via ``config_override``.
+
+    ``output_schema`` is stored as its fully-qualified ``module:ClassName``
+    so phase 11 replay can re-import it.
+    """
+    if callable(config.system_prompt):
+        system_prompt: str | None = None
+        system_prompt_is_callable = True
+    else:
+        system_prompt = config.system_prompt
+        system_prompt_is_callable = False
+
+    schema_fqn: str | None = None
+    if config.output_schema is not None:
+        schema_fqn = f"{config.output_schema.__module__}:{config.output_schema.__qualname__}"
+
+    return {
+        "agent_name": config.name,
+        "description": config.description,
+        "system_prompt": system_prompt,
+        "system_prompt_is_callable": system_prompt_is_callable,
+        "max_tool_calls": config.max_tool_calls,
+        "max_llm_calls": config.max_llm_calls,
+        "max_llm_retries": config.max_llm_retries,
+        "max_parse_retries": config.max_parse_retries,
+        "include_memory_in_prompt": config.include_memory_in_prompt,
+        "include_feedback_in_prompt": config.include_feedback_in_prompt,
+        "session_id": config.session_id,
+        "output_schema": schema_fqn,
+    }
+
+
 async def _finalize_trace(
     tracer: TracingLogger,
     trace_span: Any,
@@ -221,8 +263,14 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
     if config.output_schema is not None:
         _validate_output_schema(config.output_schema)
 
-    # 1. Start trace
-    trace = config.tracer.start_trace(config.name, {"input": input}, kind=SpanKind.AGENT_RUN)
+    # 1. Start trace. Snapshot the config alongside the input so phase 11
+    # replay can reconstruct an equivalent AgentConfig without the caller
+    # having to supply state fields that were already recorded.
+    trace = config.tracer.start_trace(
+        config.name,
+        {"input": input, "config": _serialize_config_snapshot(config)},
+        kind=SpanKind.AGENT_RUN,
+    )
 
     # State hoisted so the finally block can close the trace even if an
     # exception propagates from memory.add / grading / etc. mid-run.
@@ -542,7 +590,13 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                     trace.id, SpanKind.TOOL_CALL, call.name, call.arguments
                 )
                 result = await config.tools.execute(call)
-                config.tracer.end_span(tool_span.id, result.output[:500], error=result.error)
+                # Full tool output is persisted (no truncation). Phase 11
+                # replay substitutes recorded tool outputs into a rerun of
+                # the agent loop — truncation would silently corrupt that
+                # substitution and hide real tool behavior.
+                config.tracer.end_span(
+                    tool_span.id, result.output, error=result.error,
+                )
 
                 # Surface tool errors to the model so it can react
                 if result.error:

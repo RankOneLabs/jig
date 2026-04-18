@@ -24,7 +24,7 @@ replay; phases 12–13 migrate consumers.
 | 8     | Smithers dispatch — tools + steps         | pending       | —    | no       |
 | 9     | Trace propagation across dispatch         | pending       | —    | no       |
 | 10    | Callback-based sweep fan-out              | pending       | —    | no       |
-| 11    | Agent replay from trace                   | pending       | —    | no       |
+| 11    | Agent replay from trace                   | **open**      | —    | minor    |
 | 12    | Ta capstone migration                     | pending       | —    | —        |
 | 13    | Scout + algerknown lift                   | pending       | —    | —        |
 
