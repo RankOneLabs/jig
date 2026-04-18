@@ -42,6 +42,14 @@ from jig.core import (
 from jig.core.pipeline import map_pipeline, run_pipeline
 from jig.core.runner import AgentConfig, AgentResult, run_agent
 from jig.llm.factory import complete, from_model
+from jig.sweep import (
+    CompareResult,
+    CompareRun,
+    SweepResult,
+    SweepRun,
+    compare,
+    sweep,
+)
 from jig.tools import PastResults, ToolRegistry
 
 __all__ = [
@@ -101,4 +109,11 @@ __all__ = [
     # Budget
     "BudgetTracker",
     "BudgetedLLMClient",
+    # Experimentation
+    "CompareResult",
+    "CompareRun",
+    "SweepResult",
+    "SweepRun",
+    "compare",
+    "sweep",
 ]
