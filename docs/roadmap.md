@@ -34,8 +34,8 @@ in a parallel agent session. Phases 7+8 were bundled in one pair of
 PRs (jig #19 + smithers #18) because they tell the same dispatch
 story.
 
-**Next critical-path work: phase 9.** Detailed plan at
-[`phase-9-trace-propagation.md`](phase-9-trace-propagation.md).
+**Next critical-path work: phase 10.** Detailed plan at
+[`phase-10-callback-sweep-fanout.md`](phase-10-callback-sweep-fanout.md).
 
 ## Locked design decisions
 

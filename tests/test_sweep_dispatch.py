@@ -123,6 +123,29 @@ class TestListenerLifecycle:
         await compare("hi", [cfg], dispatch="smithers")
         assert listener_mod._active_listener() is None
 
+    async def test_concurrent_sweeps_share_listener(self):
+        """Two sweeps with dispatch="smithers" overlapping in time must
+        share one listener. The inner sweep finishing first must not
+        stop the listener under the outer sweep."""
+        cfg_a = _noop_config(name="a")
+        cfg_b = _noop_config(name="b")
+
+        async def _slow_sweep(label: str):
+            # Run a tiny sweep with dispatch="smithers" — the body
+            # yields control often enough that two concurrent calls
+            # overlap.
+            return await sweep([f"{label}-1", f"{label}-2"], [cfg_a, cfg_b], dispatch="smithers")
+
+        # Two concurrent sweeps — each enters _dispatch_listener,
+        # increments the ref count, and exits. The listener should
+        # live through both and be torn down at the end.
+        results = await asyncio.gather(_slow_sweep("s1"), _slow_sweep("s2"))
+
+        assert len(results[0].runs) == 4
+        assert len(results[1].runs) == 4
+        # After both exit, the listener should be fully torn down.
+        assert listener_mod._active_listener() is None
+
 
 # --- End-to-end sweep via fake smithers + real listener ---
 

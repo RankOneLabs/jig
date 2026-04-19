@@ -25,16 +25,36 @@ from jig.core.types import EvalCase
 
 _VALID_DISPATCH = frozenset({"smithers"})
 
+# Reference-count for the sweep-owned listener. Two concurrent
+# compare()/sweep() calls with dispatch="smithers" must share the
+# listener; whichever exits first must not tear it down under the
+# other one. Counter starts at 0, incremented on 0→1 transition
+# (which starts the listener) and decremented on exit (which stops
+# the listener on the 1→0 transition). Lock-protected so check-then-
+# act on the counter can't race.
+_managed_listener_refs: int = 0
+_managed_listener_lock: asyncio.Lock | None = None
+
+
+def _get_managed_lock() -> asyncio.Lock:
+    """Lazy construction to avoid binding to an import-time event loop."""
+    global _managed_listener_lock
+    if _managed_listener_lock is None:
+        _managed_listener_lock = asyncio.Lock()
+    return _managed_listener_lock
+
 
 @asynccontextmanager
 async def _dispatch_listener(dispatch: str | None) -> AsyncIterator[None]:
     """Ensure a callback listener runs for the wrapped block when
     ``dispatch == "smithers"``. No-op otherwise.
 
-    If the process already has a listener, reuse it (and do not stop
-    it). If we have to start one, stop it on exit so the sweep doesn't
-    leak HTTP servers. Other backend strings will go here later; unknown
-    values raise immediately.
+    Ownership is reference-counted: if the caller pre-started a
+    listener (outside any ``_dispatch_listener`` context), this context
+    reuses it and leaves it running. Otherwise the first entering
+    context starts it; the last exiting context stops it. Concurrent
+    sweeps therefore share one listener without stomping on each
+    other's shutdown.
     """
     if dispatch is None:
         yield
@@ -55,16 +75,30 @@ async def _dispatch_listener(dispatch: str | None) -> AsyncIterator[None]:
             "Install with: pip install 'jig[callback]'"
         ) from exc
 
-    pre_existing = _listener_mod._active_listener()
-    if pre_existing is not None:
-        yield
-        return
+    global _managed_listener_refs
+    owns_managed_ref = False
+    async with _get_managed_lock():
+        active = _listener_mod._active_listener()
+        if active is None:
+            await _listener_mod.listen()
+            _managed_listener_refs = 1
+            owns_managed_ref = True
+        elif _managed_listener_refs > 0:
+            # Another sweep already owns the lifecycle — join as a
+            # ref holder so we keep it alive past that sweep's exit.
+            _managed_listener_refs += 1
+            owns_managed_ref = True
+        # else: caller pre-started the listener outside any sweep
+        # context. They own the lifecycle; we're just borrowing.
 
-    await _listener_mod.listen()
     try:
         yield
     finally:
-        await _listener_mod.stop()
+        if owns_managed_ref:
+            async with _get_managed_lock():
+                _managed_listener_refs -= 1
+                if _managed_listener_refs == 0:
+                    await _listener_mod.stop()
 
 
 @dataclass

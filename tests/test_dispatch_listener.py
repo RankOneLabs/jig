@@ -199,13 +199,23 @@ class TestStopFailsPending:
 
 
 class TestBaseURLResolution:
-    async def test_explicit_base_url_wins(self):
+    async def test_explicit_base_url_with_port_wins(self):
         listener = CallbackListener()
         try:
             await listener.start(
                 port=0, host="127.0.0.1", base_url="http://explicit.example:9999"
             )
             assert listener.url == "http://explicit.example:9999"
+        finally:
+            await listener.stop()
+
+    async def test_explicit_base_url_without_port_gets_bound_port(self):
+        """Host-only base_url like `http://127.0.0.1` should pick up the
+        actual bound port instead of silently defaulting to 80."""
+        listener = CallbackListener()
+        try:
+            await listener.start(port=0, host="127.0.0.1", base_url="http://127.0.0.1")
+            assert listener.url == f"http://127.0.0.1:{listener.port}"
         finally:
             await listener.stop()
 
@@ -229,6 +239,62 @@ class TestBaseURLResolution:
             assert socket.gethostname() in listener.url
         finally:
             await listener.stop()
+
+
+class TestTokenURLEncoding:
+    async def test_special_chars_in_token_are_url_encoded(self, monkeypatch):
+        """Tokens with `?/&/=/#/space` must not break the callback URL."""
+        monkeypatch.setenv("JIG_CALLBACK_SECRET", "a b&c=d?e#f")
+        listener = CallbackListener()
+        try:
+            await listener.start(port=0, host="127.0.0.1")
+            url = listener.url_for("test-nonce")
+            # Raw reserved chars must not appear after `token=`
+            token_part = url.split("token=", 1)[1]
+            assert "&" not in token_part
+            assert "#" not in token_part
+            # The quoted form should be present
+            assert "a%20b%26c%3Dd%3Fe%23f" in token_part
+        finally:
+            await listener.stop()
+
+
+class TestHealthCheckCaching:
+    async def test_health_check_ttl_skips_probe(self, live_listener):
+        """When ttl_seconds is 10, two back-to-back calls should only hit
+        the HTTP endpoint once — the second should return from cache."""
+        # First call primes the cache
+        await live_listener.health_check(ttl_seconds=10.0)
+        primed_at = live_listener._last_healthy_at
+
+        # Second call should no-op
+        await live_listener.health_check(ttl_seconds=10.0)
+        assert live_listener._last_healthy_at == primed_at
+
+    async def test_health_check_ttl_zero_forces_fresh_probe(self, live_listener):
+        await live_listener.health_check(ttl_seconds=10.0)
+        primed_at = live_listener._last_healthy_at
+
+        # A moment later with ttl=0 should record a new timestamp
+        import asyncio
+        await asyncio.sleep(0.01)
+        await live_listener.health_check(ttl_seconds=0.0)
+        assert live_listener._last_healthy_at > primed_at
+
+
+class TestConcurrentListen:
+    async def test_concurrent_listen_returns_same_instance(self):
+        """Two concurrent `listen()` callers must observe one listener,
+        not race to create two live servers."""
+        results = await asyncio.gather(
+            listener_mod.listen(port=0, host="127.0.0.1"),
+            listener_mod.listen(port=0, host="127.0.0.1"),
+            listener_mod.listen(port=0, host="127.0.0.1"),
+        )
+        # All three references point at the same singleton
+        assert results[0] is results[1] is results[2]
+        assert listener_mod._active_listener() is results[0]
+        await listener_mod.stop()
 
 
 class TestTokenGeneration:

@@ -14,7 +14,9 @@ listener can't bind a reachable port.
 
 - New `jig.dispatch.listen(port=0, host="0.0.0.0", base_url=None)` —
   starts an `aiohttp.web` HTTP receiver that handles `POST
-  /callbacks/{job_id}` and resolves a per-job `asyncio.Future`.
+  /callbacks/{nonce}` and resolves a per-job `asyncio.Future` keyed by
+  that nonce (registered before submit to sidestep the post-submit /
+  pre-register race).
   `aiohttp` lands as an optional extra `jig[callback]`; the same
   `try:` / `ImportError → install jig[callback]` pattern jig already
   uses for `[anthropic]`, `[openai]`.
@@ -177,10 +179,13 @@ async def run(fn_ref, payload, *, dispatch_url, requester,
         # existing poll loop
 ```
 
-Registration is keyed by `job_id` returned from smithers at submit
-time — the listener holds an `asyncio.Future` per pending job.
-When `POST /callbacks/{job_id}` arrives, the future resolves with
-the result dict.
+Registration is keyed by a UUID4 nonce the caller generates before
+submit — the listener holds an `asyncio.Future` per pending nonce.
+The submission carries `callback_url=<base>/callbacks/<nonce>?token=...`,
+and when that POST arrives the listener looks up the nonce and
+resolves the future with the body dict. Generating the nonce locally
+(rather than waiting for the `job_id` smithers hands back) closes
+the small race window between submit and the first callback attempt.
 
 ### 3. Fallback: polling stays
 
@@ -254,7 +259,7 @@ keeps the trace DB from bloating when sweeps run.
 ### 7. Callback payload shape
 
 ```json
-POST /callbacks/{job_id}
+POST /callbacks/{nonce}?token={secret}
 {
   "job_id": "...",
   "status": "complete" | "failed" | "cancelled",

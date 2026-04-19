@@ -177,9 +177,15 @@ async def _submit_and_poll(
     logger.info("Dispatch job %s submitted (task_type=%s)", job_id, task_type)
 
     # --- Wait: callback path if listener active, else poll ---
+    # On non-timeout listener trouble (listener stopped mid-flight,
+    # malformed callback body) fall through to polling — smithers
+    # still has the job_id and the poll endpoint can recover the
+    # result. The job isn't lost just because our local receiver had
+    # a bad day.
+    callback_data: dict[str, Any] | None = None
     if listener is not None and callback_future is not None:
         try:
-            data = await asyncio.wait_for(
+            callback_data = await asyncio.wait_for(
                 callback_future, timeout=cfg.timeout_seconds
             )
         except asyncio.TimeoutError as e:
@@ -191,23 +197,32 @@ async def _submit_and_poll(
                 job_id=job_id,
                 timeout_seconds=cfg.timeout_seconds,
             ) from e
+        except Exception as e:
+            logger.warning(
+                "Callback future for job %s failed (%s) — falling back to polling",
+                job_id, e,
+            )
+            if callback_nonce is not None:
+                listener.unregister(callback_nonce)
+            callback_data = None
 
-        if not isinstance(data, dict):
+    if callback_data is not None:
+        if not isinstance(callback_data, dict):
             raise DispatchError(
-                f"Callback for job {job_id} delivered non-object body: {data!r}",
+                f"Callback for job {job_id} delivered non-object body: {callback_data!r}",
                 job_id=job_id,
             )
 
-        status = data.get("status", "")
+        status = callback_data.get("status", "")
         if status == "complete":
             logger.info(
                 "Dispatch job %s complete via callback (%.0fms)",
                 job_id, (time.time() - start) * 1000,
             )
-            return data
+            return callback_data
         if status == "failed":
             raise DispatchError(
-                data.get("error") or f"Dispatch job {job_id} failed",
+                callback_data.get("error") or f"Dispatch job {job_id} failed",
                 job_id=job_id,
                 status="failed",
             )
