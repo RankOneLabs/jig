@@ -15,12 +15,90 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
 from jig.core.runner import AgentConfig, AgentResult, run_agent
 from jig.core.types import EvalCase
+
+_VALID_DISPATCH = frozenset({"smithers"})
+
+# Reference-count for the sweep-owned listener. Two concurrent
+# compare()/sweep() calls with dispatch="smithers" must share the
+# listener; whichever exits first must not tear it down under the
+# other one. Counter starts at 0, incremented on 0→1 transition
+# (which starts the listener) and decremented on exit (which stops
+# the listener on the 1→0 transition). Lock-protected so check-then-
+# act on the counter can't race.
+_managed_listener_refs: int = 0
+_managed_listener_lock: asyncio.Lock | None = None
+
+
+def _get_managed_lock() -> asyncio.Lock:
+    """Lazy construction to avoid binding to an import-time event loop."""
+    global _managed_listener_lock
+    if _managed_listener_lock is None:
+        _managed_listener_lock = asyncio.Lock()
+    return _managed_listener_lock
+
+
+@asynccontextmanager
+async def _dispatch_listener(dispatch: str | None) -> AsyncIterator[None]:
+    """Ensure a callback listener runs for the wrapped block when
+    ``dispatch == "smithers"``. No-op otherwise.
+
+    Ownership is reference-counted: if the caller pre-started a
+    listener (outside any ``_dispatch_listener`` context), this context
+    reuses it and leaves it running. Otherwise the first entering
+    context starts it; the last exiting context stops it. Concurrent
+    sweeps therefore share one listener without stomping on each
+    other's shutdown.
+    """
+    if dispatch is None:
+        yield
+        return
+    if dispatch not in _VALID_DISPATCH:
+        raise ValueError(
+            f"Unknown dispatch backend {dispatch!r}; "
+            f"expected one of {sorted(_VALID_DISPATCH)}"
+        )
+
+    # Import lazily so non-dispatch callers never pay for the aiohttp
+    # extra. The try/except surfaces a clean install hint.
+    try:
+        from jig.dispatch import listener as _listener_mod
+    except ImportError as exc:
+        raise ImportError(
+            "sweep(dispatch='smithers') requires the callback listener. "
+            "Install with: pip install 'jig[callback]'"
+        ) from exc
+
+    global _managed_listener_refs
+    owns_managed_ref = False
+    async with _get_managed_lock():
+        active = _listener_mod._active_listener()
+        if active is None:
+            await _listener_mod.listen()
+            _managed_listener_refs = 1
+            owns_managed_ref = True
+        elif _managed_listener_refs > 0:
+            # Another sweep already owns the lifecycle — join as a
+            # ref holder so we keep it alive past that sweep's exit.
+            _managed_listener_refs += 1
+            owns_managed_ref = True
+        # else: caller pre-started the listener outside any sweep
+        # context. They own the lifecycle; we're just borrowing.
+
+    try:
+        yield
+    finally:
+        if owns_managed_ref:
+            async with _get_managed_lock():
+                _managed_listener_refs -= 1
+                if _managed_listener_refs == 0:
+                    await _listener_mod.stop()
 
 
 @dataclass
@@ -143,12 +221,18 @@ async def compare[T](
     configs: list[AgentConfig[T]],
     *,
     concurrency: int = 1,
+    dispatch: str | None = None,
 ) -> CompareResult[T]:
     """Run the same input through N configs; return the grid.
 
     ``concurrency > 1`` runs configs in parallel via
     ``asyncio.Semaphore``. Use this to A/B (or A/B/C) test model
     swaps / prompt variants / retriever choices on a single probe.
+
+    ``dispatch="smithers"`` wraps the call in a callback-listener
+    lifecycle. Configs that route LLM calls through smithers get the
+    callback path automatically; configs that run locally are
+    unaffected.
     """
     if concurrency <= 0:
         raise ValueError(f"concurrency must be positive, got {concurrency}")
@@ -165,7 +249,8 @@ async def compare[T](
                 result=result,
             )
 
-    runs = await asyncio.gather(*[_one(i, c) for i, c in enumerate(configs)])
+    async with _dispatch_listener(dispatch):
+        runs = await asyncio.gather(*[_one(i, c) for i, c in enumerate(configs)])
     return CompareResult(input=input, runs=list(runs))
 
 
@@ -175,6 +260,7 @@ async def sweep[T](
     *,
     concurrency: int = 1,
     sweep_id: str | None = None,
+    dispatch: str | None = None,
 ) -> SweepResult[T]:
     """Run every (case, config) pair; return a SweepResult for rollup.
 
@@ -182,6 +268,12 @@ async def sweep[T](
     fresh ``sweep_id`` is generated per call unless supplied; downstream
     analytics can join ``run_agent`` traces by that tag once phase 5's
     auto-persist path lands.
+
+    ``dispatch="smithers"`` ensures a callback listener runs for the
+    sweep's duration. With N parallel runs, this replaces N polling
+    coroutines with one HTTP receiver. If the caller has already
+    started a listener, the sweep uses it and leaves it running;
+    otherwise the sweep owns the listener for its duration.
     """
     if concurrency <= 0:
         raise ValueError(f"concurrency must be positive, got {concurrency}")
@@ -207,10 +299,11 @@ async def sweep[T](
                 result=result,
             )
 
-    tasks = [
-        _one(ci, gi, case, cfg)
-        for ci, case in enumerate(cases)
-        for gi, cfg in enumerate(configs)
-    ]
-    runs = await asyncio.gather(*tasks)
+    async with _dispatch_listener(dispatch):
+        tasks = [
+            _one(ci, gi, case, cfg)
+            for ci, case in enumerate(cases)
+            for gi, cfg in enumerate(configs)
+        ]
+        runs = await asyncio.gather(*tasks)
     return SweepResult(sweep_id=resolved_sweep_id, runs=list(runs))

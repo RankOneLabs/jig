@@ -44,7 +44,9 @@ from jig.core.pipeline import map_pipeline, run_pipeline
 from jig.core.runner import AgentConfig, AgentResult, run_agent
 from jig.core.types import TraceContext
 from jig.dispatch import DispatchError, JobTimeoutError
+from jig.dispatch import listen as dispatch_listen
 from jig.dispatch import run as dispatch_run
+from jig.dispatch import stop as dispatch_stop
 from jig.llm.factory import complete, from_model
 from jig.replay import (
     ReplayConfigMissingError,
@@ -136,7 +138,9 @@ __all__ = [
     "DispatchError",
     "JobTimeoutError",
     "TraceContext",
+    "dispatch_listen",
     "dispatch_run",
+    "dispatch_stop",
     # Replay
     "ReplayError",
     "ReplayConfigMissingError",

@@ -14,5 +14,5 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: uv sync --extra dev
+      - run: uv sync --extra dev --extra callback
       - run: uv run pytest tests/ -v
