@@ -11,9 +11,11 @@ import asyncio
 from datetime import datetime
 from typing import Any
 
-import aiohttp
 import pytest
-from aiohttp import web
+
+# End-to-end test requires the callback listener (aiohttp).
+aiohttp = pytest.importorskip("aiohttp")
+web = pytest.importorskip("aiohttp.web")
 
 from jig.core.runner import AgentConfig
 from jig.core.types import (

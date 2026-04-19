@@ -11,10 +11,12 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-import aiohttp
 import httpx
 import pytest
-from aiohttp import web
+
+# Callback path requires the optional extra. Skip cleanly when absent.
+aiohttp = pytest.importorskip("aiohttp")
+web = pytest.importorskip("aiohttp.web")
 
 from jig.dispatch import listener as listener_mod
 from jig.dispatch.client import DispatchError, JobTimeoutError, run

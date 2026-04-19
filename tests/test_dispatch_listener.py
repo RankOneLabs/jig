@@ -10,8 +10,12 @@ from __future__ import annotations
 import asyncio
 import os
 
-import aiohttp
 import pytest
+
+# Skip the whole module when the optional extra isn't installed.
+# `jig.dispatch.listener` itself raises ImportError with an install
+# hint; collecting these tests without aiohttp would cascade that.
+aiohttp = pytest.importorskip("aiohttp")
 
 from jig.dispatch import listener as listener_mod
 from jig.dispatch.listener import CallbackListener, ListenerError
