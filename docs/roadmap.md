@@ -22,11 +22,11 @@ replay; phases 12–13 migrate consumers.
 | 6     | Memory split (Store / Retriever)          | **merged**    | #17        | yes      |
 | 7     | Smithers dispatch — LLM                   | **merged**    | jig #19, smithers #18 | no |
 | 8     | Smithers dispatch — tools + steps         | **merged**    | jig #19, smithers #18 | no |
-| 9     | Trace propagation across dispatch         | **ready**     | jig + smithers phase-9 branches ready to open PRs | no |
-| 10    | Callback-based sweep fan-out              | pending       | —          | no       |
+| 9     | Trace propagation across dispatch         | **merged**    | #21        | no       |
+| 10    | Callback-based sweep fan-out              | **ready**     | this branch | minor   |
 | 11    | Agent replay from trace                   | **merged**    | #20        | minor    |
-| 12    | Ta capstone migration                     | pending       | —          | —        |
-| 13    | Scout + algerknown lift                   | pending       | —          | —        |
+| 12    | Ta capstone migration                     | **merged**    | #22        | —        |
+| 13    | Scout + algerknown lift                   | **merged**    | scout#41, algerknown#35 | — |
 
 Phases 4+5 are bundled in one PR because their surfaces pair naturally
 (feedback query ↔ sweep auto-persist). Phase 6 is independent and runs

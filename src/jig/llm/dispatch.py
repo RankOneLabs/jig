@@ -31,6 +31,7 @@ from jig.core.types import (
 from jig.dispatch.client import (
     DispatchError,
     JobTimeoutError,
+    _current_listener,
     _PollConfig,
     _submit_and_poll,
 )
@@ -241,6 +242,7 @@ class DispatchClient(LLMClient):
                     if self._trace_context is not None else None
                 ),
                 poll_config=self._poll_config,
+                listener=_current_listener(),
             )
         except JobTimeoutError as e:
             raise JigLLMError(

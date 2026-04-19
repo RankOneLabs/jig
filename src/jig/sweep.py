@@ -15,12 +15,56 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
 from jig.core.runner import AgentConfig, AgentResult, run_agent
 from jig.core.types import EvalCase
+
+_VALID_DISPATCH = frozenset({"smithers"})
+
+
+@asynccontextmanager
+async def _dispatch_listener(dispatch: str | None) -> AsyncIterator[None]:
+    """Ensure a callback listener runs for the wrapped block when
+    ``dispatch == "smithers"``. No-op otherwise.
+
+    If the process already has a listener, reuse it (and do not stop
+    it). If we have to start one, stop it on exit so the sweep doesn't
+    leak HTTP servers. Other backend strings will go here later; unknown
+    values raise immediately.
+    """
+    if dispatch is None:
+        yield
+        return
+    if dispatch not in _VALID_DISPATCH:
+        raise ValueError(
+            f"Unknown dispatch backend {dispatch!r}; "
+            f"expected one of {sorted(_VALID_DISPATCH)}"
+        )
+
+    # Import lazily so non-dispatch callers never pay for the aiohttp
+    # extra. The try/except surfaces a clean install hint.
+    try:
+        from jig.dispatch import listener as _listener_mod
+    except ImportError as exc:
+        raise ImportError(
+            "sweep(dispatch='smithers') requires the callback listener. "
+            "Install with: pip install 'jig[callback]'"
+        ) from exc
+
+    pre_existing = _listener_mod._active_listener()
+    if pre_existing is not None:
+        yield
+        return
+
+    await _listener_mod.listen()
+    try:
+        yield
+    finally:
+        await _listener_mod.stop()
 
 
 @dataclass
@@ -143,12 +187,18 @@ async def compare[T](
     configs: list[AgentConfig[T]],
     *,
     concurrency: int = 1,
+    dispatch: str | None = None,
 ) -> CompareResult[T]:
     """Run the same input through N configs; return the grid.
 
     ``concurrency > 1`` runs configs in parallel via
     ``asyncio.Semaphore``. Use this to A/B (or A/B/C) test model
     swaps / prompt variants / retriever choices on a single probe.
+
+    ``dispatch="smithers"`` wraps the call in a callback-listener
+    lifecycle. Configs that route LLM calls through smithers get the
+    callback path automatically; configs that run locally are
+    unaffected.
     """
     if concurrency <= 0:
         raise ValueError(f"concurrency must be positive, got {concurrency}")
@@ -165,7 +215,8 @@ async def compare[T](
                 result=result,
             )
 
-    runs = await asyncio.gather(*[_one(i, c) for i, c in enumerate(configs)])
+    async with _dispatch_listener(dispatch):
+        runs = await asyncio.gather(*[_one(i, c) for i, c in enumerate(configs)])
     return CompareResult(input=input, runs=list(runs))
 
 
@@ -175,6 +226,7 @@ async def sweep[T](
     *,
     concurrency: int = 1,
     sweep_id: str | None = None,
+    dispatch: str | None = None,
 ) -> SweepResult[T]:
     """Run every (case, config) pair; return a SweepResult for rollup.
 
@@ -182,6 +234,12 @@ async def sweep[T](
     fresh ``sweep_id`` is generated per call unless supplied; downstream
     analytics can join ``run_agent`` traces by that tag once phase 5's
     auto-persist path lands.
+
+    ``dispatch="smithers"`` ensures a callback listener runs for the
+    sweep's duration. With N parallel runs, this replaces N polling
+    coroutines with one HTTP receiver. If the caller has already
+    started a listener, the sweep uses it and leaves it running;
+    otherwise the sweep owns the listener for its duration.
     """
     if concurrency <= 0:
         raise ValueError(f"concurrency must be positive, got {concurrency}")
@@ -207,10 +265,11 @@ async def sweep[T](
                 result=result,
             )
 
-    tasks = [
-        _one(ci, gi, case, cfg)
-        for ci, case in enumerate(cases)
-        for gi, cfg in enumerate(configs)
-    ]
-    runs = await asyncio.gather(*tasks)
+    async with _dispatch_listener(dispatch):
+        tasks = [
+            _one(ci, gi, case, cfg)
+            for ci, case in enumerate(cases)
+            for gi, cfg in enumerate(configs)
+        ]
+        runs = await asyncio.gather(*tasks)
     return SweepResult(sweep_id=resolved_sweep_id, runs=list(runs))

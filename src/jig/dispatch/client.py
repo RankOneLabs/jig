@@ -78,8 +78,16 @@ async def _submit_and_poll(
     machine: str | None = None,
     trace_context: dict[str, Any] | None = None,
     poll_config: _PollConfig | None = None,
+    listener: Any = None,  # CallbackListener | None — typed via Any to keep
+                            # jig.dispatch.listener import optional
 ) -> dict[str, Any]:
-    """Submit a job to smithers, poll until terminal, return the job data.
+    """Submit a job to smithers, wait for a terminal status, return the job data.
+
+    When ``listener`` is provided (and its health check passes), the wait
+    is an ``asyncio.Future`` resolved by a smithers HTTP callback —
+    callers don't pay for a polling coroutine. Health-check failure or
+    any other listener trouble falls back to the polling path silently,
+    so the caller still gets an answer.
 
     Returns the full job dict from smithers on ``status == "complete"``.
     Raises :class:`DispatchError` / :class:`JobTimeoutError` on terminal
@@ -89,6 +97,23 @@ async def _submit_and_poll(
     cfg = poll_config or _PollConfig()
     url = dispatch_url.rstrip("/")
     start = time.time()
+
+    # Health-probe the listener once up front. If it doesn't respond the
+    # caller still gets an answer via the poll path.
+    if listener is not None:
+        try:
+            await listener.health_check()
+        except Exception as e:
+            logger.info(
+                "Callback listener unhealthy (%s) — falling back to polling",
+                e,
+            )
+            listener = None
+
+    callback_nonce: str | None = None
+    callback_future: Any = None  # asyncio.Future[dict[str, Any]]
+    if listener is not None:
+        callback_nonce, callback_future = listener.register()
 
     submission: dict[str, Any] = {
         "task_type": task_type,
@@ -102,16 +127,18 @@ async def _submit_and_poll(
     if machine is not None:
         submission["machine"] = machine
     if trace_context is not None:
-        # Phase 9 will have workers read this and reparent their spans.
-        # For now we just propagate the fields through the payload so the
-        # protocol is established.
+        # Phase 9 has workers read this and reparent their spans.
         submission["trace_context"] = trace_context
+    if listener is not None and callback_nonce is not None:
+        submission["callback_url"] = listener.url_for(callback_nonce)
 
     # --- Submit ---
     try:
         resp = await http.post(f"{url}/jobs", json=submission)
         resp.raise_for_status()
     except httpx.ConnectError as e:
+        if listener is not None and callback_nonce is not None:
+            listener.unregister(callback_nonce)
         # Transient: dispatch server may be momentarily unreachable
         # (restart, network blip). Mark retryable so agent loops can
         # retry instead of terminating the run.
@@ -120,6 +147,8 @@ async def _submit_and_poll(
             retryable=True,
         ) from e
     except httpx.HTTPStatusError as e:
+        if listener is not None and callback_nonce is not None:
+            listener.unregister(callback_nonce)
         # 4xx = terminal (bad submission), 5xx = transient (server
         # overloaded / misconfigured, worth a retry).
         retryable = e.response.status_code >= 500
@@ -128,6 +157,8 @@ async def _submit_and_poll(
             retryable=retryable,
         ) from e
     except httpx.RequestError as e:
+        if listener is not None and callback_nonce is not None:
+            listener.unregister(callback_nonce)
         # Timeouts, DNS failures, mid-request disconnects — all transient.
         raise DispatchError(
             f"Dispatch request error: {e}",
@@ -137,11 +168,60 @@ async def _submit_and_poll(
     try:
         job_id = resp.json()["job_id"]
     except (ValueError, KeyError) as e:
+        if listener is not None and callback_nonce is not None:
+            listener.unregister(callback_nonce)
         raise DispatchError(
             f"Unexpected dispatch response: {resp.text}",
         ) from e
 
     logger.info("Dispatch job %s submitted (task_type=%s)", job_id, task_type)
+
+    # --- Wait: callback path if listener active, else poll ---
+    if listener is not None and callback_future is not None:
+        try:
+            data = await asyncio.wait_for(
+                callback_future, timeout=cfg.timeout_seconds
+            )
+        except asyncio.TimeoutError as e:
+            if callback_nonce is not None:
+                listener.unregister(callback_nonce)
+            raise JobTimeoutError(
+                f"Dispatch job {job_id} timed out after {cfg.timeout_seconds}s"
+                " (callback not received)",
+                job_id=job_id,
+                timeout_seconds=cfg.timeout_seconds,
+            ) from e
+
+        if not isinstance(data, dict):
+            raise DispatchError(
+                f"Callback for job {job_id} delivered non-object body: {data!r}",
+                job_id=job_id,
+            )
+
+        status = data.get("status", "")
+        if status == "complete":
+            logger.info(
+                "Dispatch job %s complete via callback (%.0fms)",
+                job_id, (time.time() - start) * 1000,
+            )
+            return data
+        if status == "failed":
+            raise DispatchError(
+                data.get("error") or f"Dispatch job {job_id} failed",
+                job_id=job_id,
+                status="failed",
+            )
+        if status == "cancelled":
+            raise DispatchError(
+                f"Dispatch job {job_id} was cancelled",
+                job_id=job_id,
+                status="cancelled",
+            )
+        raise DispatchError(
+            f"Unexpected callback status {status!r} for job {job_id}",
+            job_id=job_id,
+            status=status,
+        )
 
     # --- Poll ---
     interval = cfg.poll_interval
@@ -251,7 +331,7 @@ def _get_shared_http() -> httpx.AsyncClient:
 
 
 async def aclose() -> None:
-    """Close the shared httpx client used by :func:`run`.
+    """Close the shared httpx client and the callback listener, if any.
 
     Safe to call multiple times and safe when nothing was ever
     dispatched. Tests should call this in teardown; long-running
@@ -264,6 +344,29 @@ async def aclose() -> None:
     _shared_http_loop = None
     if client is not None:
         await client.aclose()
+
+    # Tear down the listener too so `aclose()` is the single shutdown
+    # entry point for dispatch state. Import here to avoid pulling
+    # aiohttp in for callers that never start a listener.
+    try:
+        from jig.dispatch import listener as _listener_mod
+    except ImportError:
+        return
+    await _listener_mod.stop()
+
+
+def _current_listener() -> Any:
+    """Return the active callback listener (if any) without forcing the
+    aiohttp import on callers who never started one.
+
+    Returns ``None`` when aiohttp isn't installed, the listener module
+    hasn't been imported yet, or no listener is running.
+    """
+    try:
+        from jig.dispatch import listener as _listener_mod
+    except ImportError:
+        return None
+    return _listener_mod._active_listener()
 
 
 async def run(
@@ -286,6 +389,11 @@ async def run(
     ``jig.smithers_fn`` entry-point group). ``payload`` becomes the
     function's kwargs.
 
+    If :func:`jig.dispatch.listen` is running, the wait uses the
+    callback listener — no per-call polling coroutine. Otherwise falls
+    back to polling. The choice is automatic; callers don't opt in
+    per-call.
+
     Returns whatever the worker put in ``job.result["value"]``. Raises
     :class:`DispatchError` on failure, :class:`JobTimeoutError` on
     timeout. Use this for deterministic steps you want offloaded —
@@ -306,6 +414,7 @@ async def run(
             poll_interval=poll_interval,
             poll_max_interval=poll_max_interval,
         ),
+        listener=_current_listener(),
     )
     # Don't ``or {}`` here — that rewrites legitimate falsy returns
     # (``0``, ``False``, ``[]``, ``""``) into an empty dict and breaks
