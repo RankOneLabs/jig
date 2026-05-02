@@ -123,6 +123,53 @@ class TestOpenRouterComplete:
                 await client.complete(params)
             assert exc.value.provider == "openrouter"
 
+    async def test_caller_extra_body_survives_merge(self, monkeypatch):
+        # provider_params with its own extra_body must not be clobbered by
+        # the adapter's usage.include injection. Both should end up in the
+        # outgoing request — caller's fallback model list and our cost
+        # tracking flag coexist.
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-x")
+        with patch("jig.llm.openai.openai") as mock_openai:
+            instance = mock_openai.AsyncOpenAI.return_value
+            instance.chat.completions.create = AsyncMock(
+                return_value=_fake_response(cost=0.001)
+            )
+            client = OpenRouterClient(model="anthropic/claude-3.5-sonnet")
+            params = CompletionParams(
+                messages=[Message(role=Role.USER, content="hi")],
+                provider_params={
+                    "extra_body": {
+                        "models": ["anthropic/claude-3.5-sonnet", "openai/gpt-4o"],
+                        "provider": {"order": ["Anthropic", "OpenAI"]},
+                    }
+                },
+            )
+            await client.complete(params)
+
+            create_kwargs = instance.chat.completions.create.call_args.kwargs
+            assert create_kwargs["extra_body"] == {
+                "models": ["anthropic/claude-3.5-sonnet", "openai/gpt-4o"],
+                "provider": {"order": ["Anthropic", "OpenAI"]},
+                "usage": {"include": True},
+            }
+
+    async def test_caller_can_disable_inline_cost(self, monkeypatch):
+        # Explicit usage.include=False from the caller wins over our default.
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-x")
+        with patch("jig.llm.openai.openai") as mock_openai:
+            instance = mock_openai.AsyncOpenAI.return_value
+            instance.chat.completions.create = AsyncMock(
+                return_value=_fake_response(cost=None)
+            )
+            client = OpenRouterClient(model="anthropic/claude-3.5-sonnet")
+            params = CompletionParams(
+                messages=[Message(role=Role.USER, content="hi")],
+                provider_params={"extra_body": {"usage": {"include": False}}},
+            )
+            await client.complete(params)
+            create_kwargs = instance.chat.completions.create.call_args.kwargs
+            assert create_kwargs["extra_body"]["usage"] == {"include": False}
+
     async def test_inline_cost_falls_back_to_pricing_table(self, monkeypatch):
         # When OpenRouter doesn't return inline cost (older accounts, or
         # usage.include unsupported on a route), the pricing table still

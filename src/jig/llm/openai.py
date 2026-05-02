@@ -36,9 +36,14 @@ class OpenAIClient(LLMClient):
         self._client = openai.AsyncOpenAI(**client_kwargs)
         self._model = model
 
-    def _extra_kwargs(self) -> dict[str, Any]:
-        """Subclass hook: extra kwargs merged into chat.completions.create()."""
-        return {}
+    def _apply_extra_kwargs(self, kwargs: dict[str, Any]) -> None:
+        """Subclass hook: inject defaults into the chat.completions.create()
+        kwargs dict. Mutates ``kwargs`` in place rather than returning a dict
+        to update with, so subclasses can deep-merge nested fields like
+        ``extra_body`` instead of replacing caller-supplied values wholesale.
+        Default is a no-op.
+        """
+        return None
 
     def _inline_cost(self, response: Any) -> float | None:
         """Subclass hook: cost reported by the upstream response, if any.
@@ -113,7 +118,7 @@ class OpenAIClient(LLMClient):
             kwargs["max_tokens"] = params.max_tokens
         if params.provider_params:
             kwargs.update(params.provider_params)
-        kwargs.update(self._extra_kwargs())
+        self._apply_extra_kwargs(kwargs)
 
         start = time.time()
 
@@ -176,7 +181,7 @@ class OpenAIClient(LLMClient):
             kwargs["max_tokens"] = params.max_tokens
         if params.provider_params:
             kwargs.update(params.provider_params)
-        kwargs.update(self._extra_kwargs())
+        self._apply_extra_kwargs(kwargs)
 
         response = await self._client.chat.completions.create(**kwargs)
         async for chunk in response:

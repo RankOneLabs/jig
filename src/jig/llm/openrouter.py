@@ -59,8 +59,14 @@ class OpenRouterClient(OpenAIClient):
             **client_kwargs,
         )
 
-    def _extra_kwargs(self) -> dict[str, Any]:
-        return {"extra_body": {"usage": {"include": True}}}
+    def _apply_extra_kwargs(self, kwargs: dict[str, Any]) -> None:
+        # Deep-merge with setdefault so caller-supplied extra_body fields
+        # (e.g. ``models`` for fallback routing, ``provider`` preferences,
+        # ``transforms``) survive. We only inject ``usage.include=True``,
+        # and we honor an explicit caller override if they pass it.
+        extra_body = kwargs.setdefault("extra_body", {})
+        usage = extra_body.setdefault("usage", {})
+        usage.setdefault("include", True)
 
     def _inline_cost(self, response: Any) -> float | None:
         usage = getattr(response, "usage", None)
