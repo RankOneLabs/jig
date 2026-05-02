@@ -5,6 +5,10 @@
 ``from_model("gemini-2.5-pro")``    → ``GeminiClient``
 ``from_model("ollama/llama3.1")``   → ``OllamaClient`` (name stripped)
 ``from_model("dispatch/llama-70b")``→ ``DispatchClient`` (name stripped)
+``from_model("openrouter/anthropic/claude-3.5-sonnet")``
+                                    → ``OpenRouterClient`` (only first
+                                      ``openrouter/`` prefix stripped;
+                                      vendor namespace stays in the slug)
 
 Overrides pass through to the adapter constructor (``host=``, ``dispatch_url=``,
 ``api_key=``, etc.).
@@ -59,10 +63,20 @@ def from_model(model: str, **overrides: Any) -> LLMClient:
         from jig.llm.dispatch import DispatchClient
         return DispatchClient(model=provider_model, **overrides)
 
+    if model.startswith("openrouter/"):
+        # OpenRouter slugs are vendor-namespaced (e.g.
+        # ``anthropic/claude-3.5-sonnet``), so only the leading
+        # ``openrouter/`` prefix is stripped — the rest is passed through.
+        provider_model = model[len("openrouter/"):]
+        if not provider_model:
+            raise ValueError("Model name required after 'openrouter/' prefix.")
+        from jig.llm.openrouter import OpenRouterClient
+        return OpenRouterClient(model=provider_model, **overrides)
+
     raise ValueError(
         f"No provider matches model '{model}'. "
         f"Use a prefixed name (claude-*, gpt-*, o1/o3/o4-*, gemini-*, "
-        f"ollama/<name>, dispatch/<name>)."
+        f"ollama/<name>, dispatch/<name>, openrouter/<vendor>/<slug>)."
     )
 
 
