@@ -170,6 +170,34 @@ class TestOpenRouterComplete:
             create_kwargs = instance.chat.completions.create.call_args.kwargs
             assert create_kwargs["extra_body"]["usage"] == {"include": False}
 
+    async def test_inline_cost_from_model_extra(self, monkeypatch):
+        # Older openai SDK schemas don't yet declare ``cost`` on
+        # CompletionUsage, so OpenRouter's value lands in
+        # ``usage.model_extra``. Make sure that fallback path is exercised.
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-x")
+        with patch("jig.llm.openai.openai") as mock_openai:
+            usage = SimpleNamespace(
+                prompt_tokens=10,
+                completion_tokens=20,
+                model_extra={"cost": 0.00099},
+            )
+            # No ``.cost`` attribute — forces the model_extra branch.
+            message = SimpleNamespace(content="hi", tool_calls=None)
+            response = SimpleNamespace(
+                choices=[SimpleNamespace(message=message)],
+                usage=usage,
+                model="some/model",
+            )
+            instance = mock_openai.AsyncOpenAI.return_value
+            instance.chat.completions.create = AsyncMock(return_value=response)
+
+            client = OpenRouterClient(model="some/model")
+            params = CompletionParams(
+                messages=[Message(role=Role.USER, content="hi")]
+            )
+            result = await client.complete(params)
+            assert result.usage.cost == pytest.approx(0.00099)
+
     async def test_inline_cost_falls_back_to_pricing_table(self, monkeypatch):
         # When OpenRouter doesn't return inline cost (older accounts, or
         # usage.include unsupported on a route), the pricing table still
