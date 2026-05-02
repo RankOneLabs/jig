@@ -1,0 +1,141 @@
+"""Tests for the OpenRouter adapter."""
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from jig.core.types import CompletionParams, Message, Role
+from jig.llm.openrouter import OpenRouterClient, _OPENROUTER_BASE_URL
+
+
+def _fake_response(cost: float | None = None) -> SimpleNamespace:
+    """Build a minimal response shaped like openai's chat.completions object."""
+    usage = SimpleNamespace(
+        prompt_tokens=10,
+        completion_tokens=20,
+    )
+    if cost is not None:
+        usage.cost = cost
+    message = SimpleNamespace(content="hi", tool_calls=None)
+    choice = SimpleNamespace(message=message)
+    return SimpleNamespace(
+        choices=[choice],
+        usage=usage,
+        model="anthropic/claude-3.5-sonnet",
+    )
+
+
+class TestOpenRouterInit:
+    def test_uses_env_var_when_api_key_omitted(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-from-env")
+        with patch("jig.llm.openai.openai") as mock_openai:
+            OpenRouterClient(model="openai/gpt-4o-mini")
+            mock_openai.AsyncOpenAI.assert_called_once()
+            kwargs = mock_openai.AsyncOpenAI.call_args.kwargs
+            assert kwargs["api_key"] == "sk-from-env"
+            assert kwargs["base_url"] == _OPENROUTER_BASE_URL
+
+    def test_explicit_api_key_wins_over_env(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-from-env")
+        with patch("jig.llm.openai.openai") as mock_openai:
+            OpenRouterClient(model="openai/gpt-4o-mini", api_key="sk-explicit")
+            kwargs = mock_openai.AsyncOpenAI.call_args.kwargs
+            assert kwargs["api_key"] == "sk-explicit"
+
+    def test_missing_key_raises(self, monkeypatch):
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        with patch("jig.llm.openai.openai"):
+            with pytest.raises(ValueError, match="OPENROUTER_API_KEY"):
+                OpenRouterClient(model="openai/gpt-4o-mini")
+
+    def test_attribution_headers_attached(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-x")
+        with patch("jig.llm.openai.openai") as mock_openai:
+            OpenRouterClient(
+                model="openai/gpt-4o-mini",
+                http_referer="https://my.app",
+                x_title="my-app",
+            )
+            kwargs = mock_openai.AsyncOpenAI.call_args.kwargs
+            assert kwargs["default_headers"] == {
+                "HTTP-Referer": "https://my.app",
+                "X-Title": "my-app",
+            }
+
+    def test_no_headers_when_attribution_omitted(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-x")
+        with patch("jig.llm.openai.openai") as mock_openai:
+            OpenRouterClient(model="openai/gpt-4o-mini")
+            kwargs = mock_openai.AsyncOpenAI.call_args.kwargs
+            assert kwargs["default_headers"] is None
+
+    def test_custom_base_url_override(self, monkeypatch):
+        # Useful for self-hosted OpenRouter-compatible proxies.
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-x")
+        with patch("jig.llm.openai.openai") as mock_openai:
+            OpenRouterClient(
+                model="openai/gpt-4o-mini",
+                base_url="https://gateway.internal/v1",
+            )
+            kwargs = mock_openai.AsyncOpenAI.call_args.kwargs
+            assert kwargs["base_url"] == "https://gateway.internal/v1"
+
+
+class TestOpenRouterComplete:
+    async def test_complete_requests_inline_cost(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-x")
+        with patch("jig.llm.openai.openai") as mock_openai:
+            instance = mock_openai.AsyncOpenAI.return_value
+            instance.chat.completions.create = AsyncMock(
+                return_value=_fake_response(cost=0.00042)
+            )
+            client = OpenRouterClient(model="anthropic/claude-3.5-sonnet")
+            params = CompletionParams(
+                messages=[Message(role=Role.USER, content="hi")]
+            )
+            response = await client.complete(params)
+
+            create_kwargs = instance.chat.completions.create.call_args.kwargs
+            assert create_kwargs["extra_body"] == {
+                "usage": {"include": True}
+            }
+            assert response.usage.cost == pytest.approx(0.00042)
+
+    async def test_provider_label_on_error(self, monkeypatch):
+        from jig.core.errors import JigLLMError
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-x")
+        with patch("jig.llm.openai.openai") as mock_openai:
+            instance = mock_openai.AsyncOpenAI.return_value
+            instance.chat.completions.create = AsyncMock(
+                side_effect=RuntimeError("boom")
+            )
+            mock_openai.RateLimitError = type(
+                "RateLimitError", (Exception,), {}
+            )
+            client = OpenRouterClient(model="anthropic/claude-3.5-sonnet")
+            params = CompletionParams(
+                messages=[Message(role=Role.USER, content="hi")]
+            )
+            with pytest.raises(JigLLMError) as exc:
+                await client.complete(params)
+            assert exc.value.provider == "openrouter"
+
+    async def test_inline_cost_falls_back_to_pricing_table(self, monkeypatch):
+        # When OpenRouter doesn't return inline cost (older accounts, or
+        # usage.include unsupported on a route), the pricing table still
+        # gets a chance — and leaves cost None for unknown slugs.
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-x")
+        with patch("jig.llm.openai.openai") as mock_openai:
+            instance = mock_openai.AsyncOpenAI.return_value
+            instance.chat.completions.create = AsyncMock(
+                return_value=_fake_response(cost=None)
+            )
+            client = OpenRouterClient(model="some/unknown-slug")
+            params = CompletionParams(
+                messages=[Message(role=Role.USER, content="hi")]
+            )
+            response = await client.complete(params)
+            assert response.usage.cost is None

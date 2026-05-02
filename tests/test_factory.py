@@ -101,3 +101,42 @@ class TestFromModel:
     def test_empty_dispatch_suffix_raises(self):
         with pytest.raises(ValueError, match="Model name required after 'dispatch/'"):
             from_model("dispatch/")
+
+    def test_openrouter_prefix_stripped(self):
+        with patch("jig.llm.openrouter.OpenRouterClient") as mock_cls:
+            from_model("openrouter/openai/gpt-4o-mini", api_key="sk-x")
+            mock_cls.assert_called_once_with(
+                model="openai/gpt-4o-mini", api_key="sk-x"
+            )
+
+    def test_openrouter_keeps_vendor_namespace(self):
+        # OpenRouter slugs contain a `/` between vendor and model — only
+        # the leading `openrouter/` prefix should be stripped.
+        with patch("jig.llm.openrouter.OpenRouterClient") as mock_cls:
+            from_model(
+                "openrouter/anthropic/claude-3.5-sonnet", api_key="sk-x"
+            )
+            mock_cls.assert_called_once_with(
+                model="anthropic/claude-3.5-sonnet", api_key="sk-x"
+            )
+
+    def test_openrouter_overrides_pass_through(self):
+        with patch("jig.llm.openrouter.OpenRouterClient") as mock_cls:
+            from_model(
+                "openrouter/openai/gpt-4o-mini",
+                api_key="sk-x",
+                http_referer="https://example.com",
+                x_title="my-app",
+            )
+            mock_cls.assert_called_once_with(
+                model="openai/gpt-4o-mini",
+                api_key="sk-x",
+                http_referer="https://example.com",
+                x_title="my-app",
+            )
+
+    def test_empty_openrouter_suffix_raises(self):
+        with pytest.raises(
+            ValueError, match="Model name required after 'openrouter/'"
+        ):
+            from_model("openrouter/")

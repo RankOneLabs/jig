@@ -25,11 +25,28 @@ except ImportError:
 
 
 class OpenAIClient(LLMClient):
+    # Provider label stamped onto JigLLMError. Subclasses that point the
+    # OpenAI SDK at a different backend (e.g. OpenRouter) override this so
+    # error telemetry attributes failures correctly.
+    _provider_label: str = "openai"
+
     def __init__(self, model: str = "gpt-4o", **client_kwargs: Any):
         if openai is None:
             raise ImportError("Install openai: pip install 'jig[openai]'")
         self._client = openai.AsyncOpenAI(**client_kwargs)
         self._model = model
+
+    def _extra_kwargs(self) -> dict[str, Any]:
+        """Subclass hook: extra kwargs merged into chat.completions.create()."""
+        return {}
+
+    def _inline_cost(self, response: Any) -> float | None:
+        """Subclass hook: cost reported by the upstream response, if any.
+
+        Returning a float wins over the local pricing table (used by gateways
+        like OpenRouter that bill per-call and return the exact charge).
+        """
+        return None
 
     def _convert_messages(self, params: CompletionParams) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
@@ -96,6 +113,7 @@ class OpenAIClient(LLMClient):
             kwargs["max_tokens"] = params.max_tokens
         if params.provider_params:
             kwargs.update(params.provider_params)
+        kwargs.update(self._extra_kwargs())
 
         start = time.time()
 
@@ -111,7 +129,7 @@ class OpenAIClient(LLMClient):
             response = await with_retry(_call, max_attempts=3, retryable=_retryable)
         except Exception as e:
             status = getattr(e, "status_code", None)
-            raise JigLLMError(str(e), "openai", status_code=status) from e
+            raise JigLLMError(str(e), self._provider_label, status_code=status) from e
 
         latency_ms = (time.time() - start) * 1000
         choice = response.choices[0].message
@@ -131,6 +149,9 @@ class OpenAIClient(LLMClient):
             input_tokens=response.usage.prompt_tokens,
             output_tokens=response.usage.completion_tokens,
         )
+        inline_cost = self._inline_cost(response)
+        if inline_cost is not None:
+            usage.cost = inline_cost
         stamp_cost(usage, response.model)
         return LLMResponse(
             content=choice.content or "",
@@ -155,6 +176,7 @@ class OpenAIClient(LLMClient):
             kwargs["max_tokens"] = params.max_tokens
         if params.provider_params:
             kwargs.update(params.provider_params)
+        kwargs.update(self._extra_kwargs())
 
         response = await self._client.chat.completions.create(**kwargs)
         async for chunk in response:
