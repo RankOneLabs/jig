@@ -398,3 +398,41 @@ async def test_nested_pipeline():
     # Inner pipeline run is a child of outer's root
     inner_run = [s for s in run_spans if s.name == "inner"][0]
     assert inner_run.parent_id is not None
+
+
+async def test_caller_context_cannot_override_internal_trace_id():
+    """A caller-supplied ``context`` containing ``trace_id`` /
+    ``_tracer`` / ``_span_id`` must not shadow the framework's
+    real values — trajectory graders rely on the real ones.
+    """
+
+    captured: dict[str, Any] = {}
+
+    class CapturingGrader(Grader):
+        async def grade(
+            self, input: Any, output: Any, context: dict[str, Any] | None = None
+        ) -> list[Score]:
+            captured["ctx"] = context
+            return [
+                Score(dimension="ok", value=1.0, source=ScoreSource.HEURISTIC)
+            ]
+
+    tracer = FakeTracer()
+    await run_pipeline(
+        PipelineConfig(
+            name="override_test",
+            steps=[Step(name="add_one", fn=add_one, grader=CapturingGrader())],
+            tracer=tracer,
+        ),
+        input=5,
+        context={
+            "trace_id": "FAKE-INJECTED",
+            "_tracer": "not-a-tracer",
+            "_span_id": "FAKE-SPAN",
+        },
+    )
+    ctx = captured["ctx"]
+    assert ctx["trace_id"] != "FAKE-INJECTED"
+    assert ctx["trace_id"].startswith("trace-")  # FakeTracer ids
+    assert ctx["_tracer"] is tracer
+    assert ctx["_span_id"] != "FAKE-SPAN"
