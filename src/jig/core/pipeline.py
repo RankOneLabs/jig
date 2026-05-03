@@ -69,13 +69,16 @@ async def run_pipeline(
         )
         trace_id = root.trace_id
 
-    # 2. Init context
+    # 2. Init context. trace_id and the framework-internal _tracer /
+    # _span_id keys are set after the splat so a caller-supplied
+    # ``context`` cannot shadow them — trajectory graders rely on the
+    # real pipeline trace_id.
     ctx: dict[str, Any] = {
         "input": input,
+        **(context or {}),
         "_tracer": config.tracer,
         "_span_id": root.id,
         "trace_id": trace_id,
-        **(context or {}),
     }
 
     step_outputs: dict[str, Any] = {}
@@ -234,7 +237,7 @@ async def map_pipeline(
         )
         all_outputs = [r.output for r in results]
         batch_scores = await batch_grader.grade(
-            [item for item in items],
+            items,
             all_outputs,
             context={
                 "raw_output": all_outputs,

@@ -67,6 +67,20 @@ def test_load_jsonl_rejects_non_string_expected(tmp_path):
         load_jsonl(path)
 
 
+def test_load_jsonl_rejects_non_dict_context(tmp_path):
+    path = tmp_path / "cases.jsonl"
+    path.write_text('{"input": "ok", "context": [1, 2, 3]}\n')
+    with pytest.raises(ValueError, match=r"'context' must be a dict or null"):
+        load_jsonl(path)
+
+
+def test_load_jsonl_rejects_non_dict_metadata(tmp_path):
+    path = tmp_path / "cases.jsonl"
+    path.write_text('{"input": "ok", "metadata": "tag-string"}\n')
+    with pytest.raises(ValueError, match=r"'metadata' must be a dict or null"):
+        load_jsonl(path)
+
+
 def test_load_jsonl_rejects_non_object_line(tmp_path):
     path = tmp_path / "cases.jsonl"
     path.write_text('"just a string"\n')
@@ -141,6 +155,23 @@ tests:
     assert cases[0].metadata["description"] == "cite a source"
 
 
+def test_load_promptfoo_yaml_preserves_explicit_empty_input(tmp_path):
+    """An explicit empty-string ``vars.input`` should be preserved,
+    not silently fall through to ``vars.prompt``.
+    """
+    path = tmp_path / "tests.yaml"
+    path.write_text(
+        """
+tests:
+  - vars:
+      input: ""
+      prompt: fallback should not be used
+"""
+    )
+    cases = load_promptfoo_yaml(path)
+    assert cases[0].input == ""
+
+
 def test_load_promptfoo_yaml_rejects_missing_input(tmp_path):
     path = tmp_path / "tests.yaml"
     path.write_text(
@@ -150,7 +181,7 @@ tests:
       style: dry
 """
     )
-    with pytest.raises(ValueError, match="missing vars.input or vars.prompt"):
+    with pytest.raises(ValueError, match=r"missing vars\.input or vars\.prompt"):
         load_promptfoo_yaml(path)
 
 

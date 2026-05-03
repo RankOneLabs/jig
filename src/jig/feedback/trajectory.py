@@ -50,11 +50,16 @@ class TrajectoryGrader(Grader[Any]):
     ``source=HEURISTIC``. The ``output`` parameter is unused — pair
     with a ``CompositeGrader`` if you also want output-level grading.
 
-    When ``trace_id`` is missing from the context (e.g. a caller
-    invokes ``grade()`` directly without it), every assertion returns
-    0.0 rather than raising — this matches the existing grader
-    convention of failing soft so a single misconfigured grader
-    doesn't crash a sweep.
+    Failure modes all return 0.0 for every assertion rather than
+    raising, matching the existing grader convention of failing soft
+    so a single misconfigured grader doesn't crash a sweep:
+
+    - ``trace_id`` missing from context (caller invoked ``grade()``
+      directly without it).
+    - ``trace_id`` present but not a string.
+    - ``tracer.get_trace`` raises (e.g. ``StdoutTracer`` raises
+      ``NotImplementedError``, the tracer's DB is closed, or a
+      transient backend error).
     """
 
     def __init__(
@@ -65,6 +70,16 @@ class TrajectoryGrader(Grader[Any]):
         self._tracer = tracer
         self._assertions = assertions
 
+    def _zero_scores(self) -> list[Score]:
+        return [
+            Score(
+                dimension=a.name,
+                value=0.0,
+                source=ScoreSource.HEURISTIC,
+            )
+            for a in self._assertions
+        ]
+
     async def grade(
         self,
         input: Any,
@@ -72,15 +87,16 @@ class TrajectoryGrader(Grader[Any]):
         context: dict[str, Any] | None = None,
     ) -> list[Score]:
         if not context or "trace_id" not in context:
-            return [
-                Score(
-                    dimension=a.name,
-                    value=0.0,
-                    source=ScoreSource.HEURISTIC,
-                )
-                for a in self._assertions
-            ]
-        spans = await self._tracer.get_trace(context["trace_id"])
+            return self._zero_scores()
+        trace_id = context["trace_id"]
+        if not isinstance(trace_id, str):
+            return self._zero_scores()
+        try:
+            spans = await self._tracer.get_trace(trace_id)
+        except Exception:
+            # Tracer can't service get_trace (StdoutTracer, closed DB,
+            # transient backend error). Fail soft.
+            return self._zero_scores()
         scores: list[Score] = []
         for a in self._assertions:
             try:

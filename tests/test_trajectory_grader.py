@@ -244,6 +244,42 @@ async def test_grader_handles_missing_trace_id_gracefully():
     assert scores[0].value == 0.0
 
 
+async def test_grader_handles_non_string_trace_id():
+    """A non-string trace_id (e.g. accidentally passing a Span obj)
+    should fail soft to 0.0 rather than crashing the sweep.
+    """
+    grader = TrajectoryGrader(
+        StubTracer([]),
+        [TrajectoryAssertion(name="x", check=tool_called("echo"))],
+    )
+    scores = await grader.grade("i", "o", context={"trace_id": 12345})
+    assert scores[0].value == 0.0
+
+
+async def test_grader_handles_tracer_get_trace_exception():
+    """Tracer.get_trace raising (e.g. StdoutTracer's
+    NotImplementedError, closed DB) should fail soft for every
+    assertion rather than propagate.
+    """
+
+    class BrokenTracer(StubTracer):
+        async def get_trace(self, trace_id: str) -> list[Span]:
+            raise NotImplementedError("not supported")
+
+    grader = TrajectoryGrader(
+        BrokenTracer([]),
+        [
+            TrajectoryAssertion(name="a", check=tool_called("echo")),
+            TrajectoryAssertion(name="b", check=step_budget(5)),
+        ],
+    )
+    scores = await grader.grade("i", "o", context={"trace_id": "t-0"})
+    assert {s.dimension: s.value for s in scores} == {"a": 0.0, "b": 0.0}
+    # All scores should still be HEURISTIC source — fail-soft doesn't
+    # change provenance.
+    assert all(s.source == ScoreSource.HEURISTIC for s in scores)
+
+
 async def test_grader_handles_assertion_exception():
     def raises(spans: list[Span]) -> float:
         raise RuntimeError("boom")
