@@ -172,6 +172,22 @@ tests:
     assert cases[0].input == ""
 
 
+def test_load_promptfoo_yaml_rejects_falsy_non_dict_vars(tmp_path):
+    """A falsy-but-invalid ``vars`` (``[]``, ``""``, ``0``) must
+    surface as "vars must be a mapping" rather than masquerading as
+    "missing vars.input or vars.prompt".
+    """
+    path = tmp_path / "tests.yaml"
+    path.write_text(
+        """
+tests:
+  - vars: []
+"""
+    )
+    with pytest.raises(ValueError, match=r"vars must be a mapping"):
+        load_promptfoo_yaml(path)
+
+
 def test_load_promptfoo_yaml_rejects_missing_input(tmp_path):
     path = tmp_path / "tests.yaml"
     path.write_text(

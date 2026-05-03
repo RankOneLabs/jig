@@ -139,7 +139,14 @@ def load_promptfoo_yaml(path: str | Path) -> list[EvalCase]:
     for i, t in enumerate(tests):
         if not isinstance(t, dict):
             raise ValueError(f"{p}: tests[{i}] must be a mapping")
-        v = t.get("vars") or {}
+        # Only default when vars is absent or explicitly null. Falsy
+        # non-None values (``vars: []``, ``vars: ""``, ``vars: 0``)
+        # must hit the type check below so the error names the real
+        # problem instead of cascading into a misleading "missing
+        # vars.input" downstream.
+        v = t.get("vars")
+        if v is None:
+            v = {}
         if not isinstance(v, dict):
             raise ValueError(f"{p}: tests[{i}].vars must be a mapping")
         # Key-presence check (not truthiness): an explicit empty
