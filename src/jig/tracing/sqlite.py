@@ -143,7 +143,12 @@ class SQLiteTracer(TracingLogger):
                 ),
             )
         await db.commit()
-        self._spans.clear()
+        # Retain unended spans so a mid-run flush (e.g. before
+        # trajectory grading) doesn't strand the still-open root: a
+        # subsequent end_span needs the entry in _spans to update
+        # ended_at/duration. Ended spans are durably persisted and
+        # safe to drop.
+        self._spans = {sid: s for sid, s in self._spans.items() if s.ended_at is None}
 
     async def get_trace(self, trace_id: str) -> list[Span]:
         db = await self._get_db()

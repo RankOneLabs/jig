@@ -633,14 +633,24 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
 
         # 8. Auto-grade — pass parsed output when available, raw otherwise.
         # Graders that want the raw string even when parsed is present can read
-        # it from context["raw_output"].
+        # it from context["raw_output"]. trace_id is provided so trajectory
+        # graders can read the run's spans via tracer.get_trace.
         if config.grader:
+            # Flush so trajectory graders can read pre-grade spans via
+            # get_trace. SQLiteTracer retains unended spans (notably the
+            # root) so _finalize_trace's end_span still works.
+            await config.tracer.flush()
             grade_span = config.tracer.start_span(
                 trace.id, SpanKind.GRADING, "auto_grade", {"input": input}
             )
             grade_output: Any = parsed if parsed is not None else final_output
             scores = await config.grader.grade(
-                input, grade_output, context={"raw_output": final_output}
+                input,
+                grade_output,
+                context={
+                    "raw_output": final_output,
+                    "trace_id": trace.trace_id,
+                },
             )
             await config.feedback.score(result_id, scores)
             config.tracer.end_span(

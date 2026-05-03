@@ -74,6 +74,7 @@ async def run_pipeline(
         "input": input,
         "_tracer": config.tracer,
         "_span_id": root.id,
+        "trace_id": trace_id,
         **(context or {}),
     }
 
@@ -124,6 +125,10 @@ async def run_pipeline(
 
             # Per-step grading
             if step.grader:
+                # Flush so trajectory graders see spans for this and
+                # prior steps via get_trace. The pipeline root stays
+                # in _spans (still unended) for the close at step 5.
+                await config.tracer.flush()
                 grade_span = config.tracer.start_span(
                     root.id, SpanKind.GRADING, f"grade_{step.name}"
                 )
@@ -147,11 +152,22 @@ async def run_pipeline(
         # 4. Pipeline-level grading
         pipeline_scores: list[Score] | None = None
         if config.grader and not short_circuited:
+            # Flush so trajectory graders see all step spans via
+            # get_trace. End-step spans are already terminal; the
+            # pipeline root remains in _spans for the close in step 5.
+            await config.tracer.flush()
             grade_span = config.tracer.start_span(
                 root.id, SpanKind.GRADING, "pipeline_grade"
             )
             try:
-                pipeline_scores = await config.grader.grade(input, last_output)
+                pipeline_scores = await config.grader.grade(
+                    input,
+                    last_output,
+                    context={
+                        "raw_output": last_output,
+                        "trace_id": trace_id,
+                    },
+                )
                 config.tracer.end_span(
                     grade_span.id,
                     output=[
@@ -212,12 +228,18 @@ async def map_pipeline(
     # Batch grading
     batch_scores: list[Score] | None = None
     if batch_grader:
+        await config.tracer.flush()
         grade_span = config.tracer.start_span(
             parent.id, SpanKind.GRADING, "batch_grade"
         )
         all_outputs = [r.output for r in results]
         batch_scores = await batch_grader.grade(
-            [item for item in items], all_outputs
+            [item for item in items],
+            all_outputs,
+            context={
+                "raw_output": all_outputs,
+                "trace_id": parent.trace_id,
+            },
         )
         config.tracer.end_span(
             grade_span.id,

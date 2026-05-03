@@ -47,6 +47,13 @@ from jig.dispatch import DispatchError, JobTimeoutError
 from jig.dispatch import listen as dispatch_listen
 from jig.dispatch import run as dispatch_run
 from jig.dispatch import stop as dispatch_stop
+from jig.feedback import (
+    TrajectoryAssertion,
+    TrajectoryGrader,
+    step_budget,
+    tool_called,
+    tool_sequence,
+)
 from jig.llm.factory import complete, from_model
 from jig.replay import (
     ReplayConfigMissingError,
@@ -151,4 +158,10 @@ __all__ = [
     "ToolEvent",
     "replay",
     "trace_diff",
+    # Trajectory grading
+    "TrajectoryAssertion",
+    "TrajectoryGrader",
+    "step_budget",
+    "tool_called",
+    "tool_sequence",
 ]
