@@ -142,6 +142,33 @@ async def test_pairwise_tie_returns_half():
     assert scores[0].source == ScoreSource.LLM_JUDGE
 
 
+async def test_pairwise_unknown_winner_value_returns_tie():
+    """JSON parses but ``winner`` isn't A/B/tie → score as a tie,
+    not as a loss. A meaningless verdict is "no opinion."
+    """
+    judge = PairwiseLLMJudge(_FakeLLM(["neither"]), seed=0)
+    scores = await judge.grade(
+        "i", "self", context={"compare_to": {"output": "other", "id": "z"}}
+    )
+    assert scores[0].dimension == "vs_z"
+    assert scores[0].value == 0.5
+
+
+async def test_pairwise_distinguishes_none_from_empty_criteria():
+    """``criteria=None`` uses default; explicit ``[]`` renders empty.
+
+    Inspect the formatted system prompt by reading the user msg the
+    fake LLM captured (it's the easier-to-introspect side); the
+    point is to confirm None and [] don't both produce the default.
+    """
+    # The criteria show up only in the system prompt, but we can
+    # still distinguish behaviors by checking the internal state.
+    j_default = PairwiseLLMJudge(_FakeLLM(["A"]), criteria=None, seed=0)
+    j_empty = PairwiseLLMJudge(_FakeLLM(["A"]), criteria=[], seed=0)
+    assert j_default._criteria == ["overall quality"]
+    assert j_empty._criteria == []
+
+
 async def test_pairwise_handles_malformed_judge_response():
     """Bad JSON from the judge → score as a tie, don't raise."""
     judge = PairwiseLLMJudge(_BadJsonLLM(), seed=0)

@@ -101,9 +101,15 @@ def pass_at_k(
         by_dim = [s.value for s in scores if s.dimension == dimension]
         if not by_dim:
             continue
+        # If a single run has multiple Score entries for the same
+        # dimension (e.g. a CompositeGrader composes two graders that
+        # both report ``dimension``), aggregate them as the mean.
+        # Same shape ``win_rate`` uses; keeps results deterministic
+        # rather than depending on score-list order.
+        per_run_value = float(np.mean(by_dim))
         by_config_case.setdefault(run.config_name, {}).setdefault(
             run.case_index, []
-        ).append(by_dim[0])
+        ).append(per_run_value)
 
     out: list[PassAtK] = []
     for cfg, by_case in by_config_case.items():
@@ -114,6 +120,17 @@ def pass_at_k(
         n = ns.pop()
         k_eff = k if k is not None else n
         if k_eff > n:
+            # Caller asked for a larger k than this config's sample
+            # count supports. Warn so the empty result isn't a silent
+            # misconfiguration; skip per-config so a single under-
+            # sampled config doesn't sink the whole report.
+            warnings.warn(
+                f"pass@k for config {cfg!r} dimension {dimension!r}: "
+                f"requested k={k_eff} exceeds n_per_case={n}; skipped. "
+                f"Reduce k or increase ``sweep(seeds=)``.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             continue
 
         # Variance check: warn if all per-case score vectors are
@@ -173,6 +190,11 @@ def win_rate(
 
     Pass ``seed`` for reproducible bootstrap.
     """
+    if bootstrap_samples <= 0:
+        raise ValueError(
+            f"bootstrap_samples must be positive, got {bootstrap_samples}"
+        )
+
     by_case_a: dict[int, list[float]] = {}
     by_case_b: dict[int, list[float]] = {}
     for run in result.runs:

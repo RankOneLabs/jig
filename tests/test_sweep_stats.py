@@ -169,6 +169,62 @@ def test_pass_at_k_does_not_warn_when_n_per_case_is_one():
     )
 
 
+def test_pass_at_k_warns_when_k_exceeds_n_per_case():
+    """Caller-supplied k > n_per_case → RuntimeWarning naming the
+    config + skipped from result so it can't be silently empty.
+    """
+    runs = [
+        _run(0, 0, "cfg", 0, score_value=0.85),
+        _run(0, 0, "cfg", 1, score_value=0.95),
+    ]
+    result = _sweep(runs)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        out = pass_at_k(result, dimension="q", threshold=0.5, k=5)
+    assert any(
+        issubclass(w.category, RuntimeWarning)
+        and "exceeds n_per_case" in str(w.message)
+        and "cfg" in str(w.message)
+        for w in caught
+    )
+    assert out == []
+
+
+def test_pass_at_k_aggregates_multiple_scores_per_run_via_mean():
+    """A single run with multiple scores on the same dimension
+    (possible with CompositeGrader) is aggregated via mean rather
+    than silently using the first entry's order.
+    """
+    # Build a run whose AgentResult has TWO scores on dim "q".
+    multi_score_result = AgentResult(
+        output="ok",
+        trace_id="t",
+        usage={"total_cost": 0.0},
+        scores=[
+            _score("q", 0.0),
+            _score("q", 1.0),  # mean = 0.5
+        ],
+        duration_ms=1.0,
+        error=None,
+    )
+    multi_run = SweepRun(
+        case_index=0,
+        config_index=0,
+        config_name="cfg",
+        input="i",
+        result=multi_score_result,
+        seed_index=0,
+    )
+    # Use a different second value so the per-case vector has
+    # variance — keeps the constant-vector warning from firing.
+    other_run = _run(0, 0, "cfg", 1, score_value=0.9)
+    result = _sweep([multi_run, other_run])
+    out = pass_at_k(result, dimension="q", threshold=0.5)
+    # Aggregated values: 0.5 (mean of 0/1) and 0.9 — both >= 0.5,
+    # so passes_per_case=[2] and pass@2 == 1.0.
+    assert out[0].pass_at_k == pytest.approx(1.0)
+
+
 def test_pass_at_k_skips_config_missing_dimension():
     """A config that didn't report the requested dimension is omitted."""
     runs = [
@@ -265,6 +321,31 @@ def test_win_rate_seeded_bootstrap_is_reproducible():
     wr2 = win_rate(result, dimension="q", config_a="A", config_b="B", seed=7)
     assert wr1.ci_low == wr2.ci_low
     assert wr1.ci_high == wr2.ci_high
+
+
+def test_win_rate_rejects_non_positive_bootstrap_samples():
+    """``bootstrap_samples <= 0`` would crash on np.percentile([])."""
+    runs = [
+        _run(0, 0, "A", 0, score_value=0.9),
+        _run(0, 1, "B", 0, score_value=0.1),
+    ]
+    result = _sweep(runs)
+    with pytest.raises(ValueError, match=r"bootstrap_samples"):
+        win_rate(
+            result,
+            dimension="q",
+            config_a="A",
+            config_b="B",
+            bootstrap_samples=0,
+        )
+    with pytest.raises(ValueError, match=r"bootstrap_samples"):
+        win_rate(
+            result,
+            dimension="q",
+            config_a="A",
+            config_b="B",
+            bootstrap_samples=-1,
+        )
 
 
 def test_win_rate_no_overlap_returns_zero_compared():

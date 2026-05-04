@@ -79,7 +79,13 @@ class PairwiseLLMJudge(Grader):
         seed: int | None = None,
     ):
         self._llm = llm
-        self._criteria = criteria or ["overall quality"]
+        # ``None`` means "unspecified — use the default." An explicit
+        # empty list means "render no criteria" (caller wants the
+        # judge to weigh outputs free-form). The two are distinct,
+        # so don't collapse them with truthiness.
+        self._criteria = (
+            ["overall quality"] if criteria is None else criteria
+        )
         self._rubric = rubric
         self._rng = random.Random(seed)
 
@@ -137,10 +143,15 @@ class PairwiseLLMJudge(Grader):
 
         if winner == "tie":
             value = 0.5
-        elif (winner == "A" and a_is_self) or (winner == "B" and not a_is_self):
-            value = 1.0
+        elif winner == "A":
+            value = 1.0 if a_is_self else 0.0
+        elif winner == "B":
+            value = 0.0 if a_is_self else 1.0
         else:
-            value = 0.0
+            # Valid JSON but ``winner`` isn't one of A/B/tie — treat as
+            # a tie like the malformed-JSON path above. A meaningless
+            # verdict is "no opinion," not a loss.
+            value = 0.5
         return [
             Score(
                 dimension=f"vs_{other_id}",
