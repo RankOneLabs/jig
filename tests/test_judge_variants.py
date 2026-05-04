@@ -95,41 +95,109 @@ async def test_pairwise_handles_compare_to_missing_keys():
     ) == []
 
 
-async def test_pairwise_position_randomized_self_wins():
-    """Mock LLM that always picks 'A'. With 100 calls and a fair RNG,
-    self should win roughly half the time (position is randomized)."""
+async def test_pairwise_position_randomized_across_inputs():
+    """Position flip is a stable function of (seed, other_id, input).
+    Across many distinct inputs, the flip distribution should be
+    roughly 50/50 — that's the position-bias mitigation guarantee.
+    """
     judge = PairwiseLLMJudge(_FakeLLM(["A"] * 200), seed=42)
     wins = 0
-    for _ in range(200):
+    for i in range(200):
         scores = await judge.grade(
-            "input",
+            f"input_{i}",  # vary input across calls
             "self_output",
             context={"compare_to": {"output": "other_output", "id": "other"}},
         )
         if scores[0].value == 1.0:
             wins += 1
-    # Expect roughly 100/200 — generous tolerance for the RNG
+    # Mock LLM always picks "A". With ~50/50 position flip, self
+    # ends up in A about half the time → ~100 wins.
     assert 70 < wins < 130
 
 
-async def test_pairwise_seed_reproducibility():
-    """Same seed → identical outcome sequence."""
+async def test_pairwise_same_inputs_produce_same_flip():
+    """The new design: identical (seed, other_id, input) MUST produce
+    the same A/B assignment so concurrent calls in any order are
+    reproducible.
+    """
+    judge = PairwiseLLMJudge(_FakeLLM(["A"] * 10), seed=42)
+    results = []
+    for _ in range(10):
+        scores = await judge.grade(
+            "same_input",
+            "self_output",
+            context={"compare_to": {"output": "other", "id": "x"}},
+        )
+        results.append(scores[0].value)
+    # All 10 calls have identical inputs → all 10 must produce the
+    # same outcome. This is the property that breaks under shared
+    # mutable RNG with concurrent dispatch.
+    assert len(set(results)) == 1
 
-    async def run_seq(seed: int) -> list[float]:
+
+async def test_pairwise_concurrent_calls_reproducible():
+    """asyncio.gather over identical-input calls must produce the
+    same A/B assignments regardless of dispatch order — the property
+    a shared mutable RNG can't guarantee.
+    """
+    import asyncio
+
+    judge = PairwiseLLMJudge(_FakeLLM(["A"] * 20), seed=99)
+    coros = [
+        judge.grade(
+            "x",
+            "self",
+            context={"compare_to": {"output": "other", "id": "z"}},
+        )
+        for _ in range(20)
+    ]
+    results = await asyncio.gather(*coros)
+    values = [r[0].value for r in results]
+    # All identical inputs → identical outcome under deterministic
+    # per-call RNG, regardless of how gather scheduled them.
+    assert len(set(values)) == 1
+
+
+async def test_pairwise_seed_reproducibility_across_judge_instances():
+    """Two separate judge instances with the same seed produce the
+    same outcome sequence on the same inputs — the seed is the only
+    state that matters now.
+    """
+    inputs = [(f"i_{i}", f"id_{i}") for i in range(10)]
+
+    async def run(seed: int) -> list[float]:
         judge = PairwiseLLMJudge(_FakeLLM(["A"] * 10), seed=seed)
         out = []
-        for _ in range(10):
+        for inp, oid in inputs:
             scores = await judge.grade(
-                "i",
+                inp,
                 "self",
-                context={"compare_to": {"output": "other", "id": "x"}},
+                context={"compare_to": {"output": "other", "id": oid}},
             )
             out.append(scores[0].value)
         return out
 
-    a = await run_seq(123)
-    b = await run_seq(123)
+    a = await run(123)
+    b = await run(123)
     assert a == b
+
+
+async def test_pairwise_unseeded_uses_module_random():
+    """Without a seed, randomization still happens (just not
+    reproducible). This is the documented escape hatch.
+    """
+    judge = PairwiseLLMJudge(_FakeLLM(["A"] * 200), seed=None)
+    wins = 0
+    for i in range(200):
+        scores = await judge.grade(
+            f"input_{i}",
+            "self",
+            context={"compare_to": {"output": "other", "id": "x"}},
+        )
+        if scores[0].value == 1.0:
+            wins += 1
+    # Random module's flip + always-A judge → ~half wins
+    assert 60 < wins < 140  # wider tolerance: process-random
 
 
 async def test_pairwise_tie_returns_half():
@@ -240,6 +308,31 @@ async def test_committee_handles_disagreement():
     assert by_dim["q"] == pytest.approx(0.6)
     # Agreement signal should be well below 1.0
     assert by_dim["q_agreement"] < 0.5
+
+
+async def test_committee_collapses_per_judge_duplicate_dimensions():
+    """A single judge returning two ``q`` scores must NOT count as
+    two votes — each judge contributes one value per dimension.
+    """
+    # Judge 1 returns TWO scores on 'q' (0.0 and 1.0 → mean 0.5).
+    # Judge 2 returns one score on 'q' (0.5).
+    # Without per-judge dedupe: by_dim['q'] = [0.0, 1.0, 0.5] mean=0.5
+    # but stddev would be artificially high.
+    # With dedupe: by_dim['q'] = [0.5, 0.5] mean=0.5 stddev=0 (unanimous).
+    committee = CommitteeJudge([
+        _FixedGrader([
+            Score(dimension="q", value=0.0, source=ScoreSource.LLM_JUDGE),
+            Score(dimension="q", value=1.0, source=ScoreSource.LLM_JUDGE),
+        ]),
+        _FixedGrader([
+            Score(dimension="q", value=0.5, source=ScoreSource.LLM_JUDGE),
+        ]),
+    ])
+    scores = await committee.grade("i", "o")
+    by_dim = {s.dimension: s.value for s in scores}
+    assert by_dim["q"] == pytest.approx(0.5)
+    # Both judges effectively voted 0.5 — full agreement.
+    assert by_dim["q_agreement"] == pytest.approx(1.0)
 
 
 async def test_committee_warns_on_dimension_set_mismatch():

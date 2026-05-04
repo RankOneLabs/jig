@@ -65,10 +65,16 @@ class PairwiseLLMJudge(Grader):
     "score each dimension independently." Use ``LLMJudge`` (not
     pairwise) when you want per-dimension absolute scores.
 
-    Position bias mitigation is per-call randomization. Over many
-    calls the position averages out; for a single ``grade()`` the
-    flip can change the result, so seed the judge for reproducible
-    runs.
+    Position bias mitigation is per-call randomization. When
+    ``seed`` is provided, the flip is a deterministic function of
+    ``(seed, other_id, input)`` — so two calls with the same inputs
+    always produce the same A/B assignment regardless of dispatch
+    order. This matters in a sweep where one judge instance is
+    shared across concurrent ``run_agent`` calls; a shared mutable
+    RNG would interleave under ``asyncio.gather`` and break
+    reproducibility. Without a seed, the flip uses ``random`` (the
+    module's process-global RNG) — randomization without
+    reproducibility.
     """
 
     def __init__(
@@ -87,7 +93,25 @@ class PairwiseLLMJudge(Grader):
             ["overall quality"] if criteria is None else criteria
         )
         self._rubric = rubric
-        self._rng = random.Random(seed)
+        self._seed = seed
+
+    def _flip_self_to_a(self, other_id: str, input: Any) -> bool:
+        """Return True iff self's output should appear in position A.
+
+        Deterministic when ``self._seed`` is set: a fresh
+        ``random.Random`` seeded with ``(seed, other_id, input)``
+        produces the same draw regardless of call order. With
+        ``seed=None``, falls back to the process-random module which
+        gives randomization but no cross-run reproducibility.
+        """
+        if self._seed is None:
+            return random.random() < 0.5
+        # ``random.Random`` accepts None/int/float/str/bytes — not
+        # tuples — so fold the components into a single string seed.
+        # The pipe separator avoids ambiguity from values that happen
+        # to contain digits at component boundaries.
+        local_rng = random.Random(f"{self._seed}|{other_id}|{input}")
+        return local_rng.random() < 0.5
 
     async def grade(
         self,
@@ -104,8 +128,8 @@ class PairwiseLLMJudge(Grader):
         except (KeyError, TypeError):
             return []
 
-        # Position randomization
-        if self._rng.random() < 0.5:
+        # Position randomization — stable under concurrency when seeded.
+        if self._flip_self_to_a(other_id, input):
             a_text, b_text = output, other_output
             a_is_self = True
         else:
@@ -211,11 +235,19 @@ class CommitteeJudge(Grader):
                 stacklevel=2,
             )
 
-        # Aggregate by dimension
+        # Aggregate by dimension. First collapse each judge's
+        # within-call duplicates (same dimension reported twice by
+        # one judge — possible via CompositeGrader or a misconfigured
+        # judge) to a per-judge mean, THEN average across judges.
+        # Without this collapse, one judge with two ``q`` scores
+        # would silently outweigh peers reporting ``q`` once.
         by_dim: dict[str, list[float]] = {}
         for scores in per_judge:
+            per_judge_dim: dict[str, list[float]] = {}
             for s in scores:
-                by_dim.setdefault(s.dimension, []).append(s.value)
+                per_judge_dim.setdefault(s.dimension, []).append(s.value)
+            for dim, vals in per_judge_dim.items():
+                by_dim.setdefault(dim, []).append(sum(vals) / len(vals))
 
         out: list[Score] = []
         for dim, values in by_dim.items():

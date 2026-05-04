@@ -135,6 +135,33 @@ def test_missing_dimension_in_candidate_skipped():
     assert "speed" not in report.deltas["cand"]
 
 
+def test_negative_threshold_rejected():
+    """Negative threshold inverts gate semantics silently — fail fast."""
+    result = _sweep([
+        _run(0, 0, "base", scores=[_score("q", 0.80)]),
+        _run(0, 1, "cand", scores=[_score("q", 0.80)]),
+    ])
+    with pytest.raises(ValueError, match=r"threshold must be non-negative"):
+        detect_regressions(result, baseline="base", threshold=-0.05)
+
+
+def test_negative_success_rate_threshold_rejected():
+    result = _sweep([
+        _run(0, 0, "base", scores=[_score("q", 0.80)]),
+        _run(0, 1, "cand", scores=[_score("q", 0.80)]),
+    ])
+    with pytest.raises(
+        ValueError,
+        match=r"success_rate_threshold must be non-negative",
+    ):
+        detect_regressions(
+            result,
+            baseline="base",
+            threshold=0.05,
+            success_rate_threshold=-0.1,
+        )
+
+
 def test_unknown_baseline_raises_helpful_error():
     result = _sweep([
         _run(0, 0, "alpha", scores=[_score("q", 0.80)]),

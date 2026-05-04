@@ -77,8 +77,20 @@ def detect_regressions(
 
     Raises ``ValueError`` if ``baseline`` is not a config in the
     sweep — surfaces the typo at gate-time rather than producing an
-    empty report.
+    empty report. Also raises if either threshold is negative,
+    since the gate fires on ``delta < -threshold`` and a negative
+    threshold inverts that semantic silently.
     """
+    if threshold < 0:
+        raise ValueError(
+            f"threshold must be non-negative, got {threshold}"
+        )
+    if success_rate_threshold is not None and success_rate_threshold < 0:
+        raise ValueError(
+            f"success_rate_threshold must be non-negative when set, "
+            f"got {success_rate_threshold}"
+        )
+
     rollup = result.rollup()
     if baseline not in rollup:
         raise ValueError(

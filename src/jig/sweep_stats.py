@@ -37,9 +37,18 @@ class PassAtK:
 class WinRate:
     """Pairwise win rate of ``config_a`` over ``config_b`` on a dimension.
 
+    ``win_rate`` is computed in the strict pairwise sense: ties are
+    excluded from both numerator and denominator, so it answers
+    "given a decisive comparison, how often did A win?"
+
+    ``n_compared`` is the count of cases where both configs reported
+    scores on the dimension. ``n_decisive`` is the subset of those
+    where ``avg_a != avg_b``; the win rate's denominator. When all
+    cases tie, ``n_decisive == 0`` and ``win_rate`` is ``0.0`` by
+    convention (no decisive evidence either way).
+
     ``ci_low``/``ci_high`` are the 2.5th/97.5th percentiles of a
-    bootstrap over cases. ``n_compared`` is the count of cases where
-    both configs reported scores on the dimension.
+    bootstrap over cases.
     """
 
     config_a: str
@@ -49,6 +58,7 @@ class WinRate:
     ci_low: float
     ci_high: float
     n_compared: int
+    n_decisive: int = 0
 
 
 def _pass_at_k_unbiased(n: int, c: int, k: int) -> float:
@@ -86,7 +96,10 @@ def pass_at_k(
     ``n_per_case`` across cases for the same config) are skipped
     cleanly rather than guessed. Configs missing the requested
     dimension entirely are also skipped — their absence in the
-    return list is the signal.
+    return list is the signal. Configs that report the dimension on
+    *some* but not all of their cases emit a ``RuntimeWarning`` and
+    are skipped: silently dropping the missing cases would overstate
+    pass@k by hiding the hardest cases from the rollup.
 
     **Variance precondition.** With deterministic LLM settings
     (``temperature=0``, no seed jitter) every "seed" produces the
@@ -95,8 +108,18 @@ def pass_at_k(
     a ``RuntimeWarning`` is emitted naming the config so the metric
     isn't silently misinterpreted.
     """
+    if k is not None and k <= 0:
+        raise ValueError(f"k must be positive when provided, got {k}")
+
+    # Track expected case coverage per config so we can detect
+    # configs that reported the dimension on a subset of cases
+    # (silent drop = overstated pass@k).
+    expected_cases_by_config: dict[str, set[int]] = {}
     by_config_case: dict[str, dict[int, list[float]]] = {}
     for run in result.runs:
+        expected_cases_by_config.setdefault(run.config_name, set()).add(
+            run.case_index
+        )
         scores = run.result.scores or []
         by_dim = [s.value for s in scores if s.dimension == dimension]
         if not by_dim:
@@ -113,6 +136,21 @@ def pass_at_k(
 
     out: list[PassAtK] = []
     for cfg, by_case in by_config_case.items():
+        observed_cases = set(by_case)
+        expected_cases = expected_cases_by_config.get(cfg, set())
+        if observed_cases != expected_cases:
+            missing = expected_cases - observed_cases
+            warnings.warn(
+                f"pass@k for config {cfg!r} dimension {dimension!r}: "
+                f"dimension missing on {len(missing)} of "
+                f"{len(expected_cases)} sweep cases (case indices "
+                f"{sorted(missing)}); skipped to avoid overstating "
+                f"pass@k.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            continue
+
         # Require uniform n_per_case across cases for clean math.
         ns = {len(vs) for vs in by_case.values()}
         if len(ns) != 1:
@@ -178,15 +216,23 @@ def win_rate(
 ) -> WinRate:
     """Pairwise win rate of A over B on ``dimension`` with bootstrap CI.
 
-    For each case, A's per-case mean is compared to B's; A wins on
-    that case if ``avg_a > avg_b`` (ties don't count as wins). The
-    point estimate is the fraction of cases A wins; the CI is the
-    95% bootstrap CI over cases.
+    For each case, A's per-case mean is compared to B's. **Strict
+    pairwise semantics:** ties are excluded from both numerator and
+    denominator, so the win rate answers "given a decisive
+    comparison, how often did A win?" The point estimate is
+    ``count(avg_a > avg_b) / n_decisive``; the CI is the 95%
+    bootstrap over cases (each bootstrap sample applies the same
+    strict-pairwise rule to its resampled pairs).
 
     Cases where either config didn't report ``dimension`` are
-    skipped. When no case is comparable, returns a zero-everywhere
-    ``WinRate`` rather than raising — caller can branch on
-    ``n_compared``.
+    skipped. When no case is decisive — either no overlap or every
+    overlapping case ties — returns a zero-everywhere ``WinRate``
+    rather than raising; caller can branch on ``n_compared`` or
+    ``n_decisive``.
+
+    Within a single run, multiple Score entries on ``dimension``
+    (e.g. via ``CompositeGrader``) are aggregated as the mean before
+    averaging across runs in a case. Matches ``pass_at_k``.
 
     Pass ``seed`` for reproducible bootstrap.
     """
@@ -202,10 +248,14 @@ def win_rate(
         vals = [s.value for s in scores if s.dimension == dimension]
         if not vals:
             continue
+        # Collapse within-run duplicates to a single per-run value
+        # (mean) so a CompositeGrader emitting two scores on the
+        # same dimension doesn't double-count for that run.
+        per_run_value = float(np.mean(vals))
         if run.config_name == config_a:
-            by_case_a.setdefault(run.case_index, []).extend(vals)
+            by_case_a.setdefault(run.case_index, []).append(per_run_value)
         elif run.config_name == config_b:
-            by_case_b.setdefault(run.case_index, []).extend(vals)
+            by_case_b.setdefault(run.case_index, []).append(per_run_value)
 
     pairs: list[tuple[float, float]] = []
     for case_idx in sorted(set(by_case_a) & set(by_case_b)):
@@ -224,10 +274,28 @@ def win_rate(
             ci_low=0.0,
             ci_high=0.0,
             n_compared=0,
+            n_decisive=0,
         )
 
     arr = np.array(pairs)
-    point = float(np.mean(arr[:, 0] > arr[:, 1]))
+    decisive_mask = arr[:, 0] != arr[:, 1]
+    n_decisive = int(np.sum(decisive_mask))
+    if n_decisive == 0:
+        # All ties — no decisive evidence either way. Return zero CI;
+        # caller branches on n_decisive.
+        return WinRate(
+            config_a=config_a,
+            config_b=config_b,
+            dimension=dimension,
+            win_rate=0.0,
+            ci_low=0.0,
+            ci_high=0.0,
+            n_compared=len(pairs),
+            n_decisive=0,
+        )
+    point = float(
+        np.mean(arr[decisive_mask, 0] > arr[decisive_mask, 1])
+    )
 
     rng = np.random.default_rng(seed)
     n = len(pairs)
@@ -235,7 +303,18 @@ def win_rate(
     for i in range(bootstrap_samples):
         idx = rng.integers(0, n, n)
         sample = arr[idx]
-        boot[i] = float(np.mean(sample[:, 0] > sample[:, 1]))
+        sample_decisive = sample[:, 0] != sample[:, 1]
+        if not np.any(sample_decisive):
+            # This bootstrap sample drew only ties — record 0.0
+            # rather than NaN; over many samples the CI still
+            # represents the resampling distribution honestly.
+            boot[i] = 0.0
+        else:
+            boot[i] = float(
+                np.mean(
+                    sample[sample_decisive, 0] > sample[sample_decisive, 1]
+                )
+            )
     ci_low = float(np.percentile(boot, 2.5))
     ci_high = float(np.percentile(boot, 97.5))
 
@@ -247,4 +326,5 @@ def win_rate(
         ci_low=ci_low,
         ci_high=ci_high,
         n_compared=n,
+        n_decisive=n_decisive,
     )
