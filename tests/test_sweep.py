@@ -230,6 +230,36 @@ class TestSweep:
         with pytest.raises(ValueError, match="duplicates"):
             await sweep(["case1"], configs)
 
+    async def test_seeds_default_one_preserves_existing_behavior(self):
+        """Without ``seeds=``, every run has seed_index 0."""
+        result = await sweep(["c1", "c2"], [_config("a"), _config("b")])
+        assert len(result.runs) == 4
+        assert all(r.seed_index == 0 for r in result.runs)
+
+    async def test_seeds_repeats_each_pair(self):
+        """``seeds=N`` runs every (case, config) pair N times."""
+        cases = ["c1", "c2"]
+        configs = [_config("a"), _config("b")]
+        result = await sweep(cases, configs, seeds=3)
+
+        # 2 cases * 2 configs * 3 seeds = 12 runs
+        assert len(result.runs) == 12
+        # Each (case, config) pair should appear exactly 3 times with
+        # distinct seed_index values 0..2
+        from collections import defaultdict
+
+        by_pair: dict[tuple[int, int], list[int]] = defaultdict(list)
+        for r in result.runs:
+            by_pair[(r.case_index, r.config_index)].append(r.seed_index)
+        for pair, seeds in by_pair.items():
+            assert sorted(seeds) == [0, 1, 2]
+
+    async def test_seeds_must_be_positive(self):
+        with pytest.raises(ValueError, match="seeds"):
+            await sweep(["x"], [_config("a")], seeds=0)
+        with pytest.raises(ValueError, match="seeds"):
+            await sweep(["x"], [_config("a")], seeds=-1)
+
 
 @pytest.mark.asyncio
 class TestSweepErrorCounting:

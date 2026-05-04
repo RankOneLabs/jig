@@ -79,6 +79,12 @@ from jig.sweep import (
     compare,
     sweep,
 )
+from jig.sweep_stats import (
+    PassAtK,
+    WinRate,
+    pass_at_k,
+    win_rate,
+)
 from jig.tools import PastResults, ToolRegistry
 
 __all__ = [
@@ -142,13 +148,17 @@ __all__ = [
     # Experimentation
     "CompareResult",
     "CompareRun",
+    "PassAtK",
     "RegressionAlert",
     "RegressionReport",
     "SweepResult",
     "SweepRun",
+    "WinRate",
     "compare",
     "detect_regressions",
+    "pass_at_k",
     "sweep",
+    "win_rate",
     # Dispatch
     "DispatchError",
     "JobTimeoutError",

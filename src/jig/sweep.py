@@ -140,6 +140,12 @@ class SweepRun[T]:
     config_name: str
     input: str
     result: AgentResult[T]
+    # Index of this run within the (case, config) repetition group.
+    # 0 for single-run sweeps (the default ``seeds=1``); 0..seeds-1
+    # when ``sweep(..., seeds=N)`` was called. Analyses like
+    # ``pass_at_k`` group by this implicitly via the case_index +
+    # config_name pair.
+    seed_index: int = 0
 
 
 @dataclass
@@ -261,6 +267,7 @@ async def sweep[T](
     concurrency: int = 1,
     sweep_id: str | None = None,
     dispatch: str | None = None,
+    seeds: int = 1,
 ) -> SweepResult[T]:
     """Run every (case, config) pair; return a SweepResult for rollup.
 
@@ -274,9 +281,20 @@ async def sweep[T](
     coroutines with one HTTP receiver. If the caller has already
     started a listener, the sweep uses it and leaves it running;
     otherwise the sweep owns the listener for its duration.
+
+    ``seeds`` runs each ``(case, config)`` pair this many times. The
+    extra repetitions are needed for distributional analyses
+    (``pass_at_k``, ``win_rate``). Default ``1`` preserves existing
+    behavior — backward compatible. The runner does not currently
+    expose explicit per-call seed control, so ``seeds > 1`` relies
+    on temperature variance for sample diversity; with
+    ``temperature=0`` configs every repetition is identical and
+    ``pass_at_k`` will warn at analysis time.
     """
     if concurrency <= 0:
         raise ValueError(f"concurrency must be positive, got {concurrency}")
+    if seeds <= 0:
+        raise ValueError(f"seeds must be positive, got {seeds}")
     _ensure_unique_names(configs)
 
     resolved_sweep_id = sweep_id or str(uuid.uuid4())
@@ -285,6 +303,7 @@ async def sweep[T](
     async def _one(
         case_idx: int,
         cfg_idx: int,
+        seed_idx: int,
         case: EvalCase | str,
         cfg: AgentConfig[T],
     ) -> SweepRun[T]:
@@ -297,13 +316,15 @@ async def sweep[T](
                 config_name=cfg.name,
                 input=input_text,
                 result=result,
+                seed_index=seed_idx,
             )
 
     async with _dispatch_listener(dispatch):
         tasks = [
-            _one(ci, gi, case, cfg)
+            _one(ci, gi, si, case, cfg)
             for ci, case in enumerate(cases)
             for gi, cfg in enumerate(configs)
+            for si in range(seeds)
         ]
         runs = await asyncio.gather(*tasks)
     return SweepResult(sweep_id=resolved_sweep_id, runs=list(runs))
