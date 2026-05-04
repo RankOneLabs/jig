@@ -66,6 +66,11 @@ from jig.replay import (
     replay,
     trace_diff,
 )
+from jig.regression import (
+    RegressionAlert,
+    RegressionReport,
+    detect_regressions,
+)
 from jig.sweep import (
     CompareResult,
     CompareRun,
@@ -137,9 +142,12 @@ __all__ = [
     # Experimentation
     "CompareResult",
     "CompareRun",
+    "RegressionAlert",
+    "RegressionReport",
     "SweepResult",
     "SweepRun",
     "compare",
+    "detect_regressions",
     "sweep",
     # Dispatch
     "DispatchError",
