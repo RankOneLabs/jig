@@ -48,6 +48,8 @@ from jig.dispatch import listen as dispatch_listen
 from jig.dispatch import run as dispatch_run
 from jig.dispatch import stop as dispatch_stop
 from jig.feedback import (
+    CommitteeJudge,
+    PairwiseLLMJudge,
     TrajectoryAssertion,
     TrajectoryGrader,
     step_budget,
@@ -182,4 +184,7 @@ __all__ = [
     "step_budget",
     "tool_called",
     "tool_sequence",
+    # Calibrated judges
+    "CommitteeJudge",
+    "PairwiseLLMJudge",
 ]
