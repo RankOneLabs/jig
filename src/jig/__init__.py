@@ -48,6 +48,8 @@ from jig.dispatch import listen as dispatch_listen
 from jig.dispatch import run as dispatch_run
 from jig.dispatch import stop as dispatch_stop
 from jig.feedback import (
+    CommitteeJudge,
+    PairwiseLLMJudge,
     TrajectoryAssertion,
     TrajectoryGrader,
     step_budget,
@@ -66,6 +68,11 @@ from jig.replay import (
     replay,
     trace_diff,
 )
+from jig.regression import (
+    RegressionAlert,
+    RegressionReport,
+    detect_regressions,
+)
 from jig.sweep import (
     CompareResult,
     CompareRun,
@@ -73,6 +80,12 @@ from jig.sweep import (
     SweepRun,
     compare,
     sweep,
+)
+from jig.sweep_stats import (
+    PassAtK,
+    WinRate,
+    pass_at_k,
+    win_rate,
 )
 from jig.tools import PastResults, ToolRegistry
 
@@ -137,10 +150,17 @@ __all__ = [
     # Experimentation
     "CompareResult",
     "CompareRun",
+    "PassAtK",
+    "RegressionAlert",
+    "RegressionReport",
     "SweepResult",
     "SweepRun",
+    "WinRate",
     "compare",
+    "detect_regressions",
+    "pass_at_k",
     "sweep",
+    "win_rate",
     # Dispatch
     "DispatchError",
     "JobTimeoutError",
@@ -164,4 +184,7 @@ __all__ = [
     "step_budget",
     "tool_called",
     "tool_sequence",
+    # Calibrated judges
+    "CommitteeJudge",
+    "PairwiseLLMJudge",
 ]

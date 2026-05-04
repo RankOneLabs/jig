@@ -140,6 +140,12 @@ class SweepRun[T]:
     config_name: str
     input: str
     result: AgentResult[T]
+    # Index of this run within the (case, config) repetition group.
+    # 0 for single-run sweeps (the default ``seeds=1``); 0..seeds-1
+    # when ``sweep(..., seeds=N)`` was called. Analyses like
+    # ``pass_at_k`` group by this implicitly via the case_index +
+    # config_name pair.
+    seed_index: int = 0
 
 
 @dataclass
@@ -261,6 +267,7 @@ async def sweep[T](
     concurrency: int = 1,
     sweep_id: str | None = None,
     dispatch: str | None = None,
+    seeds: int = 1,
 ) -> SweepResult[T]:
     """Run every (case, config) pair; return a SweepResult for rollup.
 
@@ -274,36 +281,84 @@ async def sweep[T](
     coroutines with one HTTP receiver. If the caller has already
     started a listener, the sweep uses it and leaves it running;
     otherwise the sweep owns the listener for its duration.
+
+    ``seeds`` runs each ``(case, config)`` pair this many times. The
+    extra repetitions are needed for distributional analyses
+    (``pass_at_k``, ``win_rate``). Default ``1`` preserves existing
+    behavior — backward compatible. The runner does not currently
+    expose explicit per-call seed control, so ``seeds > 1`` relies
+    on temperature variance for sample diversity; with
+    ``temperature=0`` configs every repetition is identical and
+    ``pass_at_k`` will warn at analysis time.
     """
     if concurrency <= 0:
         raise ValueError(f"concurrency must be positive, got {concurrency}")
+    if seeds <= 0:
+        raise ValueError(f"seeds must be positive, got {seeds}")
     _ensure_unique_names(configs)
 
     resolved_sweep_id = sweep_id or str(uuid.uuid4())
-    sem = asyncio.Semaphore(concurrency)
 
-    async def _one(
-        case_idx: int,
-        cfg_idx: int,
-        case: EvalCase | str,
-        cfg: AgentConfig[T],
-    ) -> SweepRun[T]:
-        async with sem:
-            input_text = _case_to_input(case)
-            result = await run_agent(cfg, input_text)
-            return SweepRun(
-                case_index=case_idx,
-                config_index=cfg_idx,
-                config_name=cfg.name,
-                input=input_text,
-                result=result,
-            )
+    # Worker-pool pattern: instead of building a list of
+    # ``len(cases) * len(configs) * seeds`` coroutine objects up
+    # front and handing them all to ``asyncio.gather``, we run
+    # exactly ``concurrency`` workers that pull work items from a
+    # bounded queue. This caps in-memory state at O(concurrency)
+    # rather than O(cases * configs * seeds) — for large eval
+    # sweeps the difference is real (50k+ pending coroutines is a
+    # measurable spike).
+    total = len(cases) * len(configs) * seeds
+    runs: list[SweepRun[T] | None] = [None] * total
+    # Bound the queue to ``concurrency`` so the producer can't run
+    # ahead of the workers and pre-materialize every coroutine.
+    queue: asyncio.Queue[tuple[int, int, int, int, EvalCase | str, AgentConfig[T]] | None] = (
+        asyncio.Queue(maxsize=concurrency)
+    )
+
+    async def _worker() -> None:
+        while True:
+            item = await queue.get()
+            if item is None:
+                queue.task_done()
+                return
+            slot, case_idx, cfg_idx, seed_idx, case, cfg = item
+            try:
+                input_text = _case_to_input(case)
+                result = await run_agent(cfg, input_text)
+                runs[slot] = SweepRun(
+                    case_index=case_idx,
+                    config_index=cfg_idx,
+                    config_name=cfg.name,
+                    input=input_text,
+                    result=result,
+                    seed_index=seed_idx,
+                )
+            finally:
+                queue.task_done()
 
     async with _dispatch_listener(dispatch):
-        tasks = [
-            _one(ci, gi, case, cfg)
-            for ci, case in enumerate(cases)
-            for gi, cfg in enumerate(configs)
-        ]
-        runs = await asyncio.gather(*tasks)
-    return SweepResult(sweep_id=resolved_sweep_id, runs=list(runs))
+        # Cap the worker count at the actual workload — spinning up
+        # more workers than items just wastes scheduler overhead.
+        n_workers = min(concurrency, total) if total > 0 else 0
+        workers = [asyncio.create_task(_worker()) for _ in range(n_workers)]
+        try:
+            slot = 0
+            for ci, case in enumerate(cases):
+                for gi, cfg in enumerate(configs):
+                    for si in range(seeds):
+                        await queue.put((slot, ci, gi, si, case, cfg))
+                        slot += 1
+            # Sentinel per worker — graceful shutdown.
+            for _ in range(n_workers):
+                await queue.put(None)
+            await asyncio.gather(*workers)
+        except BaseException:
+            # On cancellation / any exception, cancel workers so they
+            # don't outlive the sweep call.
+            for w in workers:
+                w.cancel()
+            raise
+
+    # All slots populated by workers; the cast satisfies the type
+    # checker without a runtime cost.
+    return SweepResult(sweep_id=resolved_sweep_id, runs=runs)  # type: ignore[arg-type]

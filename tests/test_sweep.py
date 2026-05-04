@@ -230,6 +230,68 @@ class TestSweep:
         with pytest.raises(ValueError, match="duplicates"):
             await sweep(["case1"], configs)
 
+    async def test_seeds_default_one_preserves_existing_behavior(self):
+        """Without ``seeds=``, every run has seed_index 0."""
+        result = await sweep(["c1", "c2"], [_config("a"), _config("b")])
+        assert len(result.runs) == 4
+        assert all(r.seed_index == 0 for r in result.runs)
+
+    async def test_seeds_repeats_each_pair(self):
+        """``seeds=N`` runs every (case, config) pair N times."""
+        cases = ["c1", "c2"]
+        configs = [_config("a"), _config("b")]
+        result = await sweep(cases, configs, seeds=3)
+
+        # 2 cases * 2 configs * 3 seeds = 12 runs
+        assert len(result.runs) == 12
+        # Each (case, config) pair should appear exactly 3 times with
+        # distinct seed_index values 0..2
+        from collections import defaultdict
+
+        by_pair: dict[tuple[int, int], list[int]] = defaultdict(list)
+        for r in result.runs:
+            by_pair[(r.case_index, r.config_index)].append(r.seed_index)
+        for pair, seeds in by_pair.items():
+            assert sorted(seeds) == [0, 1, 2]
+
+    async def test_seeds_must_be_positive(self):
+        with pytest.raises(ValueError, match="seeds"):
+            await sweep(["x"], [_config("a")], seeds=0)
+        with pytest.raises(ValueError, match="seeds"):
+            await sweep(["x"], [_config("a")], seeds=-1)
+
+    async def test_worker_pool_preserves_full_grid_under_low_concurrency(self):
+        """The bounded-queue worker pool must produce exactly one
+        run per (case, config, seed) tuple even when concurrency is
+        much smaller than the workload.
+        """
+        cases = [f"c{i}" for i in range(10)]
+        configs = [_config("a"), _config("b")]
+        result = await sweep(cases, configs, concurrency=2, seeds=3)
+        # 10 cases * 2 configs * 3 seeds = 60 runs
+        assert len(result.runs) == 60
+        # Every (case, config) pair should appear exactly seeds=3 times
+        from collections import Counter
+
+        pairs = Counter((r.case_index, r.config_index) for r in result.runs)
+        assert all(count == 3 for count in pairs.values())
+        assert len(pairs) == 20  # 10 cases * 2 configs
+
+    async def test_worker_pool_no_dropped_runs_when_total_below_concurrency(self):
+        """Worker count is capped at the workload size — small sweeps
+        don't spin up unused workers and still complete every run.
+        """
+        result = await sweep(["only-case"], [_config("only")], concurrency=8)
+        assert len(result.runs) == 1
+        assert result.runs[0].config_name == "only"
+
+    async def test_empty_sweep_completes_cleanly(self):
+        """No cases or no configs → empty result; no workers, no hang."""
+        empty_a = await sweep([], [_config("a")], concurrency=4)
+        assert empty_a.runs == []
+        empty_b = await sweep(["x"], [], concurrency=4)
+        assert empty_b.runs == []
+
 
 @pytest.mark.asyncio
 class TestSweepErrorCounting:
