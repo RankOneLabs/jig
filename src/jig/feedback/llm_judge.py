@@ -16,7 +16,7 @@ from jig.core.types import (
 _SYSTEM_PROMPT = """You are an evaluation judge. Grade the assistant's output on the specified dimensions.
 
 Return ONLY valid JSON in this exact format:
-{"scores": [{"dimension": "<name>", "value": <0.0-1.0>, "reasoning": "<brief explanation>"}]}
+{{"scores": [{{"dimension": "<name>", "value": <0.0-1.0>, "reasoning": "<brief explanation>"}}]}}
 
 Dimensions to grade: {dimensions}
 
