@@ -12,6 +12,7 @@ from jig.core.types import (
     Score,
     ScoreSource,
 )
+from jig.feedback.parsing import strip_markdown_fence
 
 _SYSTEM_PROMPT = """You are an evaluation judge. Grade the assistant's output on the specified dimensions.
 
@@ -56,7 +57,7 @@ class LLMJudge(Grader):
         response = await self._llm.complete(params)
 
         try:
-            data = json.loads(response.content)
+            data = json.loads(strip_markdown_fence(response.content))
             return [
                 Score(
                     dimension=s["dimension"],
@@ -65,7 +66,11 @@ class LLMJudge(Grader):
                 )
                 for s in data["scores"]
             ]
-        except (json.JSONDecodeError, KeyError, TypeError):
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            # ValueError covers float() failing on a non-numeric
+            # ``value`` (e.g., a string like "high"); without it the
+            # exception would bubble out of grade() and break the
+            # documented fail-soft contract.
             return [
                 Score(dimension=d, value=0.0, source=ScoreSource.LLM_JUDGE)
                 for d in self._dimensions

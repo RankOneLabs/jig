@@ -33,6 +33,7 @@ from jig.core.types import (
     Score,
     ScoreSource,
 )
+from jig.feedback.parsing import strip_markdown_fence
 
 
 _PAIRWISE_PROMPT = """You are an evaluation judge. You will be shown an
@@ -152,7 +153,7 @@ class PairwiseLLMJudge(Grader):
         )
         response = await self._llm.complete(params)
         try:
-            data = json.loads(response.content)
+            data = json.loads(strip_markdown_fence(response.content))
             winner = data["winner"]
         except (json.JSONDecodeError, KeyError, TypeError):
             # Malformed judge response — record as a tie rather than
