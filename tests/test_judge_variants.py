@@ -248,6 +248,46 @@ async def test_pairwise_handles_malformed_judge_response():
     assert scores[0].dimension == "vs_z"
 
 
+class _FencedVerdictLLM(LLMClient):
+    """Returns a fenced JSON envelope — same shape Claude tends to
+    emit even when the system prompt forbids it."""
+
+    def __init__(self, winner: str) -> None:
+        self._winner = winner
+
+    async def complete(self, params: CompletionParams) -> LLMResponse:
+        body = "```json\n" + json.dumps(
+            {"winner": self._winner, "reasoning": "test"}
+        ) + "\n```"
+        return LLMResponse(
+            content=body,
+            tool_calls=None,
+            usage=Usage(1, 1, cost=0.0),
+            latency_ms=1.0,
+            model="fake",
+        )
+
+
+async def test_pairwise_tolerates_fenced_json_response():
+    """Same fence-stripping as :class:`LLMJudge` — a verdict wrapped
+    in a ```json ... ``` block must parse cleanly. Without the
+    strip, every fenced response falls into the malformed-JSON path
+    and returns the 0.5 tie fallback regardless of what the judge
+    actually said."""
+    judge = PairwiseLLMJudge(
+        _FencedVerdictLLM("A"), seed=0
+    )
+    scores = await judge.grade(
+        "i", "self", context={"compare_to": {"output": "other", "id": "z"}}
+    )
+    assert len(scores) == 1
+    # With seed=0 and these fixed inputs, the test only needs to
+    # assert the verdict was actually parsed (not stuck at 0.5 tie).
+    # Either flip is fine; what matters is the score isn't the
+    # malformed-JSON fallback.
+    assert scores[0].value in (0.0, 1.0)
+
+
 async def test_pairwise_dimension_uses_other_id():
     """The score dimension carries the comparison id so multiple
     pairwise comparisons in one context don't collide."""
