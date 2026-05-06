@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from jig.core.types import (
@@ -21,6 +22,33 @@ Return ONLY valid JSON in this exact format:
 Dimensions to grade: {dimensions}
 
 {rubric}"""
+
+
+_FENCE_RE = re.compile(
+    r"\A\s*```(?:json)?\s*\n(?P<body>.*?)\n```\s*\Z",
+    re.DOTALL,
+)
+
+
+def _strip_markdown_fence(text: str) -> str:
+    """Strip a surrounding ``` fence (with optional ``json`` lang tag).
+
+    Models — especially Claude — wrap structured output in a fenced
+    code block even when the system prompt forbids it. That habit
+    isn't reliably overridden by instructions, so we absorb the
+    common "whole response is one fenced block" case here before
+    json.loads runs.
+
+    Conservative: only strips when the *entire* response is one
+    fenced block. A response with leading prose and a fenced block
+    in the middle is still treated as malformed (handled by the
+    grade() fallback path) — that's a real prompt-tuning issue, not
+    a formatting quirk to absorb silently.
+    """
+    match = _FENCE_RE.match(text)
+    if match is None:
+        return text
+    return match.group("body")
 
 
 class LLMJudge(Grader):
@@ -56,7 +84,7 @@ class LLMJudge(Grader):
         response = await self._llm.complete(params)
 
         try:
-            data = json.loads(response.content)
+            data = json.loads(_strip_markdown_fence(response.content.strip()))
             return [
                 Score(
                     dimension=s["dimension"],
