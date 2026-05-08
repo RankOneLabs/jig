@@ -115,7 +115,7 @@ class OllamaClient(LLMClient):
                     f"Malformed tool call: {e}. Raw: {raw_calls}",
                     "ollama",
                     retryable=True,
-                )
+                ) from e
 
         return LLMResponse(
             content=message.content or "",

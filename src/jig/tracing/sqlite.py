@@ -163,15 +163,22 @@ class SQLiteTracer(TracingLogger):
                 ),
             )
         await db.commit()
-        # Retain unended spans so a mid-run flush (e.g. before
-        # trajectory grading) doesn't strand the still-open root: a
-        # subsequent end_span needs the entry in _spans to update
-        # ended_at/duration. Read from the live dict so spans added
-        # during the flush body above (which we deliberately skipped
-        # this round) are preserved for the next flush. The dict
-        # comprehension itself is sync — no await inside — so it can't
+        # Drop only the spans we just persisted. Two cases survive:
+        #  - Open spans (``ended_at is None``): a subsequent end_span
+        #    needs the entry to update ended_at/duration. This is the
+        #    mid-run-flush case (e.g. before trajectory grading).
+        #  - Concurrent spans added *after* the snapshot — including
+        #    spans the writer task ended synchronously while we were
+        #    awaiting db.execute. They never reached the DB this round
+        #    and must stay in _spans so the next flush picks them up.
+        # The dict comprehension is sync (no await inside) so it can't
         # interleave with concurrent inserts.
-        self._spans = {sid: s for sid, s in self._spans.items() if s.ended_at is None}
+        flushed_ids = {span.id for span in pending}
+        self._spans = {
+            sid: s
+            for sid, s in self._spans.items()
+            if s.ended_at is None or sid not in flushed_ids
+        }
 
     async def get_trace(self, trace_id: str) -> list[Span]:
         db = await self._get_db()
