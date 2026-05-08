@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -162,3 +163,43 @@ async def test_pipeline_with_sqlite_tracer(tracer: SQLiteTracer) -> None:
     assert kinds.count(SpanKind.PIPELINE_RUN) == 1
     assert kinds.count(SpanKind.PIPELINE_STEP) == 2
     await tracer.close()
+
+
+@pytest.mark.asyncio
+async def test_flush_safe_under_concurrent_start_span(tracer: SQLiteTracer) -> None:
+    """Regression: flush() snapshots ``self._spans`` before iterating so a
+    concurrent task adding spans (between our awaits in the flush body)
+    doesn't trigger ``RuntimeError: dictionary changed size during
+    iteration``.
+
+    Pre-fix repro: this raised under ``concurrency=3`` specialist sweeps —
+    one task in flush, the others mid-LLM-call adding ``llm_call`` spans.
+    """
+    root = tracer.start_trace("root", kind=SpanKind.AGENT_RUN)
+    # Seed enough completed spans that flush() takes several await
+    # iterations — gives the writer task many chances to interleave.
+    for i in range(50):
+        s = tracer.start_span(root.id, SpanKind.LLM_CALL, f"pre-{i}")
+        tracer.end_span(s.id)
+
+    async def writer() -> None:
+        for i in range(50):
+            s = tracer.start_span(root.id, SpanKind.LLM_CALL, f"concurrent-{i}")
+            tracer.end_span(s.id)
+            # Yield so flush's await gets a chance to resume mid-iteration.
+            await asyncio.sleep(0)
+
+    # Pre-fix: raises RuntimeError. Post-fix: completes cleanly.
+    await asyncio.gather(tracer.flush(), writer())
+
+    # Tail flush picks up whatever the concurrent writer added that the
+    # first flush deferred. End the root, drain, and verify everything's
+    # durable.
+    tracer.end_span(root.id)
+    await tracer.flush()
+    persisted = await tracer.get_trace(root.trace_id)
+    names = {s.name for s in persisted}
+    assert "root" in names
+    for i in range(50):
+        assert f"pre-{i}" in names
+        assert f"concurrent-{i}" in names

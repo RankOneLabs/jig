@@ -17,6 +17,7 @@ For experimentation, swap the retriever without touching the corpus::
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -78,11 +79,22 @@ class SqliteStore(MemoryStore):
         self._ollama_host = ollama_host
         self._custom_embedder = embedder
         self._db: aiosqlite.Connection | None = None
+        # Constructed lazily inside _get_db() so the lock binds to the
+        # event loop that's actually running, not whatever loop existed
+        # (or didn't) at __init__ time.
+        self._db_lock: asyncio.Lock | None = None
 
     async def _get_db(self) -> aiosqlite.Connection:
-        if self._db is None:
-            self._db = await aiosqlite.connect(self._db_path)
-            await self._db.executescript(_SCHEMA)
+        if self._db is not None:
+            return self._db
+        if self._db_lock is None:
+            self._db_lock = asyncio.Lock()
+        async with self._db_lock:
+            # Re-check after acquiring — another waiter may have
+            # initialized the connection while we blocked on the lock.
+            if self._db is None:
+                self._db = await aiosqlite.connect(self._db_path)
+                await self._db.executescript(_SCHEMA)
         return self._db
 
     async def embed(self, text: str) -> np.ndarray:

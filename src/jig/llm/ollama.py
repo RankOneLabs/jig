@@ -93,31 +93,36 @@ class OllamaClient(LLMClient):
 
         latency_ms = (time.time() - start) * 1000
 
+        # ollama-python >= 0.4 returns a typed ``ChatResponse`` pydantic
+        # model. We require that floor (see pyproject's
+        # ``ollama = ["ollama>=0.4"]`` extra) and access fields via
+        # attributes rather than dict ``.get()``.
+        message = response.message
         tool_calls: list[ToolCall] | None = None
-        raw_calls = response.get("message", {}).get("tool_calls")
+        raw_calls = message.tool_calls
         if raw_calls:
             try:
                 tool_calls = [
                     ToolCall(
                         id=str(uuid.uuid4()),
-                        name=tc["function"]["name"],
-                        arguments=parse_tool_arguments(tc["function"]["arguments"], "ollama"),
+                        name=tc.function.name,
+                        arguments=parse_tool_arguments(tc.function.arguments, "ollama"),
                     )
                     for tc in raw_calls
                 ]
-            except (KeyError, TypeError) as e:
+            except (AttributeError, TypeError) as e:
                 raise JigLLMError(
                     f"Malformed tool call: {e}. Raw: {raw_calls}",
                     "ollama",
                     retryable=True,
-                )
+                ) from e
 
         return LLMResponse(
-            content=response.get("message", {}).get("content", ""),
+            content=message.content or "",
             tool_calls=tool_calls,
             usage=Usage(
-                input_tokens=response.get("prompt_eval_count", 0),
-                output_tokens=response.get("eval_count", 0),
+                input_tokens=response.prompt_eval_count or 0,
+                output_tokens=response.eval_count or 0,
                 cost=0.0,
             ),
             latency_ms=latency_ms,
@@ -144,6 +149,6 @@ class OllamaClient(LLMClient):
 
         response = await self._client.chat(**kwargs)
         async for chunk in response:
-            content = chunk.get("message", {}).get("content", "")
+            content = chunk.message.content or ""
             if content:
                 yield content

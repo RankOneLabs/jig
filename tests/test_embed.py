@@ -1,9 +1,9 @@
-"""Tests for jig._embed.ollama_embed response-shape compatibility.
+"""Tests for jig._embed.ollama_embed response handling.
 
-ollama-python >= 0.4 returns an EmbedResponse pydantic model from
-AsyncClient.embed(); older releases returned a dict. ollama_embed must
-handle both, otherwise LocalMemory and SQLiteFeedbackLoop break the
-moment a downstream installs a current ollama client.
+ollama-python >= 0.4 (the floor declared in pyproject's ``ollama`` extra)
+returns a typed EmbedResponse pydantic model from AsyncClient.embed().
+ollama_embed accesses ``.embeddings`` directly — older dict-shaped
+responses are no longer supported.
 """
 from __future__ import annotations
 
@@ -17,8 +17,8 @@ from jig._embed import ollama_embed
 
 
 @pytest.mark.asyncio
-async def test_handles_pydantic_embed_response():
-    """Modern ollama-python returns a typed EmbedResponse with .embeddings."""
+async def test_returns_float32_vector_from_embed_response():
+    """ollama-python returns a typed EmbedResponse with .embeddings."""
     fake_response = SimpleNamespace(embeddings=[[0.1, 0.2, 0.3]])
     fake_client = AsyncMock()
     fake_client.embed = AsyncMock(return_value=fake_response)
@@ -32,22 +32,9 @@ async def test_handles_pydantic_embed_response():
 
 
 @pytest.mark.asyncio
-async def test_handles_legacy_dict_response():
-    """Older ollama-python returned a dict — keep it working."""
-    fake_response = {"embeddings": [[0.4, 0.5, 0.6]]}
-    fake_client = AsyncMock()
-    fake_client.embed = AsyncMock(return_value=fake_response)
-
-    with patch("jig._embed.OllamaAsyncClient", return_value=fake_client):
-        result = await ollama_embed("hello", model="nomic-embed-text")
-
-    np.testing.assert_array_equal(result, np.array([0.4, 0.5, 0.6], dtype=np.float32))
-
-
-@pytest.mark.asyncio
-async def test_raises_when_embeddings_missing():
-    """If the response has neither attr nor key, surface a clear error."""
-    fake_response = SimpleNamespace(other_field="x")
+async def test_raises_when_embeddings_empty():
+    """If the response's embeddings list is empty, surface a clear error."""
+    fake_response = SimpleNamespace(embeddings=[])
     fake_client = AsyncMock()
     fake_client.embed = AsyncMock(return_value=fake_response)
 

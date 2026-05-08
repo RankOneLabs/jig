@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import uuid
@@ -58,11 +59,22 @@ class SQLiteTracer(TracingLogger):
         self._db_path = db_path
         self._db: aiosqlite.Connection | None = None
         self._spans: dict[str, Span] = {}
+        # Constructed lazily inside _get_db() so the lock binds to the
+        # event loop that's actually running, not whatever loop existed
+        # (or didn't) at __init__ time.
+        self._db_lock: asyncio.Lock | None = None
 
     async def _get_db(self) -> aiosqlite.Connection:
-        if self._db is None:
-            self._db = await aiosqlite.connect(self._db_path)
-            await self._db.executescript(_SCHEMA)
+        if self._db is not None:
+            return self._db
+        if self._db_lock is None:
+            self._db_lock = asyncio.Lock()
+        async with self._db_lock:
+            # Re-check after acquiring — another waiter may have
+            # initialized the connection while we blocked on the lock.
+            if self._db is None:
+                self._db = await aiosqlite.connect(self._db_path)
+                await self._db.executescript(_SCHEMA)
         return self._db
 
     def _insert_span_sync(self, span: Span) -> None:
@@ -117,7 +129,15 @@ class SQLiteTracer(TracingLogger):
 
     async def flush(self) -> None:
         db = await self._get_db()
-        for span in self._spans.values():
+        # Snapshot before iterating: start_span / start_trace mutate
+        # self._spans synchronously between our awaits below. Each
+        # individual write is atomic on the event loop, so a list
+        # snapshot at this moment captures a consistent view — spans
+        # added during the flush body are picked up by the next flush.
+        # Without the snapshot, iterating .values() while concurrent
+        # tasks insert raises RuntimeError: dictionary changed size.
+        pending = list(self._spans.values())
+        for span in pending:
             await db.execute(
                 """INSERT OR REPLACE INTO spans
                    (id, trace_id, parent_id, kind, name, input, output,
@@ -143,12 +163,22 @@ class SQLiteTracer(TracingLogger):
                 ),
             )
         await db.commit()
-        # Retain unended spans so a mid-run flush (e.g. before
-        # trajectory grading) doesn't strand the still-open root: a
-        # subsequent end_span needs the entry in _spans to update
-        # ended_at/duration. Ended spans are durably persisted and
-        # safe to drop.
-        self._spans = {sid: s for sid, s in self._spans.items() if s.ended_at is None}
+        # Drop only the spans we just persisted. Two cases survive:
+        #  - Open spans (``ended_at is None``): a subsequent end_span
+        #    needs the entry to update ended_at/duration. This is the
+        #    mid-run-flush case (e.g. before trajectory grading).
+        #  - Concurrent spans added *after* the snapshot — including
+        #    spans the writer task ended synchronously while we were
+        #    awaiting db.execute. They never reached the DB this round
+        #    and must stay in _spans so the next flush picks them up.
+        # The dict comprehension is sync (no await inside) so it can't
+        # interleave with concurrent inserts.
+        flushed_ids = {span.id for span in pending}
+        self._spans = {
+            sid: s
+            for sid, s in self._spans.items()
+            if s.ended_at is None or sid not in flushed_ids
+        }
 
     async def get_trace(self, trace_id: str) -> list[Span]:
         db = await self._get_db()
