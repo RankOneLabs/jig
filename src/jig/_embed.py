@@ -16,17 +16,15 @@ async def ollama_embed(
     """Embed `text` via a local Ollama instance and return a float32 vector.
 
     Shared by LocalMemory and SQLiteFeedbackLoop so a single place owns the
-    client construction + response shape.
+    client construction + response shape. Requires ollama-python >= 0.4
+    (the pyproject ``ollama`` extra pins this floor); the response is a
+    typed ``EmbedResponse`` pydantic model.
     """
     if OllamaAsyncClient is None:
         raise ImportError("Install ollama: pip install 'jig[ollama]'")
     client = OllamaAsyncClient(host=host)
     response = await client.embed(model=model, input=text)
-    # ollama-python >= 0.4 returns an EmbedResponse pydantic model; older
-    # versions returned a dict. Support both shapes.
-    embeddings = getattr(response, "embeddings", None) or (
-        response.get("embeddings") if isinstance(response, dict) else None
-    )
+    embeddings = response.embeddings
     if not embeddings:
         raise RuntimeError(f"Ollama embed response missing 'embeddings' (model={model})")
     return np.array(embeddings[0], dtype=np.float32)
