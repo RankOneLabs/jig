@@ -145,7 +145,16 @@ class OpenAIClient(LLMClient):
             # ``error`` payload if present and mark retryable — these are
             # typically transient and the agent loop should try again rather
             # than crash with TypeError on ``choices[0]``.
+            #
+            # The OpenAI SDK's pydantic model for ChatCompletion doesn't
+            # declare an ``error`` field, so OpenRouter's payload lands in
+            # ``response.model_extra`` rather than as a real attribute —
+            # mirror the ``usage.cost`` handling in OpenRouterClient and
+            # check both locations.
             err = getattr(response, "error", None)
+            if err is None:
+                extra = getattr(response, "model_extra", None) or {}
+                err = extra.get("error")
             detail = ""
             if err is not None:
                 err_msg = None

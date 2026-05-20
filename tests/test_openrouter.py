@@ -163,6 +163,38 @@ class TestOpenRouterComplete:
             assert exc.value.provider == "openrouter"
             assert exc.value.retryable is True
 
+    async def test_empty_choices_error_in_model_extra(self, monkeypatch):
+        # The OpenAI SDK's pydantic ChatCompletion model doesn't declare an
+        # ``error`` field, so OpenRouter's payload arrives in
+        # ``response.model_extra`` rather than as a top-level attribute
+        # (same shape as ``usage.cost``). We must look there too, or real
+        # responses will pass the guard but drop the diagnostic message.
+        from jig.core.errors import JigLLMError
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-x")
+        with patch("jig.llm.openai.openai") as mock_openai:
+            response = SimpleNamespace(
+                choices=None,
+                usage=SimpleNamespace(prompt_tokens=0, completion_tokens=0),
+                model="anthropic/claude-3.5-sonnet",
+                model_extra={"error": {"message": "rate limited upstream"}},
+            )
+            instance = mock_openai.AsyncOpenAI.return_value
+            instance.chat.completions.create = AsyncMock(return_value=response)
+            mock_openai.RateLimitError = type(
+                "RateLimitError", (Exception,), {}
+            )
+
+            client = OpenRouterClient(model="anthropic/claude-3.5-sonnet")
+            params = CompletionParams(
+                messages=[Message(role=Role.USER, content="hi")]
+            )
+            with pytest.raises(JigLLMError) as exc:
+                await client.complete(params)
+            assert exc.value.provider == "openrouter"
+            assert exc.value.retryable is True
+            assert "rate limited upstream" in str(exc.value)
+
     async def test_provider_label_on_error(self, monkeypatch):
         from jig.core.errors import JigLLMError
 
