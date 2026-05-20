@@ -76,8 +76,8 @@ class _FakeFB(FeedbackLoop):
 class _FakeTracer(TracingLogger):
     def start_trace(self, name, metadata=None, kind=SpanKind.AGENT_RUN):
         return Span(id="t", trace_id="t", kind=kind, name=name, started_at=datetime.now())
-    def start_span(self, parent_id, kind, name, input=None):
-        return Span(id="s", trace_id="t", kind=kind, name=name, started_at=datetime.now(), parent_id=parent_id)
+    def start_span(self, parent_id, kind, name, input=None, metadata=None):
+        return Span(id="s", trace_id="t", kind=kind, name=name, started_at=datetime.now(), parent_id=parent_id, metadata=metadata)
     def end_span(self, span_id, output=None, error=None, usage=None): pass
     async def get_trace(self, tid): return []
     async def list_traces(self, since=None, limit=50, name=None): return []

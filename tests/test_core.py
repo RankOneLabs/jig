@@ -105,8 +105,8 @@ class FakeTracer(TracingLogger):
         self.spans.append(s)
         return s
 
-    def start_span(self, parent_id: str, kind: SpanKind, name: str, input: Any = None) -> Span:
-        s = Span(id=f"span-{len(self.spans)}", trace_id="t-0", kind=kind, name=name, started_at=datetime.now(), parent_id=parent_id, input=input)
+    def start_span(self, parent_id: str, kind: SpanKind, name: str, input: Any = None, metadata: dict[str, Any] | None = None) -> Span:
+        s = Span(id=f"span-{len(self.spans)}", trace_id="t-0", kind=kind, name=name, started_at=datetime.now(), parent_id=parent_id, input=input, metadata=metadata)
         self.spans.append(s)
         return s
 
@@ -169,6 +169,91 @@ async def test_simple_completion():
     assert llm_spans[0].usage.input_tokens == 10
     assert llm_spans[0].usage.output_tokens == 5
     assert llm_spans[0].usage.cost == 0.0025
+
+
+async def test_model_is_recorded_on_spans():
+    # Without this, the recorded trace tells you nothing about which
+    # model was actually serving the agent — config.llm is a live object
+    # that JSON-encodes to ``null`` and llm_call spans had no metadata.
+    tracer = FakeTracer()
+    llm = FakeLLM([
+        LLMResponse(content="ok", tool_calls=None, usage=Usage(1, 1), latency_ms=1, model="fake"),
+    ])
+    llm._model = "anthropic/claude-3.5-sonnet"
+    await run_agent(
+        AgentConfig(
+            name="test", description="d", system_prompt="s",
+            llm=llm, store=FakeMemory(), retriever=None,
+            feedback=FakeFeedback(), tracer=tracer, tools=ToolRegistry(),
+        ),
+        "hi",
+    )
+
+    # agent_run trace span carries model_id in its config snapshot.
+    trace_spans = [s for s in tracer.spans if s.kind == SpanKind.AGENT_RUN]
+    assert len(trace_spans) == 1
+    cfg_snapshot = trace_spans[0].metadata["config"]
+    assert cfg_snapshot["model_id"] == "anthropic/claude-3.5-sonnet"
+
+    # llm_call spans carry model in their metadata.
+    llm_spans = [s for s in tracer.spans if s.kind == SpanKind.LLM_CALL]
+    assert len(llm_spans) == 1
+    assert llm_spans[0].metadata == {"model": "anthropic/claude-3.5-sonnet"}
+
+
+async def test_model_recorded_on_failed_llm_call():
+    # The whole point of stamping at start_span (rather than end_span on
+    # success) is that error paths still tell you which model failed.
+    class ErrLLM(FakeLLM):
+        async def complete(self, params):  # type: ignore[override]
+            from jig.core.errors import JigLLMError
+            raise JigLLMError("boom", "openrouter", retryable=False)
+
+    tracer = FakeTracer()
+    llm = ErrLLM([])
+    llm._model = "openai/gpt-oss-120b"
+    await run_agent(
+        AgentConfig(
+            name="t", description="d", system_prompt="s",
+            llm=llm, store=FakeMemory(), retriever=None,
+            feedback=FakeFeedback(), tracer=tracer, tools=ToolRegistry(),
+            max_llm_retries=1,
+        ),
+        "hi",
+    )
+
+    llm_spans = [s for s in tracer.spans if s.kind == SpanKind.LLM_CALL]
+    assert len(llm_spans) >= 1
+    assert llm_spans[0].metadata == {"model": "openai/gpt-oss-120b"}
+    assert llm_spans[0].error is not None  # the failure is recorded too
+
+
+async def test_model_recorded_through_wrapped_llm_client():
+    # Real callers wrap the LLM with BudgetedLLMClient (and other decorators
+    # that follow the ``_inner`` convention). Without unwrapping, the trace
+    # records ``model_id=None`` — exactly the gap this PR closes.
+    from jig.budget import BudgetedLLMClient, BudgetTracker
+
+    inner = FakeLLM([
+        LLMResponse(content="ok", tool_calls=None, usage=Usage(1, 1), latency_ms=1, model="fake"),
+    ])
+    inner._model = "openrouter/qwen/qwen3-coder"
+    wrapped = BudgetedLLMClient(inner, BudgetTracker(limit_usd=1.0))
+
+    tracer = FakeTracer()
+    await run_agent(
+        AgentConfig(
+            name="t", description="d", system_prompt="s",
+            llm=wrapped, store=FakeMemory(), retriever=None,
+            feedback=FakeFeedback(), tracer=tracer, tools=ToolRegistry(),
+        ),
+        "hi",
+    )
+
+    trace_spans = [s for s in tracer.spans if s.kind == SpanKind.AGENT_RUN]
+    assert trace_spans[0].metadata["config"]["model_id"] == "openrouter/qwen/qwen3-coder"
+    llm_spans = [s for s in tracer.spans if s.kind == SpanKind.LLM_CALL]
+    assert llm_spans[0].metadata == {"model": "openrouter/qwen/qwen3-coder"}
 
 
 async def test_tool_loop():

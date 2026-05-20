@@ -172,7 +172,7 @@ class StubTracer(TracingLogger):
     ) -> Span:
         return _span(kind, name)
 
-    def start_span(self, parent_id: str, kind: SpanKind, name: str, input=None) -> Span:
+    def start_span(self, parent_id: str, kind: SpanKind, name: str, input=None, metadata=None) -> Span:
         return _span(kind, name)
 
     def end_span(self, span_id, output=None, error=None, usage=None) -> None:

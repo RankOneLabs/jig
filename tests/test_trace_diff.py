@@ -26,7 +26,7 @@ class _StubTracer(TracingLogger):
     def start_trace(self, name, metadata=None, kind=SpanKind.AGENT_RUN):  # pragma: no cover
         raise NotImplementedError
 
-    def start_span(self, parent_id, kind, name, input=None):  # noqa: A002  # pragma: no cover
+    def start_span(self, parent_id, kind, name, input=None, metadata=None):  # noqa: A002  # pragma: no cover
         raise NotImplementedError
 
     def end_span(self, span_id, output=None, error=None, usage=None):  # pragma: no cover

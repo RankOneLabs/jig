@@ -71,10 +71,11 @@ class _NullTracer(TracingLogger):
     ) -> Span:
         return Span(id="t", trace_id="t", kind=kind, name=name, started_at=datetime.now())
 
-    def start_span(self, parent_id: str, kind: SpanKind, name: str, input: Any = None) -> Span:
+    def start_span(self, parent_id: str, kind: SpanKind, name: str, input: Any = None, metadata: dict[str, Any] | None = None) -> Span:
         return Span(
             id="s", trace_id="t", kind=kind, name=name,
             started_at=datetime.now(), parent_id=parent_id,
+            metadata=metadata,
         )
 
     def end_span(self, *a: Any, **kw: Any) -> None:

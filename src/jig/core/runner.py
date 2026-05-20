@@ -220,7 +220,31 @@ def _serialize_config_snapshot(config: AgentConfig[Any]) -> dict[str, Any]:
         "include_feedback_in_prompt": config.include_feedback_in_prompt,
         "session_id": config.session_id,
         "output_schema": schema_fqn,
+        # The LLMClient itself isn't JSON-serializable (live object,
+        # gets dropped to ``null`` by _safe_json), so stamp the model
+        # slug alongside it. Every shipped adapter sets ``self._model``;
+        # custom adapters that don't will just record None.
+        "model_id": _resolve_model_id(config.llm),
     }
+
+
+def _resolve_model_id(client: LLMClient | None) -> str | None:
+    """Walk past LLMClient wrappers (e.g. BudgetedLLMClient) to find ``_model``.
+
+    Wrappers store the wrapped client at ``_inner`` by convention. Without
+    this unwrap, traces record ``model_id=None`` whenever a budget tracker
+    or similar decorator sits in front of the real adapter — exactly the
+    observability hole this stamping is meant to close.
+    """
+    seen: set[int] = set()
+    current: Any = client
+    while current is not None and id(current) not in seen:
+        model = getattr(current, "_model", None)
+        if model is not None:
+            return model
+        seen.add(id(current))
+        current = getattr(current, "_inner", None)
+    return None
 
 
 async def _finalize_trace(
@@ -360,7 +384,16 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
             # too, not just successes. A flaky LLM would otherwise be able to
             # race past max_llm_calls via the consecutive-errors retry path.
             total_usage["llm_calls"] += 1
-            llm_span = config.tracer.start_span(trace.id, SpanKind.LLM_CALL, "completion")
+            # Stamp the configured model on the span at start time so the
+            # trace records which model was requested even if the call
+            # subsequently errors (the failure path doesn't have an
+            # LLMResponse to consult).
+            llm_span = config.tracer.start_span(
+                trace.id,
+                SpanKind.LLM_CALL,
+                "completion",
+                metadata={"model": _resolve_model_id(config.llm)},
+            )
             params = CompletionParams(
                 messages=messages,
                 system=system_message,
