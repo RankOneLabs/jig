@@ -15,6 +15,7 @@ Overrides pass through to the adapter constructor (``host=``, ``dispatch_url=``,
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from jig.core.types import (
@@ -26,6 +27,8 @@ from jig.core.types import (
     ToolCall,
     ToolDefinition,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def from_model(model: str, **overrides: Any) -> LLMClient:

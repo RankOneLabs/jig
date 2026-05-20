@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import Any, AsyncIterator
 
@@ -17,6 +18,8 @@ from jig.core.types import (
 )
 from jig.llm._parsing import parse_tool_arguments
 from jig.llm.pricing import stamp_cost
+
+logger = logging.getLogger(__name__)
 
 try:
     import openai
@@ -121,6 +124,11 @@ class OpenAIClient(LLMClient):
         self._apply_extra_kwargs(kwargs)
 
         start = time.time()
+        logger.debug(
+            "%s.complete request model=%s messages=%d tools=%d",
+            self._provider_label, self._model, len(messages),
+            len(kwargs.get("tools") or ()),
+        )
 
         async def _call() -> Any:
             return await self._client.chat.completions.create(**kwargs)
@@ -134,9 +142,18 @@ class OpenAIClient(LLMClient):
             response = await with_retry(_call, max_attempts=3, retryable=_retryable)
         except Exception as e:
             status = getattr(e, "status_code", None)
+            logger.debug(
+                "%s.complete failed model=%s status=%s err=%s",
+                self._provider_label, self._model, status, e,
+            )
             raise JigLLMError(str(e), self._provider_label, status_code=status) from e
 
         latency_ms = (time.time() - start) * 1000
+        logger.debug(
+            "%s.complete response model=%s latency_ms=%.0f choices=%d",
+            self._provider_label, self._model, latency_ms,
+            len(response.choices or ()),
+        )
 
         if not response.choices:
             # Gateways (notably OpenRouter) sometimes return 200 OK with a

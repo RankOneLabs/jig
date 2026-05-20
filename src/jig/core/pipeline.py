@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Awaitable
 
 from jig.core.types import FeedbackLoop, Grader, Score, SpanKind, TracingLogger
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)

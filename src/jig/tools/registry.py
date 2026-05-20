@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 from jig.core.types import Tool, ToolCall, ToolDefinition, ToolResult
+
+logger = logging.getLogger(__name__)
 
 
 class ToolRegistry:
@@ -47,11 +50,14 @@ class ToolRegistry:
     async def execute(self, call: ToolCall) -> ToolResult:
         tool = self._tools.get(call.name)
         if not tool:
+            logger.debug("tool.execute unknown name=%s", call.name)
             return ToolResult(call_id=call.id, output="", error=f"Unknown tool: {call.name}")
 
         if getattr(tool, "dispatch", False):
+            logger.debug("tool.execute dispatched name=%s", call.name)
             return await self._execute_dispatched(tool, call)
 
+        logger.debug("tool.execute start name=%s timeout=%s", call.name, self._execute_timeout)
         try:
             if self._execute_timeout is not None:
                 output = await asyncio.wait_for(
@@ -59,14 +65,17 @@ class ToolRegistry:
                 )
             else:
                 output = await tool.execute(call.arguments)
+            logger.debug("tool.execute done name=%s", call.name)
             return ToolResult(call_id=call.id, output=output)
         except asyncio.TimeoutError:
+            logger.debug("tool.execute timeout name=%s after=%ss", call.name, self._execute_timeout)
             return ToolResult(
                 call_id=call.id,
                 output="",
                 error=f"Tool {call.name} timed out after {self._execute_timeout}s",
             )
         except Exception as e:
+            logger.debug("tool.execute error name=%s err=%s", call.name, e)
             return ToolResult(call_id=call.id, output="", error=str(e))
 
     async def _execute_dispatched(self, tool: Tool, call: ToolCall) -> ToolResult:

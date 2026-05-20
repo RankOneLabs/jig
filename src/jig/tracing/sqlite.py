@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import logging
 import uuid
 from datetime import datetime
 from typing import Any
@@ -10,6 +11,8 @@ from typing import Any
 import aiosqlite
 
 from jig.core.types import Span, SpanKind, TracingLogger, Usage
+
+logger = logging.getLogger(__name__)
 
 
 def _default_serializer(obj: Any) -> Any:
@@ -143,6 +146,7 @@ class SQLiteTracer(TracingLogger):
         # Without the snapshot, iterating .values() while concurrent
         # tasks insert raises RuntimeError: dictionary changed size.
         pending = list(self._spans.values())
+        logger.debug("sqlite tracer flush start (pending=%d)", len(pending))
         for span in pending:
             await db.execute(
                 """INSERT OR REPLACE INTO spans
@@ -185,6 +189,10 @@ class SQLiteTracer(TracingLogger):
             for sid, s in self._spans.items()
             if s.ended_at is None or sid not in flushed_ids
         }
+        logger.debug(
+            "sqlite tracer flush done (persisted=%d, retained=%d)",
+            len(flushed_ids), len(self._spans),
+        )
 
     async def get_trace(self, trace_id: str) -> list[Span]:
         db = await self._get_db()

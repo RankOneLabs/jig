@@ -324,7 +324,9 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
             mem_span = config.tracer.start_span(
                 trace.id, SpanKind.MEMORY_QUERY, "retrieve", {"query": input}
             )
+            logger.debug("retriever.retrieve start (k=5)")
             memory_context = await config.retriever.retrieve(input, k=5)
+            logger.debug("retriever.retrieve done (hits=%d)", len(memory_context))
             # Span output carries retrieved-id scores so downstream
             # analytics can group "which retriever picked what?" without
             # replaying the corpus.
@@ -344,7 +346,9 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
             fb_span = config.tracer.start_span(
                 trace.id, SpanKind.MEMORY_QUERY, "query_feedback", {"query": input}
             )
+            logger.debug("feedback.get_signals start (limit=3, min_score=0.7)")
             feedback_signals = await config.feedback.get_signals(input, limit=3, min_score=0.7)
+            logger.debug("feedback.get_signals done (signals=%d)", len(feedback_signals))
             config.tracer.end_span(fb_span.id, [s.content[:100] for s in feedback_signals])
 
         # 5. Assemble messages (system prompt is separate, not in messages list)
@@ -401,7 +405,19 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
             )
 
             try:
+                logger.debug(
+                    "llm.complete start (call %d/%d, messages=%d, tools=%d)",
+                    total_usage["llm_calls"],
+                    config.max_llm_calls,
+                    len(messages),
+                    len(tools_for_llm) if tools_for_llm else 0,
+                )
                 response = await config.llm.complete(params)
+                logger.debug(
+                    "llm.complete done (latency_ms=%s, tool_calls=%d)",
+                    getattr(response, "latency_ms", "?"),
+                    len(response.tool_calls or []),
+                )
             except JigLLMError as e:
                 config.tracer.end_span(llm_span.id, None, error=str(e))
                 # Fast-fail only on known-permanent errors (auth, bad

@@ -12,11 +12,14 @@ Or wrap a client so every call is tallied automatically::
 """
 from __future__ import annotations
 
+import logging
 import math
 from typing import AsyncIterator
 
 from jig.core.errors import JigBudgetError
 from jig.core.types import CompletionParams, LLMClient, LLMResponse, Usage
+
+logger = logging.getLogger(__name__)
 
 
 class BudgetTracker:

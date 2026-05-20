@@ -13,6 +13,7 @@ land in phase 8 — for now, concurrency is local via ``asyncio.Semaphore``.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from collections import Counter
 from collections.abc import AsyncIterator, Sequence
@@ -22,6 +23,8 @@ from typing import Any
 
 from jig.core.runner import AgentConfig, AgentResult, run_agent
 from jig.core.types import EvalCase
+
+logger = logging.getLogger(__name__)
 
 _VALID_DISPATCH = frozenset({"smithers"})
 
@@ -315,16 +318,25 @@ async def sweep[T](
         asyncio.Queue(maxsize=concurrency)
     )
 
-    async def _worker() -> None:
+    async def _worker(worker_id: int) -> None:
         while True:
             item = await queue.get()
             if item is None:
+                logger.debug("sweep worker %d shutting down", worker_id)
                 queue.task_done()
                 return
             slot, case_idx, cfg_idx, seed_idx, case, cfg = item
             try:
                 input_text = _case_to_input(case)
+                logger.debug(
+                    "sweep worker %d dispatching slot=%d case=%d cfg=%s seed=%d",
+                    worker_id, slot, case_idx, cfg.name, seed_idx,
+                )
                 result = await run_agent(cfg, input_text)
+                logger.debug(
+                    "sweep worker %d completed slot=%d cfg=%s",
+                    worker_id, slot, cfg.name,
+                )
                 runs[slot] = SweepRun(
                     case_index=case_idx,
                     config_index=cfg_idx,
@@ -340,7 +352,11 @@ async def sweep[T](
         # Cap the worker count at the actual workload — spinning up
         # more workers than items just wastes scheduler overhead.
         n_workers = min(concurrency, total) if total > 0 else 0
-        workers = [asyncio.create_task(_worker()) for _ in range(n_workers)]
+        logger.debug(
+            "sweep starting: total=%d concurrency=%d workers=%d cases=%d configs=%d seeds=%d",
+            total, concurrency, n_workers, len(cases), len(configs), seeds,
+        )
+        workers = [asyncio.create_task(_worker(i)) for i in range(n_workers)]
         try:
             slot = 0
             for ci, case in enumerate(cases):

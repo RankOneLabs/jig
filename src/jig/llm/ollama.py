@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from typing import Any, AsyncIterator
@@ -16,6 +17,8 @@ from jig.core.types import (
     Usage,
 )
 from jig.llm._parsing import parse_tool_arguments
+
+logger = logging.getLogger(__name__)
 
 try:
     import ollama as _ollama

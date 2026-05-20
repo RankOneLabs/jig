@@ -17,11 +17,13 @@ rankings page (https://openrouter.ai/rankings). Both optional.
 """
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
 from jig.llm.openai import OpenAIClient
 
+logger = logging.getLogger(__name__)
 
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
