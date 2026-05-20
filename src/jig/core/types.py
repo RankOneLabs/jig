@@ -355,7 +355,14 @@ class TracingLogger(ABC):
     ) -> Span: ...
 
     @abstractmethod
-    def start_span(self, parent_id: str, kind: SpanKind, name: str, input: Any = None) -> Span: ...
+    def start_span(
+        self,
+        parent_id: str,
+        kind: SpanKind,
+        name: str,
+        input: Any = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Span: ...
 
     @abstractmethod
     def end_span(self, span_id: str, output: Any = None, error: str | None = None, usage: Usage | None = None) -> None: ...

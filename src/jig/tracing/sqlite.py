@@ -100,7 +100,12 @@ class SQLiteTracer(TracingLogger):
         return span
 
     def start_span(
-        self, parent_id: str, kind: SpanKind, name: str, input: Any = None
+        self,
+        parent_id: str,
+        kind: SpanKind,
+        name: str,
+        input: Any = None,
+        metadata: dict[str, Any] | None = None,
     ) -> Span:
         parent = self._spans.get(parent_id)
         trace_id = parent.trace_id if parent else parent_id
@@ -113,6 +118,7 @@ class SQLiteTracer(TracingLogger):
             started_at=datetime.now(),
             parent_id=parent_id,
             input=input,
+            metadata=metadata,
         )
         self._spans[span_id] = span
         return span

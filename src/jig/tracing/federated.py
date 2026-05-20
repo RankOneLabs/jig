@@ -237,9 +237,14 @@ class FederatedTracer(TracingLogger):
         return self._local.start_trace(name, metadata, kind)
 
     def start_span(
-        self, parent_id: str, kind: SpanKind, name: str, input: Any = None,  # noqa: A002
+        self,
+        parent_id: str,
+        kind: SpanKind,
+        name: str,
+        input: Any = None,  # noqa: A002
+        metadata: dict[str, Any] | None = None,
     ) -> Span:
-        return self._local.start_span(parent_id, kind, name, input)
+        return self._local.start_span(parent_id, kind, name, input, metadata)
 
     def end_span(
         self,

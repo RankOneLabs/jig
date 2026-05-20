@@ -87,8 +87,8 @@ class FakeTracer(TracingLogger):
         self.spans.append(s)
         return s
 
-    def start_span(self, parent_id, kind, name, input=None):
-        s = Span(id=f"s{len(self.spans)}", trace_id="t", kind=kind, name=name, started_at=datetime.now(), parent_id=parent_id, input=input)
+    def start_span(self, parent_id, kind, name, input=None, metadata=None):
+        s = Span(id=f"s{len(self.spans)}", trace_id="t", kind=kind, name=name, started_at=datetime.now(), parent_id=parent_id, input=input, metadata=metadata)
         self.spans.append(s)
         return s
 

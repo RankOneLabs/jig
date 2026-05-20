@@ -47,7 +47,8 @@ class FakeTracer(TracingLogger):
         return s
 
     def start_span(
-        self, parent_id: str, kind: SpanKind, name: str, input: Any = None
+        self, parent_id: str, kind: SpanKind, name: str, input: Any = None,
+        metadata: dict[str, Any] | None = None,
     ) -> Span:
         parent = next((s for s in self.spans if s.id == parent_id), None)
         trace_id = parent.trace_id if parent else parent_id
@@ -60,6 +61,7 @@ class FakeTracer(TracingLogger):
             started_at=datetime.now(),
             parent_id=parent_id,
             input=input,
+            metadata=metadata,
         )
         self.spans.append(s)
         return s
