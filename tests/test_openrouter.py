@@ -103,6 +103,66 @@ class TestOpenRouterComplete:
             }
             assert response.usage.cost == pytest.approx(0.00042)
 
+    async def test_empty_choices_raises_jig_llm_error(self, monkeypatch):
+        # OpenRouter has been observed returning 200 OK with ``choices=None``
+        # when the upstream provider errored after request acceptance.
+        # Previously this crashed with ``TypeError: 'NoneType' object is not
+        # subscriptable`` in ``response.choices[0]``, killing long sweeps.
+        # The adapter should now raise a retryable ``JigLLMError`` so the
+        # agent loop can recover.
+        from jig.core.errors import JigLLMError
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-x")
+        with patch("jig.llm.openai.openai") as mock_openai:
+            response = SimpleNamespace(
+                choices=None,
+                usage=SimpleNamespace(prompt_tokens=0, completion_tokens=0),
+                model="anthropic/claude-3.5-sonnet",
+                error={"message": "provider downstream timeout"},
+            )
+            instance = mock_openai.AsyncOpenAI.return_value
+            instance.chat.completions.create = AsyncMock(return_value=response)
+            mock_openai.RateLimitError = type(
+                "RateLimitError", (Exception,), {}
+            )
+
+            client = OpenRouterClient(model="anthropic/claude-3.5-sonnet")
+            params = CompletionParams(
+                messages=[Message(role=Role.USER, content="hi")]
+            )
+            with pytest.raises(JigLLMError) as exc:
+                await client.complete(params)
+            assert exc.value.provider == "openrouter"
+            assert exc.value.retryable is True
+            assert "provider downstream timeout" in str(exc.value)
+
+    async def test_empty_choices_list_raises_jig_llm_error(self, monkeypatch):
+        # Same as above but with ``choices=[]`` (IndexError shape rather than
+        # TypeError shape). Both should funnel into the same JigLLMError.
+        from jig.core.errors import JigLLMError
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-x")
+        with patch("jig.llm.openai.openai") as mock_openai:
+            response = SimpleNamespace(
+                choices=[],
+                usage=SimpleNamespace(prompt_tokens=0, completion_tokens=0),
+                model="anthropic/claude-3.5-sonnet",
+            )
+            instance = mock_openai.AsyncOpenAI.return_value
+            instance.chat.completions.create = AsyncMock(return_value=response)
+            mock_openai.RateLimitError = type(
+                "RateLimitError", (Exception,), {}
+            )
+
+            client = OpenRouterClient(model="anthropic/claude-3.5-sonnet")
+            params = CompletionParams(
+                messages=[Message(role=Role.USER, content="hi")]
+            )
+            with pytest.raises(JigLLMError) as exc:
+                await client.complete(params)
+            assert exc.value.provider == "openrouter"
+            assert exc.value.retryable is True
+
     async def test_provider_label_on_error(self, monkeypatch):
         from jig.core.errors import JigLLMError
 
