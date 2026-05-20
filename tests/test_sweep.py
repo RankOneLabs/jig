@@ -292,6 +292,23 @@ class TestSweep:
         empty_b = await sweep(["x"], [], concurrency=4)
         assert empty_b.runs == []
 
+    async def test_worker_pool_emits_debug_breadcrumbs(self, caplog):
+        """The sweep worker pool must log DEBUG breadcrumbs at dispatch
+        and completion. This is the regression guard for the silent-
+        wedge scenario: when a worker hangs mid-run-agent, the operator
+        needs to see *which* slot/config is in flight without attaching
+        a debugger to the container.
+        """
+        import logging as _logging
+
+        with caplog.at_level(_logging.DEBUG, logger="jig.sweep"):
+            await sweep(["c0", "c1"], [_config("a")], concurrency=2)
+
+        messages = [r.getMessage() for r in caplog.records if r.name == "jig.sweep"]
+        assert any("sweep starting" in m for m in messages), messages
+        assert any("dispatching" in m for m in messages), messages
+        assert any("completed" in m for m in messages), messages
+
 
 @pytest.mark.asyncio
 class TestSweepErrorCounting:

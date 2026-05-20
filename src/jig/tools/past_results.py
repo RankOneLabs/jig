@@ -6,9 +6,12 @@ is the pattern this generalizes.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from jig.core.types import FeedbackLoop, FeedbackQuery, Tool, ToolDefinition
+
+logger = logging.getLogger(__name__)
 
 
 class PastResults(Tool):

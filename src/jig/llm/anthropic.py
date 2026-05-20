@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any, AsyncIterator
 
@@ -16,6 +17,8 @@ from jig.core.types import (
     Usage,
 )
 from jig.llm.pricing import stamp_cost
+
+logger = logging.getLogger(__name__)
 
 try:
     import anthropic

@@ -288,9 +288,11 @@ class DenseRetriever(Retriever):
         k: int = 5,
         context: dict[str, Any] | None = None,
     ) -> list[MemoryEntry]:
+        logger.debug("memory.retrieve start (k=%d, has_filter=%s)", k, bool((context or {}).get("filter")))
         query_emb = await self._embed(query)
         query_norm = float(np.linalg.norm(query_emb))
         if query_norm == 0:
+            logger.debug("memory.retrieve early-return: zero-norm query embedding")
             return []
 
         # Optional metadata filter, passed via context for experimentation
@@ -310,7 +312,9 @@ class DenseRetriever(Retriever):
             scored.append((sim, entry))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [entry for _, entry in scored[:k]]
+        result = [entry for _, entry in scored[:k]]
+        logger.debug("memory.retrieve done (candidates=%d, returned=%d)", len(scored), len(result))
+        return result
 
 
 def LocalMemory(
