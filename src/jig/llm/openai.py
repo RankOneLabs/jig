@@ -137,6 +137,39 @@ class OpenAIClient(LLMClient):
             raise JigLLMError(str(e), self._provider_label, status_code=status) from e
 
         latency_ms = (time.time() - start) * 1000
+
+        if not response.choices:
+            # Gateways (notably OpenRouter) sometimes return 200 OK with a
+            # null/empty ``choices`` array when the upstream provider
+            # errored after the request was accepted. Surface the response's
+            # ``error`` payload if present and mark retryable — these are
+            # typically transient and the agent loop should try again rather
+            # than crash with TypeError on ``choices[0]``.
+            #
+            # The OpenAI SDK's pydantic model for ChatCompletion doesn't
+            # declare an ``error`` field, so OpenRouter's payload lands in
+            # ``response.model_extra`` rather than as a real attribute —
+            # mirror the ``usage.cost`` handling in OpenRouterClient and
+            # check both locations.
+            err = getattr(response, "error", None)
+            if err is None:
+                extra = getattr(response, "model_extra", None) or {}
+                err = extra.get("error")
+            detail = ""
+            if err is not None:
+                err_msg = None
+                if isinstance(err, dict):
+                    err_msg = err.get("message")
+                else:
+                    err_msg = getattr(err, "message", None)
+                if err_msg:
+                    detail = f": {err_msg}"
+            raise JigLLMError(
+                f"upstream returned no choices{detail}",
+                self._provider_label,
+                retryable=True,
+            )
+
         choice = response.choices[0].message
 
         tool_calls: list[ToolCall] | None = None
