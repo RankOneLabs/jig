@@ -224,8 +224,27 @@ def _serialize_config_snapshot(config: AgentConfig[Any]) -> dict[str, Any]:
         # gets dropped to ``null`` by _safe_json), so stamp the model
         # slug alongside it. Every shipped adapter sets ``self._model``;
         # custom adapters that don't will just record None.
-        "model_id": getattr(config.llm, "_model", None),
+        "model_id": _resolve_model_id(config.llm),
     }
+
+
+def _resolve_model_id(client: LLMClient | None) -> str | None:
+    """Walk past LLMClient wrappers (e.g. BudgetedLLMClient) to find ``_model``.
+
+    Wrappers store the wrapped client at ``_inner`` by convention. Without
+    this unwrap, traces record ``model_id=None`` whenever a budget tracker
+    or similar decorator sits in front of the real adapter — exactly the
+    observability hole this stamping is meant to close.
+    """
+    seen: set[int] = set()
+    current: Any = client
+    while current is not None and id(current) not in seen:
+        model = getattr(current, "_model", None)
+        if model is not None:
+            return model
+        seen.add(id(current))
+        current = getattr(current, "_inner", None)
+    return None
 
 
 async def _finalize_trace(
@@ -373,7 +392,7 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                 trace.id,
                 SpanKind.LLM_CALL,
                 "completion",
-                metadata={"model": getattr(config.llm, "_model", None)},
+                metadata={"model": _resolve_model_id(config.llm)},
             )
             params = CompletionParams(
                 messages=messages,

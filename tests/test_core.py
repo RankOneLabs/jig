@@ -228,6 +228,34 @@ async def test_model_recorded_on_failed_llm_call():
     assert llm_spans[0].error is not None  # the failure is recorded too
 
 
+async def test_model_recorded_through_wrapped_llm_client():
+    # Real callers wrap the LLM with BudgetedLLMClient (and other decorators
+    # that follow the ``_inner`` convention). Without unwrapping, the trace
+    # records ``model_id=None`` — exactly the gap this PR closes.
+    from jig.budget import BudgetedLLMClient, BudgetTracker
+
+    inner = FakeLLM([
+        LLMResponse(content="ok", tool_calls=None, usage=Usage(1, 1), latency_ms=1, model="fake"),
+    ])
+    inner._model = "openrouter/qwen/qwen3-coder"
+    wrapped = BudgetedLLMClient(inner, BudgetTracker(limit_usd=1.0))
+
+    tracer = FakeTracer()
+    await run_agent(
+        AgentConfig(
+            name="t", description="d", system_prompt="s",
+            llm=wrapped, store=FakeMemory(), retriever=None,
+            feedback=FakeFeedback(), tracer=tracer, tools=ToolRegistry(),
+        ),
+        "hi",
+    )
+
+    trace_spans = [s for s in tracer.spans if s.kind == SpanKind.AGENT_RUN]
+    assert trace_spans[0].metadata["config"]["model_id"] == "openrouter/qwen/qwen3-coder"
+    llm_spans = [s for s in tracer.spans if s.kind == SpanKind.LLM_CALL]
+    assert llm_spans[0].metadata == {"model": "openrouter/qwen/qwen3-coder"}
+
+
 async def test_tool_loop():
     llm = FakeLLM([
         LLMResponse(

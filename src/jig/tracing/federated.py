@@ -244,7 +244,9 @@ class FederatedTracer(TracingLogger):
         input: Any = None,  # noqa: A002
         metadata: dict[str, Any] | None = None,
     ) -> Span:
-        return self._local.start_span(parent_id, kind, name, input, metadata)
+        return self._local.start_span(
+            parent_id, kind, name, input=input, metadata=metadata
+        )
 
     def end_span(
         self,
