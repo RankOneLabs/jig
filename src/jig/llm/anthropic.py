@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from typing import Any, AsyncIterator
 
 from jig.core.errors import JigLLMError
@@ -16,6 +15,7 @@ from jig.core.types import (
     ToolDefinition,
     Usage,
 )
+from jig.llm._common import merge_completion_kwargs, start_timer, wrap_llm_error
 from jig.llm.pricing import stamp_cost
 
 logger = logging.getLogger(__name__)
@@ -100,12 +100,9 @@ class AnthropicClient(LLMClient):
             kwargs["system"] = params.system
         if params.tools:
             kwargs["tools"] = self._convert_tools(params.tools)
-        if params.temperature is not None:
-            kwargs["temperature"] = params.temperature
-        if params.provider_params:
-            kwargs.update(params.provider_params)
+        merge_completion_kwargs(kwargs, params)
 
-        start = time.time()
+        timer = start_timer()
 
         async def _call() -> Any:
             return await self._client.messages.create(**kwargs)
@@ -118,10 +115,9 @@ class AnthropicClient(LLMClient):
         try:
             response = await with_retry(_call, max_attempts=3, retryable=_retryable)
         except Exception as e:
-            status = getattr(e, "status_code", None)
-            raise JigLLMError(str(e), "anthropic", status_code=status) from e
+            raise wrap_llm_error(e, "anthropic") from e
 
-        latency_ms = (time.time() - start) * 1000
+        latency_ms = timer()
 
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
@@ -157,10 +153,7 @@ class AnthropicClient(LLMClient):
             kwargs["system"] = params.system
         if params.tools:
             kwargs["tools"] = self._convert_tools(params.tools)
-        if params.temperature is not None:
-            kwargs["temperature"] = params.temperature
-        if params.provider_params:
-            kwargs.update(params.provider_params)
+        merge_completion_kwargs(kwargs, params)
 
         async with self._client.messages.stream(**kwargs) as stream:
             async for text in stream.text_stream:

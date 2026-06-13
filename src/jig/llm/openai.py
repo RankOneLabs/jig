@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 from typing import Any, AsyncIterator
 
 from jig.core.errors import JigLLMError
@@ -15,6 +14,12 @@ from jig.core.types import (
     ToolCall,
     ToolDefinition,
     Usage,
+)
+from jig.llm._common import (
+    merge_completion_kwargs,
+    openai_tool_payload,
+    start_timer,
+    wrap_llm_error,
 )
 from jig.llm._parsing import parse_tool_arguments
 from jig.llm.pricing import stamp_cost
@@ -95,17 +100,7 @@ class OpenAIClient(LLMClient):
         return messages
 
     def _convert_tools(self, tools: list[ToolDefinition]) -> list[dict[str, Any]]:
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.parameters,
-                },
-            }
-            for t in tools
-        ]
+        return openai_tool_payload(tools)
 
     async def complete(self, params: CompletionParams) -> LLMResponse:
         messages = self._convert_messages(params)
@@ -115,15 +110,10 @@ class OpenAIClient(LLMClient):
         }
         if params.tools:
             kwargs["tools"] = self._convert_tools(params.tools)
-        if params.temperature is not None:
-            kwargs["temperature"] = params.temperature
-        if params.max_tokens is not None:
-            kwargs["max_tokens"] = params.max_tokens
-        if params.provider_params:
-            kwargs.update(params.provider_params)
+        merge_completion_kwargs(kwargs, params)
         self._apply_extra_kwargs(kwargs)
 
-        start = time.time()
+        timer = start_timer()
         logger.debug(
             "%s.complete request model=%s messages=%d tools=%d",
             self._provider_label, self._model, len(messages),
@@ -141,14 +131,14 @@ class OpenAIClient(LLMClient):
         try:
             response = await with_retry(_call, max_attempts=3, retryable=_retryable)
         except Exception as e:
-            status = getattr(e, "status_code", None)
+            err = wrap_llm_error(e, self._provider_label)
             logger.debug(
                 "%s.complete failed model=%s status=%s err=%s",
-                self._provider_label, self._model, status, e,
+                self._provider_label, self._model, err.status_code, e,
             )
-            raise JigLLMError(str(e), self._provider_label, status_code=status) from e
+            raise err from e
 
-        latency_ms = (time.time() - start) * 1000
+        latency_ms = timer()
         logger.debug(
             "%s.complete response model=%s latency_ms=%.0f choices=%d",
             self._provider_label, self._model, latency_ms,
@@ -225,12 +215,7 @@ class OpenAIClient(LLMClient):
         }
         if params.tools:
             kwargs["tools"] = self._convert_tools(params.tools)
-        if params.temperature is not None:
-            kwargs["temperature"] = params.temperature
-        if params.max_tokens is not None:
-            kwargs["max_tokens"] = params.max_tokens
-        if params.provider_params:
-            kwargs.update(params.provider_params)
+        merge_completion_kwargs(kwargs, params)
         self._apply_extra_kwargs(kwargs)
 
         response = await self._client.chat.completions.create(**kwargs)

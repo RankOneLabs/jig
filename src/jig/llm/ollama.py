@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import time
 import uuid
 from typing import Any, AsyncIterator
 
@@ -16,6 +15,7 @@ from jig.core.types import (
     ToolDefinition,
     Usage,
 )
+from jig.llm._common import start_timer
 from jig.llm._parsing import parse_tool_arguments
 
 logger = logging.getLogger(__name__)
@@ -77,7 +77,7 @@ class OllamaClient(LLMClient):
         if options:
             kwargs["options"] = options
 
-        start = time.time()
+        timer = start_timer()
 
         async def _call() -> Any:
             return await self._client.chat(**kwargs)
@@ -94,7 +94,7 @@ class OllamaClient(LLMClient):
                 raise JigLLMError(str(e), "ollama") from e
             raise
 
-        latency_ms = (time.time() - start) * 1000
+        latency_ms = timer()
 
         # ollama-python >= 0.4 returns a typed ``ChatResponse`` pydantic
         # model. We require that floor (see pyproject's
