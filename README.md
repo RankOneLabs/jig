@@ -184,9 +184,17 @@ CompletionParams(
 ```
 src/jig/
 ├── core/           # types, runner, pipeline, errors, retry, prompt builder
-├── llm/            # anthropic, openai, ollama adapters
+├── llm/            # anthropic, openai, openrouter, google, ollama, dispatch adapters
 ├── memory/         # local (sqlite+embeddings), honcho, zep
 ├── feedback/       # feedback loop, llm judge, heuristic, ground truth, composite
-├── tracing/        # sqlite tracer, stdout tracer
-└── tools/          # registry + common tools
+├── tracing/        # sqlite tracer, stdout tracer, federated tracer
+├── tools/          # registry + common tools
+├── dispatch/       # dispatch client and callback listener
+├── observability/  # structured logging helpers
+├── eval/           # eval datasets and calibration
+├── replay/         # replay runner, diff, snapshot
+├── budget.py       # budget tracking
+├── sweep.py        # compare and sweep
+├── sweep_stats.py  # sweep result aggregation
+└── regression.py   # regression testing
 ```
