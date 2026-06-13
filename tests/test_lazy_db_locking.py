@@ -46,7 +46,7 @@ def _make_fake_connect_factory() -> tuple[Any, list[Any]]:
 async def test_sqlite_tracer_get_db_is_single_flight(tmp_path: Any) -> None:
     fake_connect, created = _make_fake_connect_factory()
     tracer = SQLiteTracer(db_path=str(tmp_path / "t.db"))
-    with patch("jig.tracing.sqlite.aiosqlite.connect", side_effect=fake_connect):
+    with patch("jig._sqlite.aiosqlite.connect", side_effect=fake_connect):
         # 8 concurrent first-callers — pre-fix all 8 would race past
         # ``self._db is None`` before any connect resolved.
         results = await asyncio.gather(*[tracer._get_db() for _ in range(8)])
@@ -59,7 +59,7 @@ async def test_sqlite_tracer_get_db_is_single_flight(tmp_path: Any) -> None:
 async def test_sqlite_store_get_db_is_single_flight(tmp_path: Any) -> None:
     fake_connect, created = _make_fake_connect_factory()
     store = SqliteStore(db_path=str(tmp_path / "m.db"))
-    with patch("jig.memory.local.aiosqlite.connect", side_effect=fake_connect):
+    with patch("jig._sqlite.aiosqlite.connect", side_effect=fake_connect):
         results = await asyncio.gather(*[store._get_db() for _ in range(8)])
 
     assert len(created) == 1, f"expected 1 connect call, got {len(created)}"
@@ -70,7 +70,7 @@ async def test_sqlite_store_get_db_is_single_flight(tmp_path: Any) -> None:
 async def test_feedback_loop_get_db_is_single_flight(tmp_path: Any) -> None:
     fake_connect, created = _make_fake_connect_factory()
     feedback = SQLiteFeedbackLoop(db_path=str(tmp_path / "f.db"))
-    with patch("jig.feedback.loop.aiosqlite.connect", side_effect=fake_connect):
+    with patch("jig._sqlite.aiosqlite.connect", side_effect=fake_connect):
         results = await asyncio.gather(*[feedback._get_db() for _ in range(8)])
 
     assert len(created) == 1, f"expected 1 connect call, got {len(created)}"
