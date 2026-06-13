@@ -1,3 +1,5 @@
+> Internal/historical planning note. Not part of the public documentation set.
+
 # Phase 12 plan — ta capstone migration
 
 **Goal.** Ta's researcher agents migrate from their fork of pre-phase-0
