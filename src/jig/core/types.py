@@ -132,6 +132,7 @@ class FeedbackQuery:
     min_score: float | None = None
     max_age: timedelta | None = None
     limit: int = 10
+    source: ScoreSource | None = None
 
     def __post_init__(self) -> None:
         # Reject bool explicitly: ``bool`` is an ``int`` subclass so

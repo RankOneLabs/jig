@@ -113,69 +113,8 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         min_score: float | None = None,
         source: ScoreSource | None = None,
     ) -> list[ScoredResult]:
-        db = await self._get_db()
-        query_emb = await self._embed(query)
-        query_norm = float(np.linalg.norm(query_emb))
-        if query_norm == 0:
-            return []
-
-        cursor = await db.execute(
-            "SELECT id, content, input, metadata, embedding, created_at FROM results"
-        )
-        rows = await cursor.fetchall()
-
-        candidates: list[tuple[float, str, str, dict[str, Any], datetime]] = []
-        for row in rows:
-            rid, content, inp, meta_json, emb_bytes, created_str = row
-            if not emb_bytes:
-                continue
-            row_emb = np.frombuffer(emb_bytes, dtype=np.float32)
-            row_norm = float(np.linalg.norm(row_emb))
-            if row_norm == 0:
-                continue
-            sim = float(np.dot(query_emb, row_emb) / (query_norm * row_norm))
-            candidates.append(
-                (sim, rid, content, json.loads(meta_json), datetime.fromisoformat(created_str))
-            )
-
-        candidates.sort(key=lambda x: x[0], reverse=True)
-
-        results: list[ScoredResult] = []
-        for sim, rid, content, meta, created in candidates[:limit * 2]:
-            score_cursor = await db.execute(
-                "SELECT dimension, value, source FROM scores WHERE result_id = ?", (rid,)
-            )
-            score_rows = await score_cursor.fetchall()
-            scores = [
-                Score(dimension=d, value=v, source=ScoreSource(s))
-                for d, v, s in score_rows
-            ]
-            if not scores:
-                continue
-
-            if source:
-                scores = [s for s in scores if s.source == source]
-                if not scores:
-                    continue
-
-            avg = sum(s.value for s in scores) / len(scores)
-            if min_score is not None and avg < min_score:
-                continue
-
-            results.append(
-                ScoredResult(
-                    result_id=rid,
-                    content=content,
-                    scores=scores,
-                    avg_score=avg,
-                    metadata=meta,
-                    created_at=created,
-                )
-            )
-            if len(results) >= limit:
-                break
-
-        return results
+        q = FeedbackQuery(similar_to=query, limit=limit, min_score=min_score, source=source)
+        return await self.query(q)
 
     async def query(self, q: FeedbackQuery) -> list[ScoredResult]:
         """Similarity + metadata filter search.
@@ -278,6 +217,10 @@ class SQLiteFeedbackLoop(FeedbackLoop):
             scores = scores_by_rid.get(rid, [])
             if not scores:
                 continue
+            if q.source is not None:
+                scores = [s for s in scores if s.source == q.source]
+                if not scores:
+                    continue
             avg = sum(s.value for s in scores) / len(scores)
             if q.min_score is not None and avg < q.min_score:
                 continue
