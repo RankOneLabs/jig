@@ -1,5 +1,7 @@
 # Dispatch
 
+> **Advanced / optional.** Core jig usage (polling via `DispatchClient` or `dispatch_run`) works without any extra setup. The callback listener is an optional performance optimisation — it requires the `callback` extra (`pip install 'jig[callback]'`) and a process that can receive inbound HTTP from your worker network.
+
 jig submits deterministic functions (`jig.dispatch.run`) and LLM
 inference (`jig.llm.DispatchClient`) to [smithers] workers. Two wait
 strategies are available:
@@ -73,9 +75,9 @@ polling cost on that call.
 
 The shared-secret token in the URL query string is not HMAC-grade.
 The threat model is accidental callback crossing between jig
-processes on the same network, not an active attacker on Tailscale.
-Smithers delivers callbacks over plain HTTP to Tailscale hostnames —
-the same trust assumptions as the rest of the dispatch protocol.
+processes on the same trusted network, not an active attacker.
+Smithers delivers callbacks over plain HTTP to the configured worker
+hostnames.
 
 ## Tracing
 
