@@ -10,10 +10,11 @@ comparable, and debuggable.
 
 - `jig.llm.from_model()` routes to any adapter — Anthropic, OpenAI,
   OpenRouter, Google, Ollama, or a remote dispatch fleet.
-- `jig.compare(input, configs)` runs one input against N configs in
-  parallel. `jig.sweep(cases, configs)` covers the full case × config
-  grid. `SweepResult.rollup()` aggregates per-config scores, latency,
-  cost, and error breakdown.
+- `await jig.compare(input, configs)` runs one input against N configs
+  (concurrently when `concurrency > 1`). `await jig.sweep(cases,
+  configs)` covers the full case × config grid.
+  `SweepResult.rollup()` aggregates per-config scores, latency, cost,
+  and error breakdown.
 - Per-call pricing and budget tracking are automatic across all
   adapters.
 
@@ -30,18 +31,20 @@ comparable, and debuggable.
 
 - Quality scores from past runs feed back into the prompt
   automatically via `FeedbackLoop`.
-- `feedback.export_eval_set()` exports promptfoo-compatible test cases
-  for batch evaluation.
+- `await feedback.export_eval_set()` exports promptfoo-compatible test
+  cases for batch evaluation.
 
 **Trace and replay agent runs**
 
 - Every run produces a structured trace: LLM calls, tool executions,
   memory queries, grading steps — all as queryable spans.
-- `jig.replay(trace_id, config_override)` reruns an agent with a
-  different config while holding recorded tool outputs constant.
-  Isolates the model variable without re-running expensive tool calls.
-- `jig.trace_diff(trace_a, trace_b)` produces a structured diff:
-  which tools were called differently, score deltas, cost deltas.
+- `jig.replay` reruns a recorded agent trace with a different config
+  while holding the recorded tool outputs constant — requires a
+  `tracer`, `llm`, and `feedback` instance. Isolates the model
+  variable without re-running expensive tool calls.
+- `jig.trace_diff` produces a structured diff between two recorded
+  traces (requires a `tracer` instance): which tools were called
+  differently, score deltas, cost deltas.
 
 **Optional distributed dispatch**
 
