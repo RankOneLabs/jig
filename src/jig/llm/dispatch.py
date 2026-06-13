@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-import time
 import uuid
 from typing import Any
 
@@ -28,6 +27,7 @@ from jig.core.types import (
     TraceContext,
     Usage,
 )
+from jig.llm._common import merge_completion_kwargs, start_timer
 from jig.dispatch.client import (
     DispatchError,
     JobTimeoutError,
@@ -217,17 +217,12 @@ class DispatchClient(LLMClient):
         payload: dict[str, Any] = {"messages": messages}
         if params.tools:
             payload["tools"] = _tools_payload(params.tools)
-        if params.temperature is not None:
-            payload["temperature"] = params.temperature
-        if params.max_tokens is not None:
-            payload["max_tokens"] = params.max_tokens
-        if params.provider_params:
-            payload.update(params.provider_params)
+        merge_completion_kwargs(payload, params)
         return payload
 
     async def complete(self, params: CompletionParams) -> LLMResponse:
         payload = self._build_payload(params)
-        start = time.time()
+        timer = start_timer()
         try:
             data = await _submit_and_poll(
                 http=self._http,
@@ -256,7 +251,7 @@ class DispatchClient(LLMClient):
                 str(e), "dispatch", retryable=e.retryable,
             ) from e
 
-        latency_ms = (time.time() - start) * 1000
+        latency_ms = timer()
         result = data.get("result") or {}
         content = result.get("content", "")
         model = data.get("model") or self._model or "dispatch"
