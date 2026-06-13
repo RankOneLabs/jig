@@ -324,6 +324,8 @@ The model that powers the agent. One adapter per provider.
 |---------|----------|--------------|-------|
 | `AnthropicClient` | Anthropic Messages API | `anthropic` | Sonnet, Opus, Haiku |
 | `OpenAIClient` | OpenAI Chat Completions | `openai` | GPT-4, GPT-5, o-series |
+| `OpenRouterClient` | OpenRouter | `openrouter` | Hundreds of models behind one OpenAI-compatible endpoint (vendor-namespaced slugs like anthropic/claude-3.5-sonnet); per-call cost read from the response. |
+| `GeminiClient` | Google Gemini | `google` | Google Gemini models via the google-genai SDK. |
 | `OllamaClient` | Ollama (local) | `ollama` | Any model on your hardware. Cost is always `None`. |
 | `DispatchClient` | Smithers dispatch (fleet) | _(core)_ | Routes inference to homelab GPU workers via smithers. |
 
