@@ -7,10 +7,10 @@ A jig holds the pieces while you work on them. It doesn't have opinions about yo
 ## Install
 
 ```bash
-uv add jig                          # core only
-uv add 'jig[anthropic]'             # + Anthropic adapter
-uv add 'jig[ollama]'                # + Ollama adapter (homelab)
-uv add 'jig[all]'                   # everything
+uv add 'jig @ git+https://github.com/rankonelabs/jig.git'                          # core only
+uv add 'jig[anthropic] @ git+https://github.com/rankonelabs/jig.git'               # + Anthropic adapter
+uv add 'jig[ollama] @ git+https://github.com/rankonelabs/jig.git'                  # + Ollama adapter
+uv add 'jig[all] @ git+https://github.com/rankonelabs/jig.git'                     # everything
 ```
 
 ## Quick start
