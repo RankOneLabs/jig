@@ -58,7 +58,9 @@ Package manager: uv
 # ollama = ["ollama>=0.4"]
 # honcho = ["honcho>=0.1"]
 # zep = ["zep-python>=2.0"]
-# all = ["jig[anthropic,openai,openrouter,google,ollama,honcho,zep]"]
+# callback = ["aiohttp>=3.9"]
+# eval = ["pyyaml>=6.0"]
+# all = ["jig[anthropic,openai,openrouter,google,ollama,honcho,zep,callback,eval]"]
 # ============================================================
 
 
