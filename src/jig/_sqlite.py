@@ -39,12 +39,21 @@ class LazyConnection:
             if self._db is None:
                 self._db = await aiosqlite.connect(self._db_path)
                 await self._db.executescript(self._schema)
+        assert self._db is not None
         return self._db
 
     async def close(self) -> None:
-        if self._db is not None:
-            await self._db.close()
-            self._db = None
+        # Acquire the lock so close() cannot race with an in-flight get():
+        # without this, close() could see _db=None, no-op, and the connect
+        # completing in get() would leave the connection open permanently.
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
+            if self._db is not None:
+                await self._db.close()
+                self._db = None
+        # Reset the lock so re-use after close() works across event loops.
+        self._lock = None
 
 
 def json_dumps(obj: Any) -> str:

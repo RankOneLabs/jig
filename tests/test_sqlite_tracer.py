@@ -106,15 +106,15 @@ async def test_flush_with_non_serializable_object(tracer: SQLiteTracer) -> None:
 
 
 @pytest.mark.asyncio
-async def test_close_flushes_remaining_spans(tracer: SQLiteTracer) -> None:
+async def test_close_flushes_remaining_spans(tracer: SQLiteTracer, tmp_path: Any) -> None:
     """close() flushes before closing the DB."""
     span = tracer.start_trace("pipeline", kind=SpanKind.PIPELINE_RUN)
     tracer.end_span(span.id, output="done")
 
     await tracer.close()
 
-    # Reopen to verify data was persisted
-    tracer2 = SQLiteTracer(db_path=tracer._conn._db_path)
+    # Reopen to verify data was persisted — path matches the tracer fixture
+    tracer2 = SQLiteTracer(db_path=str(tmp_path / "test_traces.db"))
     spans = await tracer2.get_trace(span.trace_id)
     assert len(spans) == 1
     assert spans[0].output == "done"
