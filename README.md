@@ -202,5 +202,5 @@ src/jig/
 ## Contributing
 
 ```bash
-uv run --extra dev pytest
+uv run --extra dev --extra callback pytest
 ```
