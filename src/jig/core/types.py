@@ -132,6 +132,9 @@ class FeedbackQuery:
     min_score: float | None = None
     max_age: timedelta | None = None
     limit: int = 10
+    # When set, only scores from this source are considered per result;
+    # results whose filtered score list is empty are dropped entirely.
+    source: ScoreSource | None = None
 
     def __post_init__(self) -> None:
         # Reject bool explicitly: ``bool`` is an ``int`` subclass so
