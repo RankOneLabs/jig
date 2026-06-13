@@ -114,7 +114,7 @@ async def test_close_flushes_remaining_spans(tracer: SQLiteTracer) -> None:
     await tracer.close()
 
     # Reopen to verify data was persisted
-    tracer2 = SQLiteTracer(db_path=tracer._db_path)
+    tracer2 = SQLiteTracer(db_path=tracer._conn._db_path)
     spans = await tracer2.get_trace(span.trace_id)
     assert len(spans) == 1
     assert spans[0].output == "done"

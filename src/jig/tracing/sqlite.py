@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import json
 import logging
@@ -10,6 +9,7 @@ from typing import Any
 
 import aiosqlite
 
+from jig._sqlite import LazyConnection, json_loads
 from jig.core.types import Span, SpanKind, TracingLogger, Usage
 
 logger = logging.getLogger(__name__)
@@ -59,26 +59,11 @@ CREATE INDEX IF NOT EXISTS idx_spans_kind ON spans(kind);
 
 class SQLiteTracer(TracingLogger):
     def __init__(self, db_path: str = "jig_traces.db"):
-        self._db_path = db_path
-        self._db: aiosqlite.Connection | None = None
         self._spans: dict[str, Span] = {}
-        # Constructed lazily inside _get_db() so the lock binds to the
-        # event loop that's actually running, not whatever loop existed
-        # (or didn't) at __init__ time.
-        self._db_lock: asyncio.Lock | None = None
+        self._conn = LazyConnection(db_path, _SCHEMA)
 
     async def _get_db(self) -> aiosqlite.Connection:
-        if self._db is not None:
-            return self._db
-        if self._db_lock is None:
-            self._db_lock = asyncio.Lock()
-        async with self._db_lock:
-            # Re-check after acquiring — another waiter may have
-            # initialized the connection while we blocked on the lock.
-            if self._db is None:
-                self._db = await aiosqlite.connect(self._db_path)
-                await self._db.executescript(_SCHEMA)
-        return self._db
+        return await self._conn.get()
 
     def _insert_span_sync(self, span: Span) -> None:
         self._spans[span.id] = span
@@ -241,17 +226,15 @@ class SQLiteTracer(TracingLogger):
             name=name,
             started_at=datetime.fromisoformat(started),
             parent_id=parent_id,
-            input=json.loads(inp) if isinstance(inp, str) else inp,
-            output=json.loads(out) if isinstance(out, str) else out,
+            input=json_loads(inp) if isinstance(inp, str) else inp,
+            output=json_loads(out) if isinstance(out, str) else out,
             ended_at=datetime.fromisoformat(ended) if ended else None,
             duration_ms=duration,
-            metadata=json.loads(meta) if isinstance(meta, str) else meta,
+            metadata=json_loads(meta) if isinstance(meta, str) else meta,
             error=error,
             usage=usage,
         )
 
     async def close(self) -> None:
         await self.flush()
-        if self._db:
-            await self._db.close()
-            self._db = None
+        await self._conn.close()
