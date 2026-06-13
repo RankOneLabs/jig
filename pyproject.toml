@@ -1,14 +1,38 @@
 [project]
 name = "jig"
 version = "0.1.0"
-description = "Rank One Labs Agent Framework — five interfaces, one run function, everything swappable"
+description = "Minimal agent framework — five interfaces, one run function, everything swappable."
+readme = "README.md"
+license = "MIT"
+authors = [
+    {name = "Rank One Labs"},
+]
+maintainers = [
+    {name = "Rank One Labs"},
+]
 requires-python = ">=3.12"
+keywords = ["agent", "llm", "framework", "orchestration", "tracing", "evaluation", "ai"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
 dependencies = [
     "httpx>=0.27",
     "aiosqlite>=0.20",
     "pydantic>=2.0",
     "numpy>=1.26",
 ]
+
+[project.urls]
+Repository = "https://github.com/rankonelabs/jig"
+Issues = "https://github.com/rankonelabs/jig/issues"
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40"]
