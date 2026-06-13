@@ -15,8 +15,8 @@ comparable, and debuggable.
   configs)` covers the full case × config grid.
   `SweepResult.rollup()` aggregates per-config scores, latency, cost,
   and error breakdown.
-- Per-call pricing and budget tracking are automatic across all
-  adapters.
+- Per-call pricing is automatic across adapters; budgets can be
+  enforced via `BudgetTracker` / `BudgetedLLMClient`.
 
 **Typed agent outputs**
 
