@@ -15,6 +15,8 @@ uv add 'jig[all]'                   # everything
 
 ## Quick start
 
+These examples require `jig[anthropic,ollama]` (or `jig[all]`).
+
 Smallest runnable agent — no memory:
 
 ```python

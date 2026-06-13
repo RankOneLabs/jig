@@ -32,6 +32,8 @@ dependencies = [
 
 ## Quick start — agent
 
+These examples require `jig[anthropic,ollama]` (or `jig[all]`). SQLite files are written to the current directory.
+
 Smallest runnable agent — no memory:
 
 ```python
@@ -47,8 +49,8 @@ config = AgentConfig(
     description="Does a thing",
     system_prompt="You are a helpful agent that does the thing.",
     llm=AnthropicClient(model="claude-sonnet-4-20250514"),
-    feedback=SQLiteFeedbackLoop(db_path="./data/feedback.db"),
-    tracer=SQLiteTracer(db_path="./data/traces.db"),
+    feedback=SQLiteFeedbackLoop(),
+    tracer=SQLiteTracer(),
     tools=ToolRegistry(),
 )
 
@@ -67,7 +69,7 @@ from jig.feedback import SQLiteFeedbackLoop
 from jig.tracing import SQLiteTracer
 from jig.tools import ToolRegistry
 
-store, retriever = LocalMemory(db_path="./data/memory.db")
+store, retriever = LocalMemory()
 
 config = AgentConfig(
     name="my-agent",
@@ -76,8 +78,8 @@ config = AgentConfig(
     llm=AnthropicClient(model="claude-sonnet-4-20250514"),
     store=store,
     retriever=retriever,
-    feedback=SQLiteFeedbackLoop(db_path="./data/feedback.db"),
-    tracer=SQLiteTracer(db_path="./data/traces.db"),
+    feedback=SQLiteFeedbackLoop(),
+    tracer=SQLiteTracer(),
     tools=ToolRegistry(),
 )
 
@@ -425,7 +427,7 @@ Persists the agent's outputs and session history across runs. When `None`, the a
 
 | Adapter | Backend | Install extra | Notes |
 |---------|---------|--------------|-------|
-| `SqliteStore` | SQLite + Ollama embeddings | `ollama` | Zero external dependencies. Embeddings via `nomic-embed-text`. |
+| `SqliteStore` | SQLite + Ollama embeddings | `ollama` | Requires the `ollama` extra and a running Ollama instance. Embeddings via `nomic-embed-text`. |
 | `HonchoMemory` | Honcho API | `honcho` | Sessions, metamessages, hosted collections. |
 | `ZepMemory` | Zep API | `zep` | Memory search with built-in relevance scoring. |
 
