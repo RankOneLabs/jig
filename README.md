@@ -74,7 +74,7 @@ print(result.output)
 
 | Interface | Purpose | Adapters |
 |---|---|---|
-| `LLMClient` | LLM completions | Anthropic, OpenAI, Ollama, Dispatch (smithers fleet) |
+| `LLMClient` | LLM completions | Anthropic, OpenAI, OpenRouter, Gemini, Ollama, Dispatch (smithers fleet) |
 | `MemoryStore` | Persistence + session history | Local (SQLite + embeddings), Honcho, Zep |
 | `Retriever` | Prompt-context strategy | DenseRetriever (embeddings), HonchoMemory, ZepMemory |
 | `FeedbackLoop` | Score tracking + eval export | SQLite |
