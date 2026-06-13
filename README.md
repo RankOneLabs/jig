@@ -15,7 +15,7 @@ uv add 'jig[all]'                   # everything
 
 ## Quick start
 
-These examples require `jig[anthropic,ollama]` (or `jig[all]`).
+These examples require `jig[anthropic,ollama]` (or `jig[all]`) and a running Ollama server.
 
 Smallest runnable agent — no memory:
 
@@ -76,7 +76,7 @@ print(result.output)
 |---|---|---|
 | `LLMClient` | LLM completions | Anthropic, OpenAI, Ollama, Dispatch (smithers fleet) |
 | `MemoryStore` | Persistence + session history | Local (SQLite + embeddings), Honcho, Zep |
-| `Retriever` | Prompt-context strategy | Dense (embeddings), Honcho, Zep |
+| `Retriever` | Prompt-context strategy | DenseRetriever (embeddings), HonchoMemory, ZepMemory |
 | `FeedbackLoop` | Score tracking + eval export | SQLite |
 | `Grader` | Auto-score outputs | LLM Judge, Heuristic, Ground Truth, Composite |
 | `TracingLogger` | Structured spans | SQLite, Stdout |

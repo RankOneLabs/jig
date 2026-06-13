@@ -32,7 +32,7 @@ dependencies = [
 
 ## Quick start — agent
 
-These examples require `jig[anthropic,ollama]` (or `jig[all]`). SQLite files are written to the current directory.
+These examples require `jig[anthropic,ollama]` (or `jig[all]`) and a running Ollama server. SQLite files are written to the current directory.
 
 Smallest runnable agent — no memory:
 
