@@ -32,10 +32,11 @@ dependencies = [
 
 ## Quick start — agent
 
+Smallest runnable agent — no memory:
+
 ```python
 from jig import AgentConfig, run_agent
 from jig.llm import AnthropicClient
-from jig.memory import LocalMemory
 from jig.feedback import SQLiteFeedbackLoop
 from jig.tracing import SQLiteTracer
 from jig.tools import ToolRegistry
@@ -45,7 +46,34 @@ config = AgentConfig(
     description="Does a thing",
     system_prompt="You are a helpful agent that does the thing.",
     llm=AnthropicClient(model="claude-sonnet-4-20250514"),
-    memory=LocalMemory(db_path="./data/memory.db"),
+    feedback=SQLiteFeedbackLoop(db_path="./data/feedback.db"),
+    tracer=SQLiteTracer(db_path="./data/traces.db"),
+    tools=ToolRegistry(),
+)
+
+result = await run_agent(config, "Do the thing")
+print(result.output)
+```
+
+With local memory (SQLite + embeddings):
+
+```python
+from jig import AgentConfig, run_agent
+from jig.llm import AnthropicClient
+from jig.memory import LocalMemory
+from jig.feedback import SQLiteFeedbackLoop
+from jig.tracing import SQLiteTracer
+from jig.tools import ToolRegistry
+
+store, retriever = LocalMemory(db_path="./data/memory.db")
+
+config = AgentConfig(
+    name="my-agent",
+    description="Does a thing",
+    system_prompt="You are a helpful agent that does the thing.",
+    llm=AnthropicClient(model="claude-sonnet-4-20250514"),
+    store=store,
+    retriever=retriever,
     feedback=SQLiteFeedbackLoop(db_path="./data/feedback.db"),
     tracer=SQLiteTracer(db_path="./data/traces.db"),
     tools=ToolRegistry(),
@@ -282,7 +310,7 @@ The inner pipeline's spans appear as children of the outer pipeline's root span.
 
 ### Required
 
-Every `AgentConfig` must provide these five components. There are no defaults — you choose every piece.
+Every `AgentConfig` must provide these four components. There are no defaults — you choose every piece.
 
 #### `llm: LLMClient`
 
@@ -330,26 +358,6 @@ response = await llm.complete(params)
 ```
 
 When using `run_agent`, these are assembled automatically — you only configure the client.
-
-#### `memory: AgentMemory`
-
-Where the agent stores and retrieves context across runs. Semantic search over past outputs, plus session history for conversational agents.
-
-| Adapter | Backend | Install extra | Notes |
-|---------|---------|--------------|-------|
-| `LocalMemory` | SQLite + Ollama embeddings | `ollama` | Zero external dependencies. Embeddings via `nomic-embed-text`. |
-| `HonchoMemory` | Honcho API | `honcho` | Sessions, metamessages, hosted collections. |
-| `ZepMemory` | Zep API | `zep` | Memory search with built-in relevance scoring. |
-
-```python
-from jig.memory import LocalMemory
-
-memory = LocalMemory(
-    db_path="./data/memory.db",
-    embed_model="nomic-embed-text",   # runs on your local Ollama
-    ollama_host="http://localhost:11434",
-)
-```
 
 #### `feedback: FeedbackLoop`
 
@@ -406,6 +414,48 @@ tools = ToolRegistry()
 ### Optional
 
 These components have sensible defaults (off) and can be added when you need them.
+
+#### `store: MemoryStore`
+
+**Default: `None` (no persistence)**
+
+Persists the agent's outputs and session history across runs. When `None`, the agent is stateless — no past context is stored or retrieved.
+
+| Adapter | Backend | Install extra | Notes |
+|---------|---------|--------------|-------|
+| `SqliteStore` | SQLite + Ollama embeddings | `ollama` | Zero external dependencies. Embeddings via `nomic-embed-text`. |
+| `HonchoMemory` | Honcho API | `honcho` | Sessions, metamessages, hosted collections. |
+| `ZepMemory` | Zep API | `zep` | Memory search with built-in relevance scoring. |
+
+#### `retriever: Retriever`
+
+**Default: `None` (no memory retrieval)**
+
+Controls how stored context is pulled into the prompt — semantic search strategy, result count, scoring threshold. When `None`, the memory query step is skipped even if `store` is set.
+
+| Adapter | Backend | Notes |
+|---------|---------|-------|
+| `DenseRetriever` | Ollama embeddings | Cosine-similarity search over stored outputs. |
+| `HonchoRetriever` | Honcho API | Hosted retrieval with metamessage filtering. |
+| `ZepRetriever` | Zep API | Built-in relevance scoring. |
+
+`LocalMemory()` is a convenience factory that returns a matched `(SqliteStore, DenseRetriever)` pair:
+
+```python
+from jig.memory import LocalMemory
+
+store, retriever = LocalMemory(
+    db_path="./data/memory.db",
+    embed_model="nomic-embed-text",   # runs on your local Ollama
+    ollama_host="http://localhost:11434",
+)
+
+config = AgentConfig(
+    ...,
+    store=store,
+    retriever=retriever,
+)
+```
 
 #### `grader: Grader`
 

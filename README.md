@@ -15,10 +15,11 @@ uv add 'jig[all]'                   # everything
 
 ## Quick start
 
+Smallest runnable agent — no memory:
+
 ```python
 from jig import AgentConfig, run_agent
 from jig.llm import AnthropicClient
-from jig.memory import LocalMemory
 from jig.feedback import SQLiteFeedbackLoop
 from jig.tracing import StdoutTracer
 from jig.tools import ToolRegistry
@@ -28,7 +29,34 @@ config = AgentConfig(
     description="A simple agent",
     system_prompt="You are a helpful assistant.",
     llm=AnthropicClient(model="claude-sonnet-4-20250514"),
-    memory=LocalMemory(),
+    feedback=SQLiteFeedbackLoop(),
+    tracer=StdoutTracer(),
+    tools=ToolRegistry(),
+)
+
+result = await run_agent(config, "What's the weather like?")
+print(result.output)
+```
+
+With local memory (SQLite + embeddings):
+
+```python
+from jig import AgentConfig, run_agent
+from jig.llm import AnthropicClient
+from jig.memory import LocalMemory
+from jig.feedback import SQLiteFeedbackLoop
+from jig.tracing import StdoutTracer
+from jig.tools import ToolRegistry
+
+store, retriever = LocalMemory()
+
+config = AgentConfig(
+    name="my-agent",
+    description="A simple agent",
+    system_prompt="You are a helpful assistant.",
+    llm=AnthropicClient(model="claude-sonnet-4-20250514"),
+    store=store,
+    retriever=retriever,
     feedback=SQLiteFeedbackLoop(),
     tracer=StdoutTracer(),
     tools=ToolRegistry(),
@@ -43,7 +71,8 @@ print(result.output)
 | Interface | Purpose | Adapters |
 |---|---|---|
 | `LLMClient` | LLM completions | Anthropic, OpenAI, Ollama, Dispatch (smithers fleet) |
-| `AgentMemory` | Storage + retrieval | Local (SQLite + embeddings), Honcho, Zep |
+| `MemoryStore` | Persistence + session history | Local (SQLite + embeddings), Honcho, Zep |
+| `Retriever` | Prompt-context strategy | Dense (embeddings), Honcho, Zep |
 | `FeedbackLoop` | Score tracking + eval export | SQLite |
 | `Grader` | Auto-score outputs | LLM Judge, Heuristic, Ground Truth, Composite |
 | `TracingLogger` | Structured spans | SQLite, Stdout |
