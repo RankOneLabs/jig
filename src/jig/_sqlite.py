@@ -37,8 +37,13 @@ class LazyConnection:
             # Re-check after acquiring — another waiter may have
             # initialized the connection while we blocked on the lock.
             if self._db is None:
-                self._db = await aiosqlite.connect(self._db_path)
-                await self._db.executescript(self._schema)
+                conn = await aiosqlite.connect(self._db_path)
+                try:
+                    await conn.executescript(self._schema)
+                except:
+                    await conn.close()
+                    raise
+                self._db = conn
         assert self._db is not None
         return self._db
 

@@ -236,5 +236,7 @@ class SQLiteTracer(TracingLogger):
         )
 
     async def close(self) -> None:
-        await self.flush()
-        await self._conn.close()
+        try:
+            await self.flush()
+        finally:
+            await self._conn.close()
