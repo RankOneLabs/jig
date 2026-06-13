@@ -35,6 +35,7 @@ dependencies = [
 Smallest runnable agent — no memory:
 
 ```python
+import asyncio
 from jig import AgentConfig, run_agent
 from jig.llm import AnthropicClient
 from jig.feedback import SQLiteFeedbackLoop
@@ -51,13 +52,14 @@ config = AgentConfig(
     tools=ToolRegistry(),
 )
 
-result = await run_agent(config, "Do the thing")
+result = asyncio.run(run_agent(config, "Do the thing"))
 print(result.output)
 ```
 
 With local memory (SQLite + embeddings):
 
 ```python
+import asyncio
 from jig import AgentConfig, run_agent
 from jig.llm import AnthropicClient
 from jig.memory import LocalMemory
@@ -79,7 +81,7 @@ config = AgentConfig(
     tools=ToolRegistry(),
 )
 
-result = await run_agent(config, "Do the thing")
+result = asyncio.run(run_agent(config, "Do the thing"))
 print(result.output)
 ```
 
@@ -436,8 +438,8 @@ Controls how stored context is pulled into the prompt — semantic search strate
 | Adapter | Backend | Notes |
 |---------|---------|-------|
 | `DenseRetriever` | Ollama embeddings | Cosine-similarity search over stored outputs. |
-| `HonchoRetriever` | Honcho API | Hosted retrieval with metamessage filtering. |
-| `ZepRetriever` | Zep API | Built-in relevance scoring. |
+| `HonchoMemory` | Honcho API | Satisfies both `MemoryStore` and `Retriever`. |
+| `ZepMemory` | Zep API | Satisfies both `MemoryStore` and `Retriever`. |
 
 `LocalMemory()` is a convenience factory that returns a matched `(SqliteStore, DenseRetriever)` pair:
 

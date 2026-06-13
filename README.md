@@ -18,6 +18,7 @@ uv add 'jig[all]'                   # everything
 Smallest runnable agent — no memory:
 
 ```python
+import asyncio
 from jig import AgentConfig, run_agent
 from jig.llm import AnthropicClient
 from jig.feedback import SQLiteFeedbackLoop
@@ -34,13 +35,14 @@ config = AgentConfig(
     tools=ToolRegistry(),
 )
 
-result = await run_agent(config, "What's the weather like?")
+result = asyncio.run(run_agent(config, "What's the weather like?"))
 print(result.output)
 ```
 
 With local memory (SQLite + embeddings):
 
 ```python
+import asyncio
 from jig import AgentConfig, run_agent
 from jig.llm import AnthropicClient
 from jig.memory import LocalMemory
@@ -62,7 +64,7 @@ config = AgentConfig(
     tools=ToolRegistry(),
 )
 
-result = await run_agent(config, "What's the weather like?")
+result = asyncio.run(run_agent(config, "What's the weather like?"))
 print(result.output)
 ```
 
