@@ -198,3 +198,9 @@ src/jig/
 ├── sweep_stats.py  # sweep result aggregation
 └── regression.py   # regression testing
 ```
+
+## Contributing
+
+```bash
+uv run --extra dev --extra callback pytest
+```
