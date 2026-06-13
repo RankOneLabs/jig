@@ -1,3 +1,5 @@
+> Internal/historical planning note. Not part of the public documentation set.
+
 # Phase 9 plan — trace propagation across dispatch
 
 **Goal.** A jig agent that calls `jig.dispatch.run("pkg.mod:fn", args)` or uses
