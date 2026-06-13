@@ -327,7 +327,7 @@ The model that powers the agent. One adapter per provider.
 | `OpenRouterClient` | OpenRouter | `openrouter` | Hundreds of models behind one OpenAI-compatible endpoint (vendor-namespaced slugs like anthropic/claude-3.5-sonnet); per-call cost read from the response. |
 | `GeminiClient` | Google Gemini | `google` | Google Gemini models via the google-genai SDK. |
 | `OllamaClient` | Ollama (local) | `ollama` | Any model on your hardware. Cost is always `None`. |
-| `DispatchClient` | Smithers dispatch (fleet) | _(core)_ | Routes inference to homelab GPU workers via smithers. |
+| `DispatchClient` | Smithers dispatch (optional) | _(core)_ | Routes inference to remote workers via an optional Smithers dispatch backend. |
 
 ```python
 from jig.llm import AnthropicClient
@@ -338,14 +338,14 @@ llm = AnthropicClient(
 )
 ```
 
-For local fleet inference via smithers dispatch:
+For remote inference via the optional Smithers dispatch backend:
 
 ```python
 from jig.llm import DispatchClient
 
-llm = DispatchClient(model="llama-70b")                   # router picks machine
-llm = DispatchClient(model="llama-70b", machine="mcbain") # explicit machine
-llm = DispatchClient(dispatch_url="http://willie:8900")    # router picks everything
+llm = DispatchClient(model="llama-70b")                                  # router picks a worker
+llm = DispatchClient(model="llama-70b", machine="gpu-worker-1")          # explicit worker label
+llm = DispatchClient(dispatch_url="http://your-dispatch-host:8900")       # router picks everything
 ```
 
 Temperature, max_tokens, and provider-specific parameters are set per-call via `CompletionParams`, not on the client:
