@@ -25,8 +25,9 @@ def merge_completion_kwargs(kwargs: dict[str, Any], params: CompletionParams) ->
     """Apply temperature, max_tokens, and provider_params to kwargs in-place.
 
     provider_params is merged last so caller-supplied values win over defaults.
-    Only sets temperature/max_tokens when not None; pre-set defaults (e.g.
-    Anthropic's ``max_tokens or 4096``) are left untouched when params is None.
+    Only sets temperature/max_tokens when those fields are not None; pre-set
+    defaults (e.g. Anthropic's ``max_tokens or 4096``) are left untouched when
+    ``params.temperature`` or ``params.max_tokens`` is None.
     """
     if params.temperature is not None:
         kwargs["temperature"] = params.temperature
