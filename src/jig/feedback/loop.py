@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-import json
 import uuid
 from datetime import datetime
 from typing import Any
@@ -10,6 +8,7 @@ import aiosqlite
 import numpy as np
 
 from jig._embed import ollama_embed
+from jig._sqlite import LazyConnection, json_dumps, json_loads
 from jig.core.types import (
     EvalCase,
     FeedbackLoop,
@@ -48,27 +47,12 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         embed_model: str = "nomic-embed-text",
         ollama_host: str | None = None,
     ):
-        self._db_path = db_path
         self._embed_model = embed_model
         self._ollama_host = ollama_host
-        self._db: aiosqlite.Connection | None = None
-        # Constructed lazily inside _get_db() so the lock binds to the
-        # event loop that's actually running, not whatever loop existed
-        # (or didn't) at __init__ time.
-        self._db_lock: asyncio.Lock | None = None
+        self._conn = LazyConnection(db_path, _SCHEMA)
 
     async def _get_db(self) -> aiosqlite.Connection:
-        if self._db is not None:
-            return self._db
-        if self._db_lock is None:
-            self._db_lock = asyncio.Lock()
-        async with self._db_lock:
-            # Re-check after acquiring — another waiter may have
-            # initialized the connection while we blocked on the lock.
-            if self._db is None:
-                self._db = await aiosqlite.connect(self._db_path)
-                await self._db.executescript(_SCHEMA)
-        return self._db
+        return await self._conn.get()
 
     async def _embed(self, text: str) -> np.ndarray:
         return await ollama_embed(text, self._embed_model, self._ollama_host)
@@ -88,7 +72,7 @@ class SQLiteFeedbackLoop(FeedbackLoop):
                 result_id,
                 content,
                 input_text,
-                json.dumps(metadata or {}),
+                json_dumps(metadata or {}),
                 embedding.tobytes(),
                 datetime.now().isoformat(),
             ),
@@ -113,69 +97,8 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         min_score: float | None = None,
         source: ScoreSource | None = None,
     ) -> list[ScoredResult]:
-        db = await self._get_db()
-        query_emb = await self._embed(query)
-        query_norm = float(np.linalg.norm(query_emb))
-        if query_norm == 0:
-            return []
-
-        cursor = await db.execute(
-            "SELECT id, content, input, metadata, embedding, created_at FROM results"
-        )
-        rows = await cursor.fetchall()
-
-        candidates: list[tuple[float, str, str, dict[str, Any], datetime]] = []
-        for row in rows:
-            rid, content, inp, meta_json, emb_bytes, created_str = row
-            if not emb_bytes:
-                continue
-            row_emb = np.frombuffer(emb_bytes, dtype=np.float32)
-            row_norm = float(np.linalg.norm(row_emb))
-            if row_norm == 0:
-                continue
-            sim = float(np.dot(query_emb, row_emb) / (query_norm * row_norm))
-            candidates.append(
-                (sim, rid, content, json.loads(meta_json), datetime.fromisoformat(created_str))
-            )
-
-        candidates.sort(key=lambda x: x[0], reverse=True)
-
-        results: list[ScoredResult] = []
-        for sim, rid, content, meta, created in candidates[:limit * 2]:
-            score_cursor = await db.execute(
-                "SELECT dimension, value, source FROM scores WHERE result_id = ?", (rid,)
-            )
-            score_rows = await score_cursor.fetchall()
-            scores = [
-                Score(dimension=d, value=v, source=ScoreSource(s))
-                for d, v, s in score_rows
-            ]
-            if not scores:
-                continue
-
-            if source:
-                scores = [s for s in scores if s.source == source]
-                if not scores:
-                    continue
-
-            avg = sum(s.value for s in scores) / len(scores)
-            if min_score is not None and avg < min_score:
-                continue
-
-            results.append(
-                ScoredResult(
-                    result_id=rid,
-                    content=content,
-                    scores=scores,
-                    avg_score=avg,
-                    metadata=meta,
-                    created_at=created,
-                )
-            )
-            if len(results) >= limit:
-                break
-
-        return results
+        q = FeedbackQuery(similar_to=query, limit=limit, min_score=min_score, source=source)
+        return await self.query(q)
 
     async def query(self, q: FeedbackQuery) -> list[ScoredResult]:
         """Similarity + metadata filter search.
@@ -215,7 +138,7 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         candidates: list[tuple[float, str, str, dict[str, Any], datetime]] = []
         for rid, content, _inp, meta_json, emb_bytes, created_str in rows:
             created = datetime.fromisoformat(created_str)
-            meta = json.loads(meta_json) if meta_json else {}
+            meta = json_loads(meta_json) if meta_json else {}
             if q.agent_name is not None and meta.get("agent_name") != q.agent_name:
                 continue
             if q.model is not None and meta.get("model") != q.model:
@@ -278,6 +201,10 @@ class SQLiteFeedbackLoop(FeedbackLoop):
             scores = scores_by_rid.get(rid, [])
             if not scores:
                 continue
+            if q.source is not None:
+                scores = [s for s in scores if s.source == q.source]
+                if not scores:
+                    continue
             avg = sum(s.value for s in scores) / len(scores)
             if q.min_score is not None and avg < q.min_score:
                 continue
@@ -331,7 +258,7 @@ class SQLiteFeedbackLoop(FeedbackLoop):
             if max_score is not None and avg > max_score:
                 continue
 
-            meta = json.loads(meta_json)
+            meta = json_loads(meta_json) if meta_json else {}
             meta["avg_score"] = avg
             cases.append(
                 EvalCase(
@@ -344,6 +271,4 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         return cases
 
     async def close(self) -> None:
-        if self._db:
-            await self._db.close()
-            self._db = None
+        await self._conn.close()

@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-import time
 import uuid
 from typing import Any
 
@@ -19,6 +18,7 @@ from jig.core.types import (
     ToolDefinition,
     Usage,
 )
+from jig.llm._common import start_timer
 from jig.llm.pricing import stamp_cost
 
 try:
@@ -148,7 +148,7 @@ class GeminiClient(LLMClient):
 
         config = genai_types.GenerateContentConfig(**config_kwargs)
 
-        start = time.time()
+        timer = start_timer()
 
         async def _call() -> Any:
             return await self._client.aio.models.generate_content(
@@ -168,7 +168,7 @@ class GeminiClient(LLMClient):
             status = getattr(e, "status_code", None) or getattr(e, "code", None)
             raise JigLLMError(str(e), "google", status_code=status) from e
 
-        latency_ms = (time.time() - start) * 1000
+        latency_ms = timer()
 
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []

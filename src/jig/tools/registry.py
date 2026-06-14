@@ -20,7 +20,8 @@ class ToolRegistry:
 
         ``dispatch_url`` overrides the default smithers endpoint for
         any registered tool with ``dispatch=True``. Leave as None to
-        use :func:`jig.dispatch.run`'s default (``http://willie:8900``).
+        use :func:`jig.dispatch.run`'s default (the ``JIG_DISPATCH_URL``
+        environment variable, or ``http://localhost:8900``).
         """
         if execute_timeout is not None and execute_timeout <= 0:
             raise ValueError(f"execute_timeout must be > 0 when provided, got {execute_timeout}")

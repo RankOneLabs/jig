@@ -7,18 +7,22 @@ A jig holds the pieces while you work on them. It doesn't have opinions about yo
 ## Install
 
 ```bash
-uv add jig                          # core only
-uv add 'jig[anthropic]'             # + Anthropic adapter
-uv add 'jig[ollama]'                # + Ollama adapter (homelab)
-uv add 'jig[all]'                   # everything
+uv add 'jig @ git+https://github.com/rankonelabs/jig.git'                          # core only
+uv add 'jig[anthropic] @ git+https://github.com/rankonelabs/jig.git'               # + Anthropic adapter
+uv add 'jig[ollama] @ git+https://github.com/rankonelabs/jig.git'                  # + Ollama adapter
+uv add 'jig[all] @ git+https://github.com/rankonelabs/jig.git'                     # everything
 ```
 
 ## Quick start
 
+These examples require `jig[anthropic,ollama]` (or `jig[all]`) and a running Ollama server.
+
+Smallest runnable agent — no memory:
+
 ```python
+import asyncio
 from jig import AgentConfig, run_agent
 from jig.llm import AnthropicClient
-from jig.memory import LocalMemory
 from jig.feedback import SQLiteFeedbackLoop
 from jig.tracing import StdoutTracer
 from jig.tools import ToolRegistry
@@ -28,13 +32,41 @@ config = AgentConfig(
     description="A simple agent",
     system_prompt="You are a helpful assistant.",
     llm=AnthropicClient(model="claude-sonnet-4-20250514"),
-    memory=LocalMemory(),
     feedback=SQLiteFeedbackLoop(),
     tracer=StdoutTracer(),
     tools=ToolRegistry(),
 )
 
-result = await run_agent(config, "What's the weather like?")
+result = asyncio.run(run_agent(config, "What's the weather like?"))
+print(result.output)
+```
+
+With local memory (SQLite + embeddings):
+
+```python
+import asyncio
+from jig import AgentConfig, run_agent
+from jig.llm import AnthropicClient
+from jig.memory import LocalMemory
+from jig.feedback import SQLiteFeedbackLoop
+from jig.tracing import StdoutTracer
+from jig.tools import ToolRegistry
+
+store, retriever = LocalMemory()
+
+config = AgentConfig(
+    name="my-agent",
+    description="A simple agent",
+    system_prompt="You are a helpful assistant.",
+    llm=AnthropicClient(model="claude-sonnet-4-20250514"),
+    store=store,
+    retriever=retriever,
+    feedback=SQLiteFeedbackLoop(),
+    tracer=StdoutTracer(),
+    tools=ToolRegistry(),
+)
+
+result = asyncio.run(run_agent(config, "What's the weather like?"))
 print(result.output)
 ```
 
@@ -42,8 +74,9 @@ print(result.output)
 
 | Interface | Purpose | Adapters |
 |---|---|---|
-| `LLMClient` | LLM completions | Anthropic, OpenAI, Ollama, Dispatch (smithers fleet) |
-| `AgentMemory` | Storage + retrieval | Local (SQLite + embeddings), Honcho, Zep |
+| `LLMClient` | LLM completions | Anthropic, OpenAI, OpenRouter, Gemini, Ollama, Dispatch (optional Smithers backend) |
+| `MemoryStore` | Persistence + session history | Local (SQLite + embeddings), Honcho, Zep |
+| `Retriever` | Prompt-context strategy | DenseRetriever (embeddings), HonchoMemory, ZepMemory |
 | `FeedbackLoop` | Score tracking + eval export | SQLite |
 | `Grader` | Auto-score outputs | LLM Judge, Heuristic, Ground Truth, Composite |
 | `TracingLogger` | Structured spans | SQLite, Stdout |
@@ -151,9 +184,23 @@ CompletionParams(
 ```
 src/jig/
 ├── core/           # types, runner, pipeline, errors, retry, prompt builder
-├── llm/            # anthropic, openai, ollama adapters
+├── llm/            # anthropic, openai, openrouter, google, ollama, dispatch adapters
 ├── memory/         # local (sqlite+embeddings), honcho, zep
 ├── feedback/       # feedback loop, llm judge, heuristic, ground truth, composite
-├── tracing/        # sqlite tracer, stdout tracer
-└── tools/          # registry + common tools
+├── tracing/        # sqlite tracer, stdout tracer, federated tracer
+├── tools/          # registry + common tools
+├── dispatch/       # dispatch client and callback listener
+├── observability/  # structured logging helpers
+├── eval/           # eval datasets and calibration
+├── replay/         # replay runner, diff, snapshot
+├── budget.py       # budget tracking
+├── sweep.py        # compare and sweep
+├── sweep_stats.py  # sweep result aggregation
+└── regression.py   # regression testing
+```
+
+## Contributing
+
+```bash
+uv run --extra dev --extra callback pytest
 ```

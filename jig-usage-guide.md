@@ -32,10 +32,14 @@ dependencies = [
 
 ## Quick start — agent
 
+These examples require `jig[anthropic,ollama]` (or `jig[all]`) and a running Ollama server. SQLite files are written to the current directory.
+
+Smallest runnable agent — no memory:
+
 ```python
+import asyncio
 from jig import AgentConfig, run_agent
 from jig.llm import AnthropicClient
-from jig.memory import LocalMemory
 from jig.feedback import SQLiteFeedbackLoop
 from jig.tracing import SQLiteTracer
 from jig.tools import ToolRegistry
@@ -45,13 +49,41 @@ config = AgentConfig(
     description="Does a thing",
     system_prompt="You are a helpful agent that does the thing.",
     llm=AnthropicClient(model="claude-sonnet-4-20250514"),
-    memory=LocalMemory(db_path="./data/memory.db"),
-    feedback=SQLiteFeedbackLoop(db_path="./data/feedback.db"),
-    tracer=SQLiteTracer(db_path="./data/traces.db"),
+    feedback=SQLiteFeedbackLoop(),
+    tracer=SQLiteTracer(),
     tools=ToolRegistry(),
 )
 
-result = await run_agent(config, "Do the thing")
+result = asyncio.run(run_agent(config, "Do the thing"))
+print(result.output)
+```
+
+With local memory (SQLite + embeddings):
+
+```python
+import asyncio
+from jig import AgentConfig, run_agent
+from jig.llm import AnthropicClient
+from jig.memory import LocalMemory
+from jig.feedback import SQLiteFeedbackLoop
+from jig.tracing import SQLiteTracer
+from jig.tools import ToolRegistry
+
+store, retriever = LocalMemory()
+
+config = AgentConfig(
+    name="my-agent",
+    description="Does a thing",
+    system_prompt="You are a helpful agent that does the thing.",
+    llm=AnthropicClient(model="claude-sonnet-4-20250514"),
+    store=store,
+    retriever=retriever,
+    feedback=SQLiteFeedbackLoop(),
+    tracer=SQLiteTracer(),
+    tools=ToolRegistry(),
+)
+
+result = asyncio.run(run_agent(config, "Do the thing"))
 print(result.output)
 ```
 
@@ -282,7 +314,7 @@ The inner pipeline's spans appear as children of the outer pipeline's root span.
 
 ### Required
 
-Every `AgentConfig` must provide these five components. There are no defaults — you choose every piece.
+Every `AgentConfig` must provide these four components. There are no defaults — you choose every piece.
 
 #### `llm: LLMClient`
 
@@ -292,8 +324,10 @@ The model that powers the agent. One adapter per provider.
 |---------|----------|--------------|-------|
 | `AnthropicClient` | Anthropic Messages API | `anthropic` | Sonnet, Opus, Haiku |
 | `OpenAIClient` | OpenAI Chat Completions | `openai` | GPT-4, GPT-5, o-series |
+| `OpenRouterClient` | OpenRouter | `openrouter` | Hundreds of models behind one OpenAI-compatible endpoint (vendor-namespaced slugs like anthropic/claude-3.5-sonnet); per-call cost read from the response. |
+| `GeminiClient` | Google Gemini | `google` | Google Gemini models via the google-genai SDK. |
 | `OllamaClient` | Ollama (local) | `ollama` | Any model on your hardware. Cost is always `None`. |
-| `DispatchClient` | Smithers dispatch (fleet) | _(core)_ | Routes inference to homelab GPU workers via smithers. |
+| `DispatchClient` | Smithers dispatch (optional) | _(core)_ | Routes inference to remote workers via an optional Smithers dispatch backend. |
 
 ```python
 from jig.llm import AnthropicClient
@@ -304,14 +338,14 @@ llm = AnthropicClient(
 )
 ```
 
-For local fleet inference via smithers dispatch:
+For remote inference via the optional Smithers dispatch backend:
 
 ```python
 from jig.llm import DispatchClient
 
-llm = DispatchClient(model="llama-70b")                   # router picks machine
-llm = DispatchClient(model="llama-70b", machine="mcbain") # explicit machine
-llm = DispatchClient(dispatch_url="http://willie:8900")    # router picks everything
+llm = DispatchClient(model="llama-70b")                                  # router picks a worker
+llm = DispatchClient(model="llama-70b", machine="gpu-worker-1")          # explicit worker label
+llm = DispatchClient(dispatch_url="http://your-dispatch-host:8900")       # router picks everything
 ```
 
 Temperature, max_tokens, and provider-specific parameters are set per-call via `CompletionParams`, not on the client:
@@ -330,26 +364,6 @@ response = await llm.complete(params)
 ```
 
 When using `run_agent`, these are assembled automatically — you only configure the client.
-
-#### `memory: AgentMemory`
-
-Where the agent stores and retrieves context across runs. Semantic search over past outputs, plus session history for conversational agents.
-
-| Adapter | Backend | Install extra | Notes |
-|---------|---------|--------------|-------|
-| `LocalMemory` | SQLite + Ollama embeddings | `ollama` | Zero external dependencies. Embeddings via `nomic-embed-text`. |
-| `HonchoMemory` | Honcho API | `honcho` | Sessions, metamessages, hosted collections. |
-| `ZepMemory` | Zep API | `zep` | Memory search with built-in relevance scoring. |
-
-```python
-from jig.memory import LocalMemory
-
-memory = LocalMemory(
-    db_path="./data/memory.db",
-    embed_model="nomic-embed-text",   # runs on your local Ollama
-    ollama_host="http://localhost:11434",
-)
-```
 
 #### `feedback: FeedbackLoop`
 
@@ -406,6 +420,48 @@ tools = ToolRegistry()
 ### Optional
 
 These components have sensible defaults (off) and can be added when you need them.
+
+#### `store: MemoryStore`
+
+**Default: `None` (no persistence)**
+
+Persists the agent's outputs and session history across runs. When `None`, the agent is stateless — no past context is stored or retrieved.
+
+| Adapter | Backend | Install extra | Notes |
+|---------|---------|--------------|-------|
+| `SqliteStore` | SQLite + Ollama embeddings | `ollama` | Requires the `ollama` extra and a running Ollama instance. Embeddings via `nomic-embed-text`. |
+| `HonchoMemory` | Honcho API | `honcho` | Sessions, metamessages, hosted collections. |
+| `ZepMemory` | Zep API | `zep` | Memory search with built-in relevance scoring. |
+
+#### `retriever: Retriever`
+
+**Default: `None` (no memory retrieval)**
+
+Controls how stored context is pulled into the prompt — semantic search strategy, result count, scoring threshold. When `None`, the memory query step is skipped even if `store` is set.
+
+| Adapter | Backend | Notes |
+|---------|---------|-------|
+| `DenseRetriever` | Ollama embeddings | Cosine-similarity search over stored outputs. |
+| `HonchoMemory` | Honcho API | Satisfies both `MemoryStore` and `Retriever`. |
+| `ZepMemory` | Zep API | Satisfies both `MemoryStore` and `Retriever`. |
+
+`LocalMemory()` is a convenience factory that returns a matched `(SqliteStore, DenseRetriever)` pair:
+
+```python
+from jig.memory import LocalMemory
+
+store, retriever = LocalMemory(
+    db_path="./data/memory.db",
+    embed_model="nomic-embed-text",   # runs on your local Ollama
+    ollama_host="http://localhost:11434",
+)
+
+config = AgentConfig(
+    ...,
+    store=store,
+    retriever=retriever,
+)
+```
 
 #### `grader: Grader`
 

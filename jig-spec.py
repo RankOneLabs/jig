@@ -25,7 +25,9 @@ Package manager: uv
 # LLM adapters (install per-provider):
 #   anthropic       — Anthropic SDK (Messages API)
 #   openai          — OpenAI SDK (Chat Completions API)
-#   ollama          — Ollama Python client (local models via homelab)
+#   openrouter      — OpenAI-compatible client routing to OpenRouter (hundreds of models)
+#   google          — Google Gemini via google-genai SDK
+#   ollama          — Ollama Python client (local models)
 #
 # Memory adapters (install per-backend):
 #   honcho          — Honcho SDK (sessions + metamessages)
@@ -51,10 +53,14 @@ Package manager: uv
 # [project.optional-dependencies]
 # anthropic = ["anthropic>=0.40"]
 # openai = ["openai>=1.50"]
+# openrouter = ["openai>=1.50"]
+# google = ["google-genai>=1.0"]
 # ollama = ["ollama>=0.4"]
 # honcho = ["honcho>=0.1"]
 # zep = ["zep-python>=2.0"]
-# all = ["jig[anthropic,openai,ollama,honcho,zep]"]
+# callback = ["aiohttp>=3.9"]
+# eval = ["pyyaml>=6.0"]
+# all = ["jig[anthropic,openai,openrouter,google,ollama,honcho,zep,callback,eval]"]
 # ============================================================
 
 
@@ -339,7 +345,7 @@ class LLMClient(ABC):
 #   params.provider_params          -> forwarded as **kwargs (e.g. num_ctx, top_k, repeat_penalty)
 #
 # ERROR HANDLING:
-#   ConnectionError            -> retry with backoff (homelab might be waking up)
+#   ConnectionError            -> retry with backoff (worker might be waking up)
 #   ollama.ResponseError       -> wrap in JigLLMError
 
 
@@ -388,7 +394,7 @@ class AgentMemory(ABC):
 # ---- Local Memory Adapter (SQLite + Ollama Embeddings) ----
 # Dependencies: aiosqlite, ollama, numpy
 #
-# EMBEDDING MODEL: nomic-embed-text via Ollama on homelab (RTX 5000 Pro)
+# EMBEDDING MODEL: nomic-embed-text via Ollama (local or remote GPU)
 #   Dimensions: 768
 #   Call: ollama.embed(model="nomic-embed-text", input=text) -> {"embeddings": [[float, ...]]}
 #
@@ -1012,7 +1018,7 @@ class JigToolError(JigError):
 # │       │   ├── __init__.py
 # │       │   ├── anthropic.py      # Anthropic adapter
 # │       │   ├── openai.py         # OpenAI adapter
-# │       │   └── ollama.py         # Ollama adapter (homelab)
+# │       │   └── ollama.py         # Ollama adapter (local models)
 # │       ├── memory/
 # │       │   ├── __init__.py
 # │       │   ├── local.py          # SQLite + Ollama embeddings

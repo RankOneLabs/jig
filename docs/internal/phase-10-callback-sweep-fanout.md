@@ -1,3 +1,5 @@
+> Internal/historical planning note. Not part of the public documentation set.
+
 # Phase 10 plan — Callback-based sweep fan-out
 
 **Goal.** Replace per-job polling with a single callback listener so

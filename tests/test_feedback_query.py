@@ -242,6 +242,106 @@ class TestPastResultsTool:
             await tool.execute({"hypothesis": "x", "min_score": True})
 
 
+@pytest.mark.asyncio
+class TestSourceFilteringParity:
+    """Source filtering and min-score behave identically through query() and get_signals()."""
+
+    async def test_source_filter_returns_only_matching_source(self, feedback_db):
+        rid = await feedback_db.store_result("A", "query text", {})
+        await feedback_db.score(rid, [
+            Score("q", 0.9, ScoreSource.LLM_JUDGE),
+            Score("q", 0.5, ScoreSource.HEURISTIC),
+        ])
+
+        out = await feedback_db.query(FeedbackQuery(source=ScoreSource.LLM_JUDGE))
+        assert len(out) == 1
+        assert all(s.source == ScoreSource.LLM_JUDGE for s in out[0].scores)
+
+    async def test_source_filter_drops_results_with_no_matching_source(self, feedback_db):
+        rid = await feedback_db.store_result("A", "query text", {})
+        await feedback_db.score(rid, [Score("q", 0.9, ScoreSource.HEURISTIC)])
+
+        out = await feedback_db.query(FeedbackQuery(source=ScoreSource.LLM_JUDGE))
+        assert out == []
+
+    async def test_avg_score_computed_over_source_filtered_scores(self, feedback_db):
+        rid = await feedback_db.store_result("A", "query text", {})
+        await feedback_db.score(rid, [
+            Score("q", 0.8, ScoreSource.LLM_JUDGE),
+            Score("q", 0.2, ScoreSource.HEURISTIC),
+        ])
+
+        out = await feedback_db.query(FeedbackQuery(source=ScoreSource.LLM_JUDGE))
+        assert len(out) == 1
+        assert out[0].avg_score == pytest.approx(0.8)
+
+    async def test_get_signals_and_query_agree_on_source_filter(self, feedback_db):
+        await _seed(feedback_db, [
+            {"content": "alpha", "input": "signal query",
+             "scores": [Score("q", 0.9, ScoreSource.LLM_JUDGE)]},
+            {"content": "beta", "input": "signal query",
+             "scores": [Score("q", 0.7, ScoreSource.HEURISTIC)]},
+            {"content": "gamma", "input": "signal query",
+             "scores": [
+                 Score("q", 0.8, ScoreSource.LLM_JUDGE),
+                 Score("q", 0.3, ScoreSource.HEURISTIC),
+             ]},
+        ])
+
+        via_query = await feedback_db.query(
+            FeedbackQuery(similar_to="signal query", source=ScoreSource.LLM_JUDGE, limit=10)
+        )
+        via_signals = await feedback_db.get_signals(
+            "signal query", limit=10, source=ScoreSource.LLM_JUDGE
+        )
+
+        assert {r.content for r in via_query} == {r.content for r in via_signals}
+        assert {r.content for r in via_query} == {"alpha", "gamma"}
+
+    async def test_min_score_identical_through_both_apis(self, feedback_db):
+        await _seed(feedback_db, [
+            {"content": "high", "input": "min score query",
+             "scores": [Score("q", 0.9, ScoreSource.HEURISTIC)]},
+            {"content": "low", "input": "min score query",
+             "scores": [Score("q", 0.3, ScoreSource.HEURISTIC)]},
+        ])
+
+        via_query = await feedback_db.query(
+            FeedbackQuery(similar_to="min score query", min_score=0.5, limit=10)
+        )
+        via_signals = await feedback_db.get_signals(
+            "min score query", limit=10, min_score=0.5
+        )
+
+        assert {r.content for r in via_query} == {r.content for r in via_signals}
+        assert {r.content for r in via_query} == {"high"}
+
+    async def test_source_and_min_score_combined_through_both_apis(self, feedback_db):
+        await _seed(feedback_db, [
+            {"content": "want", "input": "combo query",
+             "scores": [Score("q", 0.9, ScoreSource.LLM_JUDGE)]},
+            {"content": "wrong-source", "input": "combo query",
+             "scores": [Score("q", 0.9, ScoreSource.HEURISTIC)]},
+            {"content": "low-score", "input": "combo query",
+             "scores": [Score("q", 0.2, ScoreSource.LLM_JUDGE)]},
+        ])
+
+        via_query = await feedback_db.query(
+            FeedbackQuery(
+                similar_to="combo query",
+                source=ScoreSource.LLM_JUDGE,
+                min_score=0.5,
+                limit=10,
+            )
+        )
+        via_signals = await feedback_db.get_signals(
+            "combo query", limit=10, min_score=0.5, source=ScoreSource.LLM_JUDGE
+        )
+
+        assert {r.content for r in via_query} == {r.content for r in via_signals}
+        assert {r.content for r in via_query} == {"want"}
+
+
 class TestFeedbackQueryValidation:
     def test_rejects_non_positive_limit(self):
         with pytest.raises(ValueError, match="positive int"):

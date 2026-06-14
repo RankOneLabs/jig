@@ -17,8 +17,6 @@ For experimentation, swap the retriever without touching the corpus::
 """
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
 import uuid
 from datetime import datetime
@@ -28,6 +26,7 @@ import aiosqlite
 import numpy as np
 
 from jig._embed import ollama_embed
+from jig._sqlite import LazyConnection, json_dumps, json_loads
 from jig.core.types import MemoryEntry, MemoryStore, Message, Retriever, Role, ToolCall
 
 logger = logging.getLogger(__name__)
@@ -74,28 +73,13 @@ class SqliteStore(MemoryStore):
         ollama_host: str | None = None,
         embedder: Embedder | None = None,
     ):
-        self._db_path = db_path
         self._embed_model = embed_model
         self._ollama_host = ollama_host
         self._custom_embedder = embedder
-        self._db: aiosqlite.Connection | None = None
-        # Constructed lazily inside _get_db() so the lock binds to the
-        # event loop that's actually running, not whatever loop existed
-        # (or didn't) at __init__ time.
-        self._db_lock: asyncio.Lock | None = None
+        self._conn = LazyConnection(db_path, _SCHEMA)
 
     async def _get_db(self) -> aiosqlite.Connection:
-        if self._db is not None:
-            return self._db
-        if self._db_lock is None:
-            self._db_lock = asyncio.Lock()
-        async with self._db_lock:
-            # Re-check after acquiring — another waiter may have
-            # initialized the connection while we blocked on the lock.
-            if self._db is None:
-                self._db = await aiosqlite.connect(self._db_path)
-                await self._db.executescript(_SCHEMA)
-        return self._db
+        return await self._conn.get()
 
     async def embed(self, text: str) -> np.ndarray:
         """Public so :class:`DenseRetriever` can use the same embedder."""
@@ -112,7 +96,7 @@ class SqliteStore(MemoryStore):
             (
                 entry_id,
                 content,
-                json.dumps(metadata or {}),
+                json_dumps(metadata or {}),
                 embedding.tobytes(),
                 datetime.now().isoformat(),
             ),
@@ -133,7 +117,7 @@ class SqliteStore(MemoryStore):
         return MemoryEntry(
             id=id,
             content=content,
-            metadata=json.loads(meta_json) if meta_json else {},
+            metadata=json_loads(meta_json) if meta_json else {},
             created_at=datetime.fromisoformat(created_str),
         )
 
@@ -147,7 +131,7 @@ class SqliteStore(MemoryStore):
             MemoryEntry(
                 id=rid,
                 content=content,
-                metadata=json.loads(meta_json) if meta_json else {},
+                metadata=json_loads(meta_json) if meta_json else {},
                 created_at=datetime.fromisoformat(created_str),
             )
             for rid, content, meta_json, created_str in rows
@@ -180,7 +164,7 @@ class SqliteStore(MemoryStore):
             entry = MemoryEntry(
                 id=rid,
                 content=content,
-                metadata=json.loads(meta_json) if meta_json else {},
+                metadata=json_loads(meta_json) if meta_json else {},
                 created_at=datetime.fromisoformat(created_str),
             )
             emb = np.frombuffer(emb_bytes, dtype=np.float32)
@@ -199,7 +183,7 @@ class SqliteStore(MemoryStore):
         for role_str, content, tool_call_id, tool_calls_json in rows:
             tool_calls = None
             if tool_calls_json:
-                raw = json.loads(tool_calls_json)
+                raw = json_loads(tool_calls_json)
                 tool_calls = [ToolCall(**tc) for tc in raw]
             messages.append(
                 Message(
@@ -215,7 +199,7 @@ class SqliteStore(MemoryStore):
         db = await self._get_db()
         tool_calls_json = None
         if message.tool_calls:
-            tool_calls_json = json.dumps(
+            tool_calls_json = json_dumps(
                 [{"id": tc.id, "name": tc.name, "arguments": tc.arguments}
                  for tc in message.tool_calls]
             )
@@ -259,9 +243,7 @@ class SqliteStore(MemoryStore):
         await db.commit()
 
     async def close(self) -> None:
-        if self._db is not None:
-            await self._db.close()
-            self._db = None
+        await self._conn.close()
 
 
 class DenseRetriever(Retriever):
