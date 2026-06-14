@@ -54,7 +54,7 @@ def _resolve_output_schema(fqn: str) -> type[BaseModel]:
     import allowlist, because an attacker who can seed the tracer's
     storage can pick any importable module to load.
 
-    In the homelab single-tenant use case this is fine; anyone
+    In a trusted single-tenant deployment this is fine; anyone
     considering a broader deployment should wrap this with an
     allowlist check on the ``fqn``'s module prefix.
     """

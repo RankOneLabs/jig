@@ -170,7 +170,7 @@ async def complete(
     Convenience for call sites that don't need to hold a client reference.
     Accepts ``list[Message]`` or a list of ``{"role": ..., "content": ...}``
     dicts. ``client_kwargs`` forwards to the adapter constructor (e.g.
-    ``{"host": "http://mcbain:11434"}`` for Ollama).
+    ``{"host": "http://localhost:11434"}`` for Ollama).
     """
     # Validate and coerce input before constructing the client — gives useful
     # errors even when the provider SDK isn't installed.
