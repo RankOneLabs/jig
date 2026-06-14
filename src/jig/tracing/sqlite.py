@@ -237,6 +237,10 @@ class SQLiteTracer(TracingLogger):
 
     async def close(self) -> None:
         try:
-            await self.flush()
+            # Skip the flush (and its lazy _get_db() open) when nothing is
+            # buffered — otherwise close() on an unused tracer would create
+            # an empty DB file and run schema setup for no reason.
+            if self._spans:
+                await self.flush()
         finally:
             await self._conn.close()

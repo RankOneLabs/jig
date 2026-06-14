@@ -40,7 +40,7 @@ class LazyConnection:
                 conn = await aiosqlite.connect(self._db_path)
                 try:
                     await conn.executescript(self._schema)
-                except:
+                except BaseException:
                     await conn.close()
                     raise
                 self._db = conn

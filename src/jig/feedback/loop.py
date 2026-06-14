@@ -258,7 +258,7 @@ class SQLiteFeedbackLoop(FeedbackLoop):
             if max_score is not None and avg > max_score:
                 continue
 
-            meta = json_loads(meta_json)
+            meta = json_loads(meta_json) if meta_json else {}
             meta["avg_score"] = avg
             cases.append(
                 EvalCase(
