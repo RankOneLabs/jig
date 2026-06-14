@@ -345,7 +345,7 @@ class LLMClient(ABC):
 #   params.provider_params          -> forwarded as **kwargs (e.g. num_ctx, top_k, repeat_penalty)
 #
 # ERROR HANDLING:
-#   ConnectionError            -> retry with backoff (homelab might be waking up)
+#   ConnectionError            -> retry with backoff (worker might be waking up)
 #   ollama.ResponseError       -> wrap in JigLLMError
 
 
@@ -394,7 +394,7 @@ class AgentMemory(ABC):
 # ---- Local Memory Adapter (SQLite + Ollama Embeddings) ----
 # Dependencies: aiosqlite, ollama, numpy
 #
-# EMBEDDING MODEL: nomic-embed-text via Ollama on homelab (RTX 5000 Pro)
+# EMBEDDING MODEL: nomic-embed-text via Ollama (local or remote GPU)
 #   Dimensions: 768
 #   Call: ollama.embed(model="nomic-embed-text", input=text) -> {"embeddings": [[float, ...]]}
 #
@@ -1018,7 +1018,7 @@ class JigToolError(JigError):
 # │       │   ├── __init__.py
 # │       │   ├── anthropic.py      # Anthropic adapter
 # │       │   ├── openai.py         # OpenAI adapter
-# │       │   └── ollama.py         # Ollama adapter (homelab)
+# │       │   └── ollama.py         # Ollama adapter (local models)
 # │       ├── memory/
 # │       │   ├── __init__.py
 # │       │   ├── local.py          # SQLite + Ollama embeddings

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -21,6 +22,17 @@ logger = logging.getLogger(__name__)
 
 # Smithers job statuses that mean "still working"
 _PENDING_STATUSES = frozenset({"queued", "waking_machine", "dispatched", "running"})
+
+# Dispatch is a deployment-specific backend, so the endpoint is configured
+# rather than hardcoded: pass ``dispatch_url=`` explicitly, set the
+# ``JIG_DISPATCH_URL`` environment variable, or fall back to a local server.
+_DISPATCH_URL_ENV = "JIG_DISPATCH_URL"
+_DEFAULT_DISPATCH_URL = "http://localhost:8900"
+
+
+def default_dispatch_url() -> str:
+    """Resolve the dispatch URL from ``JIG_DISPATCH_URL`` or the local default."""
+    return os.getenv(_DISPATCH_URL_ENV) or _DEFAULT_DISPATCH_URL
 
 
 class DispatchError(JigError):
@@ -388,7 +400,7 @@ async def run(
     fn_ref: str,
     payload: dict[str, Any] | None = None,
     *,
-    dispatch_url: str = "http://willie:8900",
+    dispatch_url: str | None = None,
     requester: str = "jig",
     machine: str | None = None,
     trace_context: dict[str, Any] | None = None,
@@ -418,7 +430,7 @@ async def run(
     transport = http or _get_shared_http()
     data = await _submit_and_poll(
         http=transport,
-        dispatch_url=dispatch_url,
+        dispatch_url=dispatch_url or default_dispatch_url(),
         task_type="function",
         payload={"fn_ref": fn_ref, "args": payload or {}},
         requester=requester,

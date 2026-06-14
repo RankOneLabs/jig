@@ -1,8 +1,8 @@
 """Federated tracer: local SQLite for writes, rollup for cross-machine reads.
 
 Phase 9 pairs jig-side spans (written here via :class:`SQLiteTracer`)
-with worker-side spans (written on smithers workers, queried via the
-rollup service on willie). ``FederatedTracer`` hides that federation
+with worker-side spans (written on smithers workers, queried via a
+remote rollup service). ``FederatedTracer`` hides that federation
 from callers of :func:`jig.replay` and :func:`jig.trace_diff`: they
 get one merged span list whether they ran locally or dispatched out.
 
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime
 from typing import Any
 
@@ -30,7 +31,15 @@ from jig.tracing.sqlite import SQLiteTracer
 logger = logging.getLogger(__name__)
 
 
-_DEFAULT_ROLLUP_URL = "http://willie:8902"
+# The rollup service is deployment-specific: set ``JIG_ROLLUP_URL`` to point
+# at it, or pass ``base_url=`` explicitly. Falls back to a local server.
+_ROLLUP_URL_ENV = "JIG_ROLLUP_URL"
+_DEFAULT_ROLLUP_URL = "http://localhost:8902"
+
+
+def _default_rollup_url() -> str:
+    """Resolve the rollup URL from ``JIG_ROLLUP_URL`` or the local default."""
+    return os.getenv(_ROLLUP_URL_ENV) or _DEFAULT_ROLLUP_URL
 
 
 def _span_from_row(row: dict[str, Any]) -> Span | None:
@@ -125,12 +134,12 @@ class RollupClient:
 
     def __init__(
         self,
-        base_url: str = _DEFAULT_ROLLUP_URL,
+        base_url: str | None = None,
         *,
         http: httpx.AsyncClient | None = None,
         timeout: float = 5.0,
     ):
-        self._base_url = base_url.rstrip("/")
+        self._base_url = (base_url or _default_rollup_url()).rstrip("/")
         self._timeout = timeout
         self._owns_http = http is None
         self._http = http or httpx.AsyncClient()

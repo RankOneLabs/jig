@@ -1,4 +1,4 @@
-"""Smithers dispatch adapter — routes inference to the Springfield homelab fleet.
+"""Smithers dispatch adapter — routes inference to remote worker machines.
 
 Thin wrapper around :func:`jig.dispatch.client._submit_and_poll` that
 translates jig's :class:`CompletionParams` into the ``inference`` task
@@ -34,6 +34,7 @@ from jig.dispatch.client import (
     _current_listener,
     _PollConfig,
     _submit_and_poll,
+    default_dispatch_url,
 )
 
 logger = logging.getLogger(__name__)
@@ -148,7 +149,7 @@ class DispatchClient(LLMClient):
     Three levels of specificity:
         DispatchClient()                              # router picks model + machine
         DispatchClient(model="llama-70b")             # router picks machine
-        DispatchClient(model="llama-70b", machine="mcbain")  # explicit
+        DispatchClient(model="llama-70b", machine="gpu-worker-1")  # explicit
 
     Tool use is supported: when :class:`CompletionParams` carries
     ``tools``, they're serialized into the smithers payload and
@@ -164,7 +165,7 @@ class DispatchClient(LLMClient):
         self,
         model: str | None = None,
         machine: str | None = None,
-        dispatch_url: str = "http://willie:8900",
+        dispatch_url: str | None = None,
         requester: str = "jig",
         timeout_seconds: int = 300,
         poll_interval: float = 0.5,
@@ -173,7 +174,7 @@ class DispatchClient(LLMClient):
     ) -> None:
         self._model = model
         self._machine = machine
-        self._dispatch_url = dispatch_url.rstrip("/")
+        self._dispatch_url = (dispatch_url or default_dispatch_url()).rstrip("/")
         self._requester = requester
         self._trace_context = trace_context
         self._poll_config = _PollConfig(

@@ -14,8 +14,8 @@ that only need the polling path never trigger the import.
 Auth is a shared secret in the callback URL query string
 (``?token=...``). Not HMAC-grade — the attack model is accidental
 callbacks crossing wires between jig processes, not an active
-attacker on the Tailscale network. See phase-10 plan for the full
-threat-model rationale.
+attacker on the worker network. See the internal phase-10 plan for
+the full threat-model rationale.
 """
 from __future__ import annotations
 
