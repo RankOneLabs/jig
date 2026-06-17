@@ -1,6 +1,6 @@
 # jig
 
-Minimal agent framework. Five interfaces, two execution models, everything swappable.
+Minimal agent framework. Six interfaces, two execution models, everything swappable.
 
 A jig holds the pieces while you work on them. It doesn't have opinions about your pieces — just the shapes of the plugs between them.
 
