@@ -85,6 +85,7 @@ Plus `ToolRegistry` (concrete) and `Tool` (abstract) for tool use.
 
 \* Honcho and Zep adapters exist but are not covered by integration tests in this repo.
 The SQLite path (`LocalMemory`, `SQLiteFeedbackLoop`) is the verified baseline.
+For older feedback databases, see [SQLite feedback maintenance](docs/sqlite-feedback-maintenance.md).
 
 ## Two execution models
 

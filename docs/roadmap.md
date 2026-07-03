@@ -36,6 +36,9 @@ comparable, and debuggable.
 - The full lifecycle — `run_agent` / `run_pipeline` → `store_result` →
   `score` → `query` / `get_signals` / `export_eval_set` — is proven by
   integration tests against a real SQLite database.
+- Long-lived SQLite feedback databases from older versions may need orphan-score
+  cleanup before strict foreign-key enforcement; see
+  [SQLite feedback maintenance](sqlite-feedback-maintenance.md).
 - Honcho and Zep adapters exist but are not integration-tested.
 
 **Trace and replay agent runs**
