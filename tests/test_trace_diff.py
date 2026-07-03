@@ -1,13 +1,17 @@
 """Tests for :func:`jig.trace_diff`."""
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime
 from typing import Any
 
+import numpy as np
 import pytest
 
-from jig import Span, SpanKind, Usage, trace_diff
-from jig.core.types import TracingLogger
+from jig import AgentConfig, CompletionParams, LLMResponse, Score, ScoreSource, Span, SpanKind, Usage, run_agent, trace_diff
+from jig.core.types import Grader, LLMClient, TracingLogger
+from jig.feedback.loop import SQLiteFeedbackLoop
+from jig.tools import ToolRegistry
 from jig.replay.diff import TraceDiff
 from jig.tracing import SQLiteTracer
 
@@ -497,4 +501,66 @@ async def test_dropped_dimension_with_zero_score_makes_identical_false():
     assert "quality" in diff.score_deltas
     assert diff.score_deltas["quality"] == pytest.approx(0.0)
     assert diff.score_details["quality"] == (pytest.approx(0.0), None)
+    assert diff.identical is False
+
+
+# --- Real runner grading spans ---
+
+
+async def _fake_embed_diff(text: str) -> np.ndarray:
+    seed = int.from_bytes(hashlib.sha256(text.encode()).digest()[:4], "big")
+    rng = np.random.default_rng(seed)
+    return rng.random(128, dtype=np.float32)
+
+
+class _FixedLLM(LLMClient):
+    def __init__(self, content: str) -> None:
+        self._content = content
+
+    async def complete(self, params: CompletionParams) -> LLMResponse:
+        return LLMResponse(
+            content=self._content,
+            tool_calls=None,
+            usage=Usage(10, 5, cost=0.0),
+            latency_ms=1,
+            model="fixed",
+        )
+
+
+class _FixedGrader(Grader):
+    def __init__(self, value: float) -> None:
+        self._value = value
+
+    async def grade(self, input: Any, output: Any, context: dict[str, Any] | None = None) -> list[Score]:
+        return [Score(dimension="quality", value=self._value, source=ScoreSource.HEURISTIC)]
+
+
+@pytest.mark.asyncio
+async def test_score_deltas_from_real_runner_grading_spans(tmp_path: Any):
+    """trace_diff reads score_deltas from grading spans produced by run_agent."""
+    tracer = SQLiteTracer(db_path=str(tmp_path / "runner.db"))
+
+    feedback = SQLiteFeedbackLoop(db_path=str(tmp_path / "fb.db"))
+    feedback._embed = _fake_embed_diff  # type: ignore[method-assign]
+
+    def _config(name: str, value: float) -> AgentConfig:
+        return AgentConfig(
+            name=name,
+            description="trace diff test",
+            system_prompt="You are a test agent.",
+            llm=_FixedLLM("answer"),
+            feedback=feedback,
+            tracer=tracer,
+            tools=ToolRegistry(),
+            grader=_FixedGrader(value),
+        )
+
+    result_a = await run_agent(_config("agent-a", 0.9), "question")
+    result_b = await run_agent(_config("agent-b", 0.3), "question")
+    await tracer.flush()
+
+    diff = await trace_diff(result_a.trace_id, result_b.trace_id, tracer=tracer)
+
+    assert "quality" in diff.score_deltas
+    assert diff.score_deltas["quality"] == pytest.approx(-0.6, abs=1e-6)
     assert diff.identical is False
