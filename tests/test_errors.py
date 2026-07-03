@@ -420,10 +420,12 @@ class TestAgentResultError:
 
 @pytest.mark.asyncio
 class TestTracerFinalizationOnException:
-    """run_agent's try/finally ensures buffered tracers flush even when an
-    exception propagates from memory.add / grading / etc. mid-run."""
+    """Post-output bookkeeping failures are fail-soft: the valid output is
+    returned and the tracer is always flushed. Pre-output failures still
+    propagate so callers know the run produced no valid answer."""
 
     async def test_flush_called_when_memory_add_raises(self):
+        """memory.add failure after valid output is fail-soft: result returned, tracer flushed."""
         class FlakyMemory(FakeMemory):
             async def add(self, content, metadata=None):
                 raise RuntimeError("memory write failed")
@@ -451,20 +453,22 @@ class TestTracerFinalizationOnException:
             tools=ToolRegistry(),
         )
 
-        with pytest.raises(RuntimeError, match="memory write failed"):
-            await run_agent(config, "hi")
+        # memory.add failure is fail-soft after a valid output: no exception raised
+        result = await run_agent(config, "hi")
+        assert result.output == "ok"
+        assert result.error is None
 
-        # flush must have run despite the memory exception propagating
-        assert tracer.flush_count == 1
+        # flush must have run via _finalize_trace in the finally block
+        assert tracer.flush_count >= 1
         # Root span must be ended
         root = tracer.spans[0]
         assert root.ended_at is not None
 
     async def test_finalization_swallows_end_span_errors(self):
-        """A broken tracer.end_span must not shadow the original exception."""
+        """Broken tracer.end_span and fail-soft memory error both leave the result intact."""
         class FlakyMemory(FakeMemory):
             async def add(self, content, metadata=None):
-                raise RuntimeError("original error")
+                raise RuntimeError("memory write failed")
 
         class BrokenEndSpanTracer(FakeTracer):
             def end_span(self, span_id, output=None, error=None, usage=None):
@@ -486,9 +490,10 @@ class TestTracerFinalizationOnException:
             tools=ToolRegistry(),
         )
 
-        # Original exception bubbles up; tracer error is logged and swallowed
-        with pytest.raises(RuntimeError, match="original error"):
-            await run_agent(config, "hi")
+        # Both memory.add and end_span failures are swallowed; valid output returned
+        result = await run_agent(config, "hi")
+        assert result.output == "ok"
+        assert result.error is None
 
 
 @pytest.mark.asyncio
@@ -544,3 +549,112 @@ class TestTracerFlushDefault:
         # Must not raise AttributeError on tracer.flush()
         result = await run_agent(_config(llm, tracer=StdoutTracer(color=False)), "hi")
         assert result.output == "ok"
+
+
+@pytest.mark.asyncio
+class TestTerminatedRunSkipsBookkeeping:
+    """Terminated runs (agent_error set) must not persist sentinel text to
+    memory, session, or feedback so downstream queries stay clean."""
+
+    async def test_terminated_run_skips_memory_add(self):
+        """memory.add is not called when the run terminates (max_llm_calls)."""
+        add_calls: list[str] = []
+
+        class TrackingMemory(FakeMemory):
+            async def add(self, content, metadata=None):
+                add_calls.append(content)
+                return "m"
+
+        llm = FakeLLM([
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCall(id="tc", name="none", arguments={})],
+                usage=Usage(1, 1), latency_ms=1, model="fake",
+            )
+        ] * 3)
+        result = await run_agent(
+            _config(llm, store=TrackingMemory(), max_tool_calls=1, max_llm_calls=2),
+            "go",
+        )
+        assert isinstance(result.error, AgentMaxLLMCallsError)
+        assert add_calls == [], "memory.add must not be called for terminated runs"
+
+    async def test_terminated_run_skips_auto_grading(self):
+        """grader.grade is not called when the run terminates."""
+        from jig.core.types import Grader, Score, ScoreSource
+
+        grade_calls: list[Any] = []
+
+        class TrackingGrader(Grader):
+            async def grade(self, input, output, context=None):
+                grade_calls.append(output)
+                return [Score(dimension="q", value=1.0, source=ScoreSource.HEURISTIC)]
+
+        err = JigLLMError("down", "fake", retryable=True)
+        llm = FakeLLM([err, err])
+        result = await run_agent(
+            _config(llm, max_llm_retries=2, grader=TrackingGrader()),
+            "go",
+        )
+        assert isinstance(result.error, AgentMaxLLMRetriesError)
+        assert grade_calls == [], "grader.grade must not be called for terminated runs"
+
+
+@pytest.mark.asyncio
+class TestPreOutputSpanLifecycle:
+    """Pre-output spans must be closed even when the underlying operation raises."""
+
+    async def test_retriever_failure_closes_mem_span(self):
+        """If retriever.retrieve raises, the memory query span is closed with error."""
+        class BrokenRetriever(FakeMemory):
+            async def retrieve(self, query, k=5, context=None):
+                raise RuntimeError("retriever down")
+
+        tracer = FakeTracer()
+        llm = FakeLLM([])  # never reached
+        config = AgentConfig(
+            name="t",
+            description="test",
+            system_prompt="",
+            llm=llm,
+            store=None, retriever=BrokenRetriever(),
+            feedback=FakeFeedback(),
+            tracer=tracer,
+            tools=ToolRegistry(),
+        )
+
+        with pytest.raises(RuntimeError, match="retriever down"):
+            await run_agent(config, "hi")
+
+        # All spans should be closed (no orphan open spans)
+        open_spans = [s for s in tracer.spans if s.ended_at is None]
+        assert open_spans == [], f"Orphan open spans: {[s.name for s in open_spans]}"
+
+        mem_span = next(s for s in tracer.spans if s.name == "retrieve")
+        assert mem_span.error is not None
+        assert "RuntimeError" in mem_span.error
+
+
+@pytest.mark.asyncio
+class TestPostOutputFailSoft:
+    """Grading failures after a valid output must not erase the result."""
+
+    async def test_grading_failure_does_not_erase_output(self):
+        """If grader.grade raises, run_agent still returns the valid output."""
+        from jig.core.types import Grader, Score
+
+        class BrokenGrader(Grader):
+            async def grade(self, input, output, context=None) -> list[Score]:
+                raise RuntimeError("grader exploded")
+
+        llm = FakeLLM([
+            LLMResponse(content="the answer", tool_calls=None, usage=Usage(1, 1), latency_ms=1, model="fake"),
+        ])
+        result = await run_agent(
+            _config(llm, grader=BrokenGrader()),
+            "hi",
+        )
+
+        assert result.output == "the answer"
+        assert result.error is None
+        assert result.scores is None  # grading didn't complete
