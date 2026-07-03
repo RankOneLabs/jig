@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable
 
 from jig.core.types import FeedbackLoop, Grader, Score, SpanKind, TracingLogger
+from jig.tracing.spans import span_guard
 
 logger = logging.getLogger(__name__)
 
@@ -238,17 +239,24 @@ async def run_pipeline(
                 raise
 
     except Exception:
-        # Ensure root span is always closed on unhandled exceptions
         config.tracer.end_span(root.id, error="unhandled exception")
+        try:
+            await config.tracer.flush()
+        except Exception:
+            logger.exception("tracer.flush failed during pipeline exception handling")
         raise
 
-    # 5. Close trace
+    # 5. Close trace and flush so callers see completed spans immediately
     duration = (time.time() - start) * 1000
     config.tracer.end_span(
         root.id,
         output=last_output,
         error=error_detail if short_circuited else None,
     )
+    try:
+        await config.tracer.flush()
+    except Exception:
+        logger.exception("tracer.flush failed during pipeline finalization")
 
     return PipelineResult(
         output=last_output,
@@ -277,40 +285,50 @@ async def map_pipeline(
         kind=SpanKind.PIPELINE_RUN,
     )
 
-    results: list[PipelineResult] = []
-    for item in items:
-        result = await run_pipeline(
-            config, item, context=context, _parent_span_id=parent.id
-        )
-        results.append(result)
+    try:
+        results: list[PipelineResult] = []
+        for item in items:
+            result = await run_pipeline(
+                config, item, context=context, _parent_span_id=parent.id
+            )
+            results.append(result)
 
-    # Batch grading
-    batch_scores: list[Score] | None = None
-    if batch_grader:
-        await config.tracer.flush()
-        grade_span = config.tracer.start_span(
-            parent.id, SpanKind.GRADING, "batch_grade"
-        )
-        all_outputs = [r.output for r in results]
-        batch_scores = await batch_grader.grade(
-            items,
-            all_outputs,
-            context={
-                "raw_output": all_outputs,
-                "trace_id": parent.trace_id,
-            },
-        )
-        config.tracer.end_span(
-            grade_span.id,
-            output={"scores": [{"dimension": s.dimension, "value": s.value} for s in batch_scores]},
-        )
+        # Batch grading
+        batch_scores: list[Score] | None = None
+        if batch_grader:
+            await config.tracer.flush()
+            with span_guard(config.tracer, parent.id, SpanKind.GRADING, "batch_grade") as grade_span:
+                all_outputs = [r.output for r in results]
+                batch_scores = await batch_grader.grade(
+                    items,
+                    all_outputs,
+                    context={
+                        "raw_output": all_outputs,
+                        "trace_id": parent.trace_id,
+                    },
+                )
+                config.tracer.end_span(
+                    grade_span.id,
+                    output={"scores": [{"dimension": s.dimension, "value": s.value} for s in batch_scores]},
+                )
 
-    duration = (time.time() - start) * 1000
-    config.tracer.end_span(parent.id, output={"item_count": len(results)})
+        duration = (time.time() - start) * 1000
+        config.tracer.end_span(parent.id, output={"item_count": len(results)})
+        try:
+            await config.tracer.flush()
+        except Exception:
+            logger.exception("tracer.flush failed during map_pipeline finalization")
 
-    return MapResult(
-        results=results,
-        trace_id=parent.trace_id,
-        duration_ms=duration,
-        scores=batch_scores,
-    )
+        return MapResult(
+            results=results,
+            trace_id=parent.trace_id,
+            duration_ms=duration,
+            scores=batch_scores,
+        )
+    except Exception:
+        config.tracer.end_span(parent.id, error="unhandled exception")
+        try:
+            await config.tracer.flush()
+        except Exception:
+            logger.exception("tracer.flush failed during map_pipeline exception handling")
+        raise
