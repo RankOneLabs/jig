@@ -185,15 +185,19 @@ class OpenAIClient(LLMClient):
                 ToolCall(
                     id=tc.id,
                     name=tc.function.name,
-                    arguments=parse_tool_arguments(tc.function.arguments, "openai"),
+                    arguments=parse_tool_arguments(tc.function.arguments, self._provider_label),
                 )
                 for tc in choice.tool_calls
             ]
 
-        usage = Usage(
-            input_tokens=response.usage.prompt_tokens,
-            output_tokens=response.usage.completion_tokens,
-        )
+        raw_usage = getattr(response, "usage", None)
+        if raw_usage is not None:
+            usage = Usage(
+                input_tokens=getattr(raw_usage, "prompt_tokens", None) or 0,
+                output_tokens=getattr(raw_usage, "completion_tokens", None) or 0,
+            )
+        else:
+            usage = Usage(input_tokens=0, output_tokens=0)
         inline_cost = self._inline_cost(response)
         if inline_cost is not None:
             usage.cost = inline_cost
