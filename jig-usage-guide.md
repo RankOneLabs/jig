@@ -147,7 +147,7 @@ Every call to `run_pipeline(config, input)` executes a fixed sequence of steps y
    - Call `step.fn(ctx)`
    - Store the return value in `ctx[step.name]` and `step_outputs`
    - If `is_err(result)` → end span with error from `extract_err`, short-circuit (remaining steps don't run)
-   - If `step.grader` is set → grade in a `GRADING` sub-span, store in `step_scores`. If `feedback` is configured, call `feedback.score()`.
+   - If `step.grader` is set → grade in a `GRADING` sub-span, store in `step_scores`. If `feedback` is configured, register a feedback result and score that feedback result ID.
 4. **Pipeline grader** — if `config.grader` is set and no short-circuit, grade the overall (input, final output)
 5. **Close trace**, return `PipelineResult`
 
@@ -267,7 +267,7 @@ Step(
 )
 ```
 
-Per-step scores appear in `result.step_scores["summarize"]`. If `config.feedback` is also set, scores are stored via `feedback.score()` with a result ID of `{trace_id}:{step_name}`.
+Per-step scores appear in `result.step_scores["summarize"]`. If `config.feedback` is also set, the step output is first registered as a feedback result, then scores are stored against that returned feedback result ID. Trace IDs and step names remain queryable metadata; they are not used as unregistered score IDs.
 
 ### `map_pipeline`
 
@@ -468,6 +468,8 @@ config = AgentConfig(
 **Default: `None` (no auto-grading)**
 
 Automatically scores output after each run. In `run_agent`, scores are stored in the feedback loop and available to future runs via `get_signals()`. In `run_pipeline`, graders can be attached per-step (via `Step.grader`) or pipeline-wide (via `PipelineConfig.grader`).
+
+SQLite feedback storage enforces result/score integrity. See [SQLite feedback maintenance](docs/sqlite-feedback-maintenance.md) before reusing long-lived databases created by older jig versions.
 
 Graders accept `Any` for input and output, so they work with both string-based agent outputs and typed pipeline step outputs.
 
