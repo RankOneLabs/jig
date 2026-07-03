@@ -270,13 +270,14 @@ async def trace_diff(
     # Iterate the union so a grader dimension that exists in only one
     # trace still shows up — a dropped or added dimension is a real
     # regression the diff must surface. Missing side contributes 0.0
-    # (so an added dim appears as a positive delta, a dropped one
-    # negative).
+    # to the numeric delta, but asymmetric presence (one side None) is
+    # always a rubric change even when the present side scores 0.0.
     for dim in set(a_scores) | set(b_scores):
         a_val: float | None = a_scores.get(dim)
         b_val: float | None = b_scores.get(dim)
         delta = (b_val if b_val is not None else 0.0) - (a_val if a_val is not None else 0.0)
-        if delta != 0:
+        asymmetric = (a_val is None) != (b_val is None)
+        if delta != 0 or asymmetric:
             score_deltas[dim] = delta
         score_details[dim] = (a_val, b_val)
 

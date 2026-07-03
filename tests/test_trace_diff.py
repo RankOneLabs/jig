@@ -468,3 +468,33 @@ async def test_score_delta_zero_value_does_not_lose_dimension():
     diff = await trace_diff("a", "b", tracer=tracer)
     assert diff.score_deltas == {"quality": pytest.approx(0.5)}
     assert diff.score_details["quality"] == (pytest.approx(0.0), pytest.approx(0.5))
+
+
+@pytest.mark.asyncio
+async def test_added_dimension_with_zero_score_makes_identical_false():
+    """A dimension added in B with score 0.0 must still appear in score_deltas and
+    make identical=False — the numeric delta is 0.0 but the rubric changed."""
+    tracer = _StubTracer({
+        "a": [_root("a")],
+        "b": [_root("b"), _grading("b", [{"dimension": "quality", "value": 0.0}])],
+    })
+    diff = await trace_diff("a", "b", tracer=tracer)
+    assert "quality" in diff.score_deltas
+    assert diff.score_deltas["quality"] == pytest.approx(0.0)
+    assert diff.score_details["quality"] == (None, pytest.approx(0.0))
+    assert diff.identical is False
+
+
+@pytest.mark.asyncio
+async def test_dropped_dimension_with_zero_score_makes_identical_false():
+    """A dimension dropped from A where its score was 0.0 must still appear in
+    score_deltas and make identical=False."""
+    tracer = _StubTracer({
+        "a": [_root("a"), _grading("a", [{"dimension": "quality", "value": 0.0}])],
+        "b": [_root("b")],
+    })
+    diff = await trace_diff("a", "b", tracer=tracer)
+    assert "quality" in diff.score_deltas
+    assert diff.score_deltas["quality"] == pytest.approx(0.0)
+    assert diff.score_details["quality"] == (pytest.approx(0.0), None)
+    assert diff.identical is False
