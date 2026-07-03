@@ -39,6 +39,7 @@ class LazyConnection:
             if self._db is None:
                 conn = await aiosqlite.connect(self._db_path)
                 try:
+                    await conn.execute("PRAGMA foreign_keys=ON")
                     await conn.executescript(self._schema)
                 except BaseException:
                     await conn.close()

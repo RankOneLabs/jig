@@ -35,6 +35,7 @@ def _make_fake_connect_factory() -> tuple[Any, list[Any]]:
         # critical section if locking is broken.
         await asyncio.sleep(0)
         conn = MagicMock(name=f"conn-{len(created)}")
+        conn.execute = AsyncMock()
         conn.executescript = AsyncMock()
         created.append(conn)
         return conn
