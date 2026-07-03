@@ -9,6 +9,7 @@ import numpy as np
 
 from jig._embed import ollama_embed
 from jig._sqlite import LazyConnection, json_dumps, json_loads
+from jig.feedback.validation import validate_scores
 from jig.core.types import (
     EvalCase,
     FeedbackLoop,
@@ -81,6 +82,7 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         return result_id
 
     async def score(self, result_id: str, scores: list[Score]) -> None:
+        validate_scores(scores)
         db = await self._get_db()
         now = datetime.now().isoformat()
         for s in scores:
@@ -229,27 +231,44 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         max_score: float | None = None,
         limit: int | None = None,
     ) -> list[EvalCase]:
+        if limit is not None:
+            if isinstance(limit, bool) or limit < 0:
+                raise ValueError(
+                    f"export_eval_set limit must be a non-negative integer, got {limit!r}"
+                )
+            if limit == 0:
+                return []
+        if (
+            min_score is not None
+            and max_score is not None
+            and min_score > max_score
+        ):
+            raise ValueError(
+                f"min_score ({min_score}) must not exceed max_score ({max_score})"
+            )
+
         db = await self._get_db()
-        query = "SELECT id, content, input, metadata, created_at FROM results"
+        sql = "SELECT id, content, input, metadata, created_at FROM results"
         params: list[Any] = []
         if since:
-            query += " WHERE created_at >= ?"
+            sql += " WHERE created_at >= ?"
             params.append(since.isoformat())
-        query += " ORDER BY created_at DESC"
-        if limit:
-            query += " LIMIT ?"
-            params.append(limit)
+        sql += " ORDER BY created_at DESC"
 
-        cursor = await db.execute(query, params)
-        rows = await cursor.fetchall()
+        rows = await (await db.execute(sql, params)).fetchall()
+
+        score_filter_active = min_score is not None or max_score is not None
 
         cases: list[EvalCase] = []
         for rid, content, inp, meta_json, _ in rows:
-            score_cursor = await db.execute(
-                "SELECT dimension, value, source FROM scores WHERE result_id = ?", (rid,)
-            )
-            score_rows = await score_cursor.fetchall()
+            score_rows = await (await db.execute(
+                "SELECT dimension, value, source FROM scores WHERE result_id = ?",
+                (rid,),
+            )).fetchall()
+
             if not score_rows:
+                # Unscored rows don't qualify when any score filter is active;
+                # also skip them unconditionally (consistent with query()).
                 continue
 
             avg = sum(v for _, v, _ in score_rows) / len(score_rows)
@@ -267,6 +286,8 @@ class SQLiteFeedbackLoop(FeedbackLoop):
                     metadata=meta,
                 )
             )
+            if limit is not None and len(cases) >= limit:
+                break
 
         return cases
 
