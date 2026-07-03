@@ -12,7 +12,6 @@ from jig import AgentConfig, CompletionParams, LLMResponse, Score, ScoreSource, 
 from jig.core.types import Grader, LLMClient, TracingLogger
 from jig.feedback.loop import SQLiteFeedbackLoop
 from jig.tools import ToolRegistry
-from jig.tracing import SQLiteTracer
 from jig.replay.diff import TraceDiff
 from jig.tracing import SQLiteTracer
 

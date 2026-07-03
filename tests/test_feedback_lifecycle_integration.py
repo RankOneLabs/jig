@@ -18,7 +18,6 @@ import pytest
 
 from jig import AgentConfig, CompletionParams, LLMResponse, PipelineConfig, Score, ScoreSource, Step, Usage, run_agent, run_pipeline
 from jig.core.types import (
-    EvalCase,
     FeedbackQuery,
     Grader,
     LLMClient,
