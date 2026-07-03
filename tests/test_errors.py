@@ -767,3 +767,228 @@ class TestPostOutputFailSoft:
 
         assert result.output == "result"
         assert result.error is None
+
+
+# ---------------------------------------------------------------------------
+# Adapter error boundary tests
+# ---------------------------------------------------------------------------
+
+
+class TestGeminiAdapterErrorBoundaries:
+    """GeminiClient error classification and nullable field handling.
+
+    These tests mock the google-genai SDK so they run without the optional
+    dependency installed. Each test targets a provider-specific edge case
+    called out by the lifecycle-hardening spec.
+    """
+
+    def _make_genai_mocks(self):
+        """Return minimal SimpleNamespace mocks for the genai module and types."""
+        import types as _types
+        genai_mock = _types.SimpleNamespace()
+        genai_types_mock = _types.SimpleNamespace()
+
+        # Types stubs used by GeminiClient.__init__ and complete()
+        genai_types_mock.Content = object
+        genai_types_mock.Part = object
+        genai_types_mock.FunctionCall = object
+        genai_types_mock.FunctionResponse = object
+        genai_types_mock.FunctionDeclaration = object
+        genai_types_mock.Tool = object
+        genai_types_mock.GenerateContentConfig = object
+
+        return genai_mock, genai_types_mock
+
+    @pytest.mark.asyncio
+    async def test_none_usage_metadata_normalizes_to_zero(self, monkeypatch):
+        """usage_metadata=None from Gemini API yields 0 tokens, not AttributeError.
+
+        Gemini can omit usage metadata on certain request types (e.g., cached
+        content). The adapter must treat it as 0/0 so Usage.input_tokens and
+        output_tokens are always integers.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import types as _types
+
+        # Stub out genai at the module level so GeminiClient skips the ImportError guard
+        genai_stub = MagicMock()
+        genai_types_stub = MagicMock()
+
+        # GenerateContentConfig must be constructable
+        genai_types_stub.GenerateContentConfig.return_value = MagicMock()
+        genai_types_stub.Content = MagicMock
+        genai_types_stub.Part = MagicMock
+
+        candidate = MagicMock()
+        candidate.content.parts = []  # no tool calls, no text
+        response = MagicMock()
+        response.candidates = [candidate]
+        response.usage_metadata = None  # the edge case
+
+        genai_stub.Client.return_value.aio.models.generate_content = AsyncMock(return_value=response)
+
+        with patch.dict("sys.modules", {
+            "google": MagicMock(),
+            "google.genai": genai_stub,
+            "google.genai.types": genai_types_stub,
+        }):
+            with patch("jig.llm.google.genai", genai_stub), \
+                 patch("jig.llm.google.genai_types", genai_types_stub):
+                from jig.llm.google import GeminiClient
+                client = GeminiClient.__new__(GeminiClient)
+                client._client = genai_stub.Client()
+                client._model = "gemini-test"
+
+                params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
+                result = await client.complete(params)
+
+        assert result.usage.input_tokens == 0
+        assert result.usage.output_tokens == 0
+
+    @pytest.mark.asyncio
+    async def test_none_token_counts_normalize_to_zero(self, monkeypatch):
+        """Individual token count fields that are None become 0.
+
+        prompt_token_count and candidates_token_count can both be None on
+        empty/cached responses. The adapter normalizes via `or 0`.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        genai_stub = MagicMock()
+        genai_types_stub = MagicMock()
+        genai_types_stub.GenerateContentConfig.return_value = MagicMock()
+        genai_types_stub.Content = MagicMock
+        genai_types_stub.Part = MagicMock
+
+        candidate = MagicMock()
+        candidate.content.parts = []
+        response = MagicMock()
+        response.candidates = [candidate]
+        # usage_metadata present but individual counts are None
+        response.usage_metadata = MagicMock()
+        response.usage_metadata.prompt_token_count = None
+        response.usage_metadata.candidates_token_count = None
+
+        genai_stub.Client.return_value.aio.models.generate_content = AsyncMock(return_value=response)
+
+        with patch("jig.llm.google.genai", genai_stub), \
+             patch("jig.llm.google.genai_types", genai_types_stub):
+            from jig.llm.google import GeminiClient
+            client = GeminiClient.__new__(GeminiClient)
+            client._client = genai_stub.Client()
+            client._model = "gemini-test"
+
+            params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
+            result = await client.complete(params)
+
+        assert result.usage.input_tokens == 0
+        assert result.usage.output_tokens == 0
+
+    @pytest.mark.asyncio
+    async def test_request_preparation_failure_raises_jig_llm_error(self):
+        """A failure in _convert_messages wraps in JigLLMError, not a raw exception.
+
+        Schema conversion or FunctionResponse validation can raise. The outer
+        try/except in GeminiClient.complete() must catch these and re-raise as
+        JigLLMError so the runner can classify the error correctly.
+        """
+        from unittest.mock import MagicMock, patch
+
+        genai_stub = MagicMock()
+        genai_types_stub = MagicMock()
+        # Make GenerateContentConfig raise to trigger the request-prep error boundary
+        genai_types_stub.GenerateContentConfig.side_effect = ValueError("nested schema unsupported")
+        genai_types_stub.Content = MagicMock
+        genai_types_stub.Part = MagicMock
+
+        with patch("jig.llm.google.genai", genai_stub), \
+             patch("jig.llm.google.genai_types", genai_types_stub):
+            from jig.llm.google import GeminiClient
+            client = GeminiClient.__new__(GeminiClient)
+            client._client = genai_stub.Client()
+            client._model = "gemini-test"
+
+            params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
+            with pytest.raises(JigLLMError) as exc_info:
+                await client.complete(params)
+
+        err = exc_info.value
+        assert err.provider == "google"
+        assert "Request preparation failed" in str(err) or "nested schema unsupported" in str(err)
+
+
+class TestOllamaAdapterErrorBoundaries:
+    """OllamaClient transport error classification.
+
+    Verifies that httpx transport errors are wrapped in JigLLMError
+    so the runner can classify and route them correctly.
+    """
+
+    @pytest.mark.asyncio
+    async def test_httpx_read_error_becomes_jig_llm_error_retryable(self):
+        """httpx.ReadError (transport-level) is classified as retryable JigLLMError.
+
+        ReadError is a subclass of TransportError — it occurs when the TCP
+        connection drops mid-response. The adapter wraps it as retryable so
+        the runner's consecutive-errors path handles transient Ollama restarts.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import httpx
+
+        ollama_stub = MagicMock()
+        ollama_stub.AsyncClient = MagicMock
+
+        with patch("jig.llm.ollama._ollama", ollama_stub), \
+             patch("jig.llm.ollama.OllamaAsyncClient", ollama_stub.AsyncClient):
+            from jig.llm.ollama import OllamaClient
+            client = OllamaClient.__new__(OllamaClient)
+            client._client = MagicMock()
+            client._model = "llama3.1"
+
+            # httpx.ReadError is a TransportError — simulates dropped connection
+            read_error = httpx.ReadError("connection reset", request=MagicMock())
+            client._client.chat = AsyncMock(side_effect=read_error)
+
+            params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
+            with pytest.raises(JigLLMError) as exc_info:
+                await client.complete(params)
+
+        err = exc_info.value
+        assert err.provider == "ollama"
+        assert err.retryable is True
+
+    @pytest.mark.asyncio
+    async def test_httpx_status_error_preserves_status_code(self):
+        """httpx.HTTPStatusError status code is preserved in JigLLMError.
+
+        When Ollama returns a non-2xx response, the status code must flow
+        through so the runner's permanent-error detection can act on 4xx.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import httpx
+
+        ollama_stub = MagicMock()
+
+        with patch("jig.llm.ollama._ollama", ollama_stub), \
+             patch("jig.llm.ollama.OllamaAsyncClient", ollama_stub.AsyncClient):
+            from jig.llm.ollama import OllamaClient
+            client = OllamaClient.__new__(OllamaClient)
+            client._client = MagicMock()
+            client._model = "llama3.1"
+
+            mock_response = MagicMock()
+            mock_response.status_code = 503
+            http_err = httpx.HTTPStatusError(
+                "503 service unavailable",
+                request=MagicMock(),
+                response=mock_response,
+            )
+            client._client.chat = AsyncMock(side_effect=http_err)
+
+            params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
+            with pytest.raises(JigLLMError) as exc_info:
+                await client.complete(params)
+
+        err = exc_info.value
+        assert err.provider == "ollama"
+        assert err.status_code == 503
