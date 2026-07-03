@@ -238,8 +238,8 @@ async def run_pipeline(
                 config.tracer.end_span(grade_span.id, error=str(exc))
                 raise
 
-    except Exception:
-        config.tracer.end_span(root.id, error="unhandled exception")
+    except Exception as exc:
+        config.tracer.end_span(root.id, error=f"{type(exc).__name__}: {exc}")
         try:
             await config.tracer.flush()
         except Exception:
@@ -325,8 +325,8 @@ async def map_pipeline(
             duration_ms=duration,
             scores=batch_scores,
         )
-    except Exception:
-        config.tracer.end_span(parent.id, error="unhandled exception")
+    except Exception as exc:
+        config.tracer.end_span(parent.id, error=f"{type(exc).__name__}: {exc}")
         try:
             await config.tracer.flush()
         except Exception:
