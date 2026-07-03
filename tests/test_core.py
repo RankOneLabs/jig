@@ -414,6 +414,39 @@ async def test_auto_grading():
     assert feedback.scored[0][0] == "r-1"
 
 
+async def test_auto_grading_empty_scores_skips_feedback_persistence():
+    class EmptyGrader(Grader):
+        async def grade(self, input: str, output: str, context: dict[str, Any] | None = None) -> list[Score]:
+            return []
+
+    feedback = FakeFeedback()
+    tracer = FakeTracer()
+    llm = FakeLLM([
+        LLMResponse(content="No comparison available", tool_calls=None, usage=Usage(10, 5), latency_ms=50, model="fake"),
+    ])
+    result = await run_agent(
+        AgentConfig(
+            name="test",
+            description="test agent",
+            system_prompt="test",
+            llm=llm,
+            store=FakeMemory(), retriever=None,
+            feedback=feedback,
+            tracer=tracer,
+            tools=ToolRegistry(),
+            grader=EmptyGrader(),
+        ),
+        "test input",
+    )
+
+    assert result.scores == []
+    assert feedback.stored == []
+    assert feedback.scored == []
+
+    grade_span = next(s for s in tracer.spans if s.kind == SpanKind.GRADING)
+    assert grade_span.output == {"scores": []}
+
+
 async def test_tool_registry_unknown_tool():
     registry = ToolRegistry()
     result = await registry.execute(ToolCall(id="x", name="nonexistent", arguments={}))

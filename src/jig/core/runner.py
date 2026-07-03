@@ -698,30 +698,31 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                     "trace_id": trace.trace_id,
                 },
             )
-            fb_meta: dict[str, Any] = {
-                "kind": "agent_result",
-                "agent_name": config.name,
-                "source": "run_agent",
-                "trace_id": trace.trace_id,
+            feedback_result_id: str | None = None
+            if scores:
+                fb_meta: dict[str, Any] = {
+                    "kind": "agent_result",
+                    "agent_name": config.name,
+                    "source": "run_agent",
+                    "trace_id": trace.trace_id,
+                }
+                model_id = _resolve_model_id(config.llm)
+                if model_id is not None:
+                    fb_meta["model"] = model_id
+                if config.session_id is not None:
+                    fb_meta["session_id"] = config.session_id
+                if memory_id is not None:
+                    fb_meta["memory_id"] = memory_id
+                feedback_result_id = await config.feedback.store_result(
+                    final_output, input, fb_meta
+                )
+                await config.feedback.score(feedback_result_id, scores)
+            span_output: dict[str, Any] = {
+                "scores": [{"dimension": s.dimension, "value": s.value} for s in scores],
             }
-            model_id = _resolve_model_id(config.llm)
-            if model_id is not None:
-                fb_meta["model"] = model_id
-            if config.session_id is not None:
-                fb_meta["session_id"] = config.session_id
-            if memory_id is not None:
-                fb_meta["memory_id"] = memory_id
-            feedback_result_id = await config.feedback.store_result(
-                final_output, input, fb_meta
-            )
-            await config.feedback.score(feedback_result_id, scores)
-            config.tracer.end_span(
-                grade_span.id,
-                {
-                    "feedback_result_id": feedback_result_id,
-                    "scores": [{"dimension": s.dimension, "value": s.value} for s in scores],
-                },
-            )
+            if feedback_result_id is not None:
+                span_output["feedback_result_id"] = feedback_result_id
+            config.tracer.end_span(grade_span.id, span_output)
     finally:
         # Always close the root span + flush the tracer, even if an
         # exception propagates mid-run. Buffered tracers (SQLiteTracer)
