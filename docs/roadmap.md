@@ -27,12 +27,19 @@ comparable, and debuggable.
 - A stable error taxonomy (`AgentError` hierarchy with `category`
   tags) makes error counts first-class sweep metrics.
 
-**Feedback loop**
+**Feedback loop** *(SQLite path integration-tested end-to-end)*
 
 - Quality scores from past runs feed back into the prompt
-  automatically via `FeedbackLoop`.
+  automatically via `FeedbackLoop` (`SQLiteFeedbackLoop`).
 - `await feedback.export_eval_set()` exports promptfoo-compatible test
   cases for batch evaluation.
+- The full lifecycle — `run_agent` / `run_pipeline` → `store_result` →
+  `score` → `query` / `get_signals` / `export_eval_set` — is proven by
+  integration tests against a real SQLite database.
+- Long-lived SQLite feedback databases from older versions may need orphan-score
+  cleanup before strict foreign-key enforcement; see
+  [SQLite feedback maintenance](sqlite-feedback-maintenance.md).
+- Honcho and Zep adapters exist but are not integration-tested.
 
 **Trace and replay agent runs**
 
@@ -59,7 +66,8 @@ comparable, and debuggable.
 
 - `MemoryStore` (persistence) and `Retriever` (retrieval strategy) as
   separate, composable interfaces.
-- Built-in: local SQLite + embeddings. Optional: Honcho, Zep.
+- Built-in: local SQLite + embeddings. Optional: Honcho, Zep (not
+  integration-tested in this repo).
 
 ## What's next
 

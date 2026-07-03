@@ -9,6 +9,7 @@ import pytest
 
 from jig import (
     CommitteeJudge,
+    GradeParseError,
     PairwiseLLMJudge,
     Score,
     ScoreSource,
@@ -210,16 +211,15 @@ async def test_pairwise_tie_returns_half():
     assert scores[0].source == ScoreSource.LLM_JUDGE
 
 
-async def test_pairwise_unknown_winner_value_returns_tie():
-    """JSON parses but ``winner`` isn't A/B/tie → score as a tie,
-    not as a loss. A meaningless verdict is "no opinion."
+async def test_pairwise_unknown_winner_value_raises():
+    """JSON parses but ``winner`` isn't A/B/tie → GradeParseError.
+    An unexpected verdict is a protocol failure, not a valid tie score.
     """
     judge = PairwiseLLMJudge(_FakeLLM(["neither"]), seed=0)
-    scores = await judge.grade(
-        "i", "self", context={"compare_to": {"output": "other", "id": "z"}}
-    )
-    assert scores[0].dimension == "vs_z"
-    assert scores[0].value == 0.5
+    with pytest.raises(GradeParseError, match="unexpected winner"):
+        await judge.grade(
+            "i", "self", context={"compare_to": {"output": "other", "id": "z"}}
+        )
 
 
 async def test_pairwise_distinguishes_none_from_empty_criteria():
@@ -237,15 +237,14 @@ async def test_pairwise_distinguishes_none_from_empty_criteria():
     assert j_empty._criteria == []
 
 
-async def test_pairwise_handles_malformed_judge_response():
-    """Bad JSON from the judge → score as a tie, don't raise."""
+async def test_pairwise_raises_on_malformed_judge_response():
+    """Bad JSON from the judge raises GradeParseError — not a tie score.
+    A parse failure is an infrastructure failure, not a verdict."""
     judge = PairwiseLLMJudge(_BadJsonLLM(), seed=0)
-    scores = await judge.grade(
-        "i", "self", context={"compare_to": {"output": "other", "id": "z"}}
-    )
-    assert len(scores) == 1
-    assert scores[0].value == 0.5  # tie fallback
-    assert scores[0].dimension == "vs_z"
+    with pytest.raises(GradeParseError):
+        await judge.grade(
+            "i", "self", context={"compare_to": {"output": "other", "id": "z"}}
+        )
 
 
 class _FencedVerdictLLM(LLMClient):
@@ -401,3 +400,24 @@ async def test_committee_warns_on_dimension_set_mismatch():
     assert by_dim["q"] == pytest.approx(0.7)
     # 'speed' only reported by the first judge → mean is 0.5
     assert by_dim["speed"] == pytest.approx(0.5)
+
+
+class _RaisingGrader(Grader):
+    """Always raises GradeParseError — used to verify CommitteeJudge
+    propagates failures rather than swallowing them."""
+
+    async def grade(
+        self, input: Any, output: Any, context: dict[str, Any] | None = None
+    ) -> list[Score]:
+        raise GradeParseError("simulated parse failure")
+
+
+async def test_committee_propagates_grade_parse_error():
+    """If any member judge raises GradeParseError, CommitteeJudge must
+    propagate it. Averaging a failed judge as 0.0 is explicitly rejected."""
+    committee = CommitteeJudge([
+        _FixedGrader([Score(dimension="q", value=0.8, source=ScoreSource.LLM_JUDGE)]),
+        _RaisingGrader(),
+    ])
+    with pytest.raises(GradeParseError):
+        await committee.grade("i", "o")

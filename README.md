@@ -75,13 +75,17 @@ print(result.output)
 | Interface | Purpose | Adapters |
 |---|---|---|
 | `LLMClient` | LLM completions | Anthropic, OpenAI, OpenRouter, Gemini, Ollama, Dispatch (optional Smithers backend) |
-| `MemoryStore` | Persistence + session history | Local (SQLite + embeddings), Honcho, Zep |
-| `Retriever` | Prompt-context strategy | DenseRetriever (embeddings), HonchoMemory, ZepMemory |
-| `FeedbackLoop` | Score tracking + eval export | SQLite |
+| `MemoryStore` | Persistence + session history | Local (SQLite + embeddings), Honcho\*, Zep\* |
+| `Retriever` | Prompt-context strategy | DenseRetriever (embeddings), HonchoMemory\*, ZepMemory\* |
+| `FeedbackLoop` | Score tracking + eval export | SQLite (integration-tested end-to-end) |
 | `Grader` | Auto-score outputs | LLM Judge, Heuristic, Ground Truth, Composite |
 | `TracingLogger` | Structured spans | SQLite, Stdout |
 
 Plus `ToolRegistry` (concrete) and `Tool` (abstract) for tool use.
+
+\* Honcho and Zep adapters exist but are not covered by integration tests in this repo.
+The SQLite path (`LocalMemory`, `SQLiteFeedbackLoop`) is the verified baseline.
+For older feedback databases, see [SQLite feedback maintenance](docs/sqlite-feedback-maintenance.md).
 
 ## Two execution models
 

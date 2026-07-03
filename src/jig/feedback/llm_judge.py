@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from jig.core.errors import GradeParseError
 from jig.core.types import (
     CompletionParams,
     Grader,
@@ -13,6 +14,7 @@ from jig.core.types import (
     ScoreSource,
 )
 from jig.feedback.parsing import strip_markdown_fence
+from jig.feedback.validation import validate_scores
 
 _SYSTEM_PROMPT = """You are an evaluation judge. Grade the assistant's output on the specified dimensions.
 
@@ -58,20 +60,36 @@ class LLMJudge(Grader):
 
         try:
             data = json.loads(strip_markdown_fence(response.content))
-            return [
+            scores = [
                 Score(
                     dimension=s["dimension"],
-                    value=max(0.0, min(1.0, float(s["value"]))),
+                    value=float(s["value"]),
                     source=ScoreSource.LLM_JUDGE,
                 )
                 for s in data["scores"]
             ]
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            # ValueError covers float() failing on a non-numeric
-            # ``value`` (e.g., a string like "high"); without it the
-            # exception would bubble out of grade() and break the
-            # documented fail-soft contract.
-            return [
-                Score(dimension=d, value=0.0, source=ScoreSource.LLM_JUDGE)
-                for d in self._dimensions
-            ]
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise GradeParseError(
+                f"LLMJudge could not parse judge response: {exc}"
+            ) from exc
+
+        try:
+            returned_dims = {s.dimension for s in scores}
+        except TypeError as exc:
+            raise GradeParseError(
+                f"LLMJudge response contains unhashable dimension value: {exc}"
+            ) from exc
+        missing = [d for d in self._dimensions if d not in returned_dims]
+        if missing:
+            raise GradeParseError(
+                f"LLMJudge response missing required dimensions: {missing}"
+            )
+
+        try:
+            validate_scores(scores)
+        except ValueError as exc:
+            raise GradeParseError(
+                f"LLMJudge returned invalid score values: {exc}"
+            ) from exc
+
+        return scores

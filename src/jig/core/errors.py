@@ -172,6 +172,15 @@ class AgentSchemaNotCalledError(AgentError):
         self.retries = retries
 
 
+class GradeParseError(JigError):
+    """Raised when a judge cannot parse the LLM response into valid scores.
+
+    Distinct from a low-quality answer: the judge infrastructure failed,
+    not the model under evaluation. Callers must not treat this as a
+    score of 0.0 or any other numeric value.
+    """
+
+
 class AgentAmbiguousTurnError(AgentError):
     """Model kept emitting submit_output alongside other tool calls.
 
