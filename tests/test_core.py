@@ -78,10 +78,12 @@ class FakeMemory(MemoryStore, Retriever):
 
 class FakeFeedback(FeedbackLoop):
     def __init__(self) -> None:
+        self.stored: list[tuple[str, str, dict | None]] = []
         self.scored: list[tuple[str, list[Score]]] = []
 
     async def store_result(self, content, input_text, metadata=None):
-        return "r-0"
+        self.stored.append((content, input_text, metadata))
+        return f"r-{len(self.stored)}"
 
     async def score(self, result_id: str, scores: list[Score]) -> None:
         self.scored.append((result_id, scores))
@@ -403,7 +405,13 @@ async def test_auto_grading():
     )
     assert result.scores is not None
     assert result.scores[0].value == 1.0
+    # store_result must be called once before score
+    assert len(feedback.stored) == 1
+    assert feedback.stored[0][0] == "Great answer"  # content is final output
+    assert feedback.stored[0][1] == "test input"    # input_text is user input
     assert len(feedback.scored) == 1
+    # score must reference the feedback_result_id returned by store_result
+    assert feedback.scored[0][0] == "r-1"
 
 
 async def test_tool_registry_unknown_tool():
