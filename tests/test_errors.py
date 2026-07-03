@@ -599,6 +599,69 @@ class TestTerminatedRunSkipsBookkeeping:
         assert isinstance(result.error, AgentMaxLLMRetriesError)
         assert grade_calls == [], "grader.grade must not be called for terminated runs"
 
+    async def test_terminated_run_skips_session_append(self):
+        """Session history is not updated when the run terminates.
+
+        Sentinel text like '[agent terminated: ...]' must not appear in the
+        session assistant content so subsequent retrievals don't see garbage.
+        """
+        session_writes: list[tuple[str, str]] = []  # (session_id, role)
+
+        class TrackingMemory(FakeMemory):
+            async def add_to_session(self, session_id, message):
+                session_writes.append((session_id, message.role.value))
+
+        err = JigLLMError("down", "fake", retryable=True)
+        llm = FakeLLM([err, err])
+        result = await run_agent(
+            _config(
+                llm,
+                max_llm_retries=2,
+                store=TrackingMemory(),
+                session_id="test-session",
+            ),
+            "go",
+        )
+        assert isinstance(result.error, AgentMaxLLMRetriesError)
+        assert session_writes == [], (
+            "add_to_session must not be called for terminated runs; "
+            f"got {session_writes}"
+        )
+
+    async def test_terminated_run_skips_feedback_scoring(self):
+        """Feedback store_result/score are not called when the run terminates."""
+        store_calls: list[str] = []
+        score_calls: list[str] = []
+
+        class TrackingFeedback(FakeFeedback):
+            async def store_result(self, content, input_text, metadata=None):
+                store_calls.append(content)
+                return "r"
+
+            async def score(self, result_id, scores):
+                score_calls.append(result_id)
+
+        from jig.core.types import Grader, Score, ScoreSource
+
+        class FixedGrader(Grader):
+            async def grade(self, input, output, context=None):
+                return [Score(dimension="q", value=1.0, source=ScoreSource.HEURISTIC)]
+
+        err = JigLLMError("down", "fake", retryable=True)
+        llm = FakeLLM([err, err])
+        result = await run_agent(
+            _config(
+                llm,
+                max_llm_retries=2,
+                feedback=TrackingFeedback(),
+                grader=FixedGrader(),
+            ),
+            "go",
+        )
+        assert isinstance(result.error, AgentMaxLLMRetriesError)
+        assert store_calls == [], "feedback.store_result must not be called for terminated runs"
+        assert score_calls == [], "feedback.score must not be called for terminated runs"
+
 
 @pytest.mark.asyncio
 class TestPreOutputSpanLifecycle:
@@ -637,7 +700,12 @@ class TestPreOutputSpanLifecycle:
 
 @pytest.mark.asyncio
 class TestPostOutputFailSoft:
-    """Grading failures after a valid output must not erase the result."""
+    """Post-output bookkeeping failures must not erase a valid output.
+
+    Each secondary operation (memory store, session append, feedback store/score,
+    grader) is wrapped in its own try/except after the valid output is produced.
+    Failures are logged and the output is returned unchanged.
+    """
 
     async def test_grading_failure_does_not_erase_output(self):
         """If grader.grade raises, run_agent still returns the valid output."""
@@ -658,3 +726,44 @@ class TestPostOutputFailSoft:
         assert result.output == "the answer"
         assert result.error is None
         assert result.scores is None  # grading didn't complete
+
+    async def test_session_append_failure_does_not_erase_output(self):
+        """store.add_to_session failure after valid output is fail-soft."""
+
+        class FlakyMemory(FakeMemory):
+            async def add_to_session(self, session_id, message):
+                raise RuntimeError("session DB locked")
+
+        llm = FakeLLM([
+            LLMResponse(content="hello", tool_calls=None, usage=Usage(1, 1), latency_ms=1, model="fake"),
+        ])
+        result = await run_agent(
+            _config(llm, store=FlakyMemory(), session_id="s1"),
+            "hi",
+        )
+
+        assert result.output == "hello"
+        assert result.error is None
+
+    async def test_feedback_store_failure_does_not_erase_output(self):
+        """feedback.store_result failure during grading is fail-soft."""
+        from jig.core.types import Grader, Score, ScoreSource
+
+        class FixedGrader(Grader):
+            async def grade(self, input, output, context=None):
+                return [Score(dimension="q", value=1.0, source=ScoreSource.HEURISTIC)]
+
+        class BrokenFeedback(FakeFeedback):
+            async def store_result(self, content, input_text, metadata=None):
+                raise RuntimeError("feedback DB write failed")
+
+        llm = FakeLLM([
+            LLMResponse(content="result", tool_calls=None, usage=Usage(1, 1), latency_ms=1, model="fake"),
+        ])
+        result = await run_agent(
+            _config(llm, feedback=BrokenFeedback(), grader=FixedGrader()),
+            "hi",
+        )
+
+        assert result.output == "result"
+        assert result.error is None

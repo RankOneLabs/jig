@@ -203,3 +203,98 @@ async def test_flush_safe_under_concurrent_start_span(tracer: SQLiteTracer) -> N
     for i in range(50):
         assert f"pre-{i}" in names
         assert f"concurrent-{i}" in names
+
+
+# ---------------------------------------------------------------------------
+# Pipeline failure acceptance tests (SQLiteTracer-backed)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pipeline_step_failure_immediately_readable(tmp_path: Any) -> None:
+    """A failing pipeline step leaves root and step spans readable in SQLiteTracer
+    immediately after run_pipeline raises — no manual flush required by the caller.
+
+    This is the acceptance test for the pipeline trace-flush guarantee introduced
+    in the lifecycle hardening cohort: run_pipeline must close the root span and
+    flush the tracer in all exit paths, including exception propagation.
+    """
+    db = SQLiteTracer(db_path=str(tmp_path / "fail.db"))
+
+    captured_trace_ids: list[str] = []
+    _orig = db.start_trace
+
+    def _capture(*args: Any, **kwargs: Any) -> Any:
+        span = _orig(*args, **kwargs)
+        captured_trace_ids.append(span.trace_id)
+        return span
+
+    db.start_trace = _capture  # type: ignore[method-assign]
+
+    async def boom(ctx: dict[str, Any]) -> str:
+        raise ValueError("step exploded")
+
+    try:
+        await run_pipeline(
+            PipelineConfig(
+                name="failing",
+                steps=[Step(name="boom", fn=boom)],
+                tracer=db,
+            ),
+            input=1,
+        )
+    except ValueError:
+        pass
+
+    assert captured_trace_ids, "start_trace was never called"
+    spans = await db.get_trace(captured_trace_ids[0])
+
+    root = next((s for s in spans if s.kind == SpanKind.PIPELINE_RUN), None)
+    assert root is not None, "pipeline root span must be flushed to DB on exception"
+    assert root.ended_at is not None, "root span must be closed"
+    assert root.error is not None, "root span must record the error"
+
+    step = next((s for s in spans if s.kind == SpanKind.PIPELINE_STEP), None)
+    assert step is not None, "failing step span must be flushed to DB"
+    assert step.ended_at is not None, "step span must be closed"
+    assert step.error is not None, "step span must record the error"
+    # Error detail must be non-empty so callers can diagnose without log scraping
+    assert "ValueError" in step.error or "step exploded" in step.error
+
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_graderless_pipeline_success_immediately_readable(tmp_path: Any) -> None:
+    """A pipeline with no grader still flushes spans immediately on success.
+
+    Proves that the tracer flush guarantee covers the no-grader path (where there
+    is no pre-grade flush call), so callers always see completed spans after
+    run_pipeline returns without having to call tracer.flush() themselves.
+    """
+    db = SQLiteTracer(db_path=str(tmp_path / "nograde.db"))
+
+    async def add_one(ctx: dict[str, Any]) -> int:
+        return ctx["input"] + 1
+
+    result = await run_pipeline(
+        PipelineConfig(
+            name="nograde",
+            steps=[Step(name="add_one", fn=add_one)],
+            tracer=db,
+        ),
+        input=10,
+    )
+    assert result.output == 11
+
+    spans = await db.get_trace(result.trace_id)
+    assert len(spans) == 2  # pipeline_run + pipeline_step
+
+    root = next(s for s in spans if s.kind == SpanKind.PIPELINE_RUN)
+    assert root.ended_at is not None
+
+    step = next(s for s in spans if s.kind == SpanKind.PIPELINE_STEP)
+    assert step.ended_at is not None
+    assert step.error is None
+
+    await db.close()
