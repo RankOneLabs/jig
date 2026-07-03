@@ -7,14 +7,13 @@ Covers:
 """
 from __future__ import annotations
 
-import math
-import tempfile
+import sqlite3
 from datetime import datetime
 
 import numpy as np
 import pytest
 
-from jig.core.types import EvalCase, Score, ScoreSource
+from jig.core.types import Score, ScoreSource
 from jig.feedback.loop import SQLiteFeedbackLoop
 from jig.feedback.validation import validate_scores
 
@@ -42,8 +41,8 @@ def feedback_db(tmp_path):
 @pytest.mark.asyncio
 class TestForeignKeyEnforcement:
     async def test_score_unknown_result_id_raises(self, feedback_db):
-        """Scoring a result_id that does not exist must fail, not silently insert."""
-        with pytest.raises(Exception):
+        """Scoring a result_id that does not exist must raise an IntegrityError."""
+        with pytest.raises(sqlite3.IntegrityError):
             await feedback_db.score(
                 "nonexistent-id",
                 [Score("quality", 0.9, ScoreSource.HEURISTIC)],
@@ -54,11 +53,10 @@ class TestForeignKeyEnforcement:
         # Must not raise.
         await feedback_db.score(rid, [Score("quality", 0.9, ScoreSource.HEURISTIC)])
 
-    async def test_orphan_score_is_not_queryable(self, feedback_db):
-        """Even if FK is somehow bypassed, ensure orphan rows can't pollute queries."""
+    async def test_valid_score_appears_in_query(self, feedback_db):
+        """A scored result is retrievable via query()."""
         rid = await feedback_db.store_result("content", "input", {})
         await feedback_db.score(rid, [Score("quality", 0.9, ScoreSource.HEURISTIC)])
-        # Scores for the valid result must be present.
         from jig.core.types import FeedbackQuery
         results = await feedback_db.query(FeedbackQuery())
         assert len(results) == 1

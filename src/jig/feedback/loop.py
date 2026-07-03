@@ -232,7 +232,7 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         limit: int | None = None,
     ) -> list[EvalCase]:
         if limit is not None:
-            if isinstance(limit, bool) or limit < 0:
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
                 raise ValueError(
                     f"export_eval_set limit must be a non-negative integer, got {limit!r}"
                 )
@@ -255,9 +255,10 @@ class SQLiteFeedbackLoop(FeedbackLoop):
             params.append(since.isoformat())
         sql += " ORDER BY created_at DESC"
 
+        # Full result set is materialized before filtering; acceptable for current corpus
+        # sizes. A windowed/streaming approach (like query()'s factor-of-10 window) is a
+        # known follow-up for large DBs.
         rows = await (await db.execute(sql, params)).fetchall()
-
-        score_filter_active = min_score is not None or max_score is not None
 
         cases: list[EvalCase] = []
         for rid, content, inp, meta_json, _ in rows:
