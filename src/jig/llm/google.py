@@ -132,21 +132,30 @@ class GeminiClient(LLMClient):
         return [genai_types.Tool(function_declarations=declarations)]
 
     async def complete(self, params: CompletionParams) -> LLMResponse:
-        contents = self._convert_messages(params)
+        try:
+            contents = self._convert_messages(params)
 
-        config_kwargs: dict[str, Any] = {}
-        if params.system:
-            config_kwargs["system_instruction"] = params.system
-        if params.tools:
-            config_kwargs["tools"] = self._convert_tools(params.tools)
-        if params.temperature is not None:
-            config_kwargs["temperature"] = params.temperature
-        if params.max_tokens is not None:
-            config_kwargs["max_output_tokens"] = params.max_tokens
-        if params.provider_params:
-            config_kwargs.update(params.provider_params)
+            config_kwargs: dict[str, Any] = {}
+            if params.system:
+                config_kwargs["system_instruction"] = params.system
+            if params.tools:
+                config_kwargs["tools"] = self._convert_tools(params.tools)
+            if params.temperature is not None:
+                config_kwargs["temperature"] = params.temperature
+            if params.max_tokens is not None:
+                config_kwargs["max_output_tokens"] = params.max_tokens
+            if params.provider_params:
+                config_kwargs.update(params.provider_params)
 
-        config = genai_types.GenerateContentConfig(**config_kwargs)
+            config = genai_types.GenerateContentConfig(**config_kwargs)
+        except JigLLMError:
+            raise
+        except Exception as e:
+            msg = str(e)
+            detail = msg if msg else "no detail"
+            raise JigLLMError(
+                f"Request preparation failed: {type(e).__name__}: {detail}", "google",
+            ) from e
 
         timer = start_timer()
 
@@ -164,6 +173,8 @@ class GeminiClient(LLMClient):
 
         try:
             response = await with_retry(_call, max_attempts=3, retryable=_retryable)
+        except JigLLMError:
+            raise
         except Exception as e:
             status = getattr(e, "status_code", None) or getattr(e, "code", None)
             raise JigLLMError(str(e), "google", status_code=status) from e
@@ -186,8 +197,8 @@ class GeminiClient(LLMClient):
                     ))
 
         usage_meta = response.usage_metadata
-        input_tokens = usage_meta.prompt_token_count if usage_meta else 0
-        output_tokens = usage_meta.candidates_token_count if usage_meta else 0
+        input_tokens = (usage_meta.prompt_token_count if usage_meta else None) or 0
+        output_tokens = (usage_meta.candidates_token_count if usage_meta else None) or 0
 
         usage = Usage(input_tokens=input_tokens, output_tokens=output_tokens)
         stamp_cost(usage, self._model)

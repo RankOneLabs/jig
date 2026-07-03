@@ -306,3 +306,26 @@ class TestOpenRouterComplete:
             )
             response = await client.complete(params)
             assert response.usage.cost is None
+
+    async def test_usage_none_normalizes_to_zero_tokens(self, monkeypatch):
+        # Some upstream providers return usage=None on certain error paths.
+        # The adapter must not AttributeError — normalize to 0 tokens.
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-x")
+        with patch("jig.llm.openai.openai") as mock_openai:
+            message = SimpleNamespace(content="hi", tool_calls=None)
+            response = SimpleNamespace(
+                choices=[SimpleNamespace(message=message)],
+                usage=None,
+                model="some/model",
+            )
+            instance = mock_openai.AsyncOpenAI.return_value
+            instance.chat.completions.create = AsyncMock(return_value=response)
+            mock_openai.RateLimitError = type("RateLimitError", (Exception,), {})
+
+            client = OpenRouterClient(model="some/model")
+            params = CompletionParams(
+                messages=[Message(role=Role.USER, content="hi")]
+            )
+            result = await client.complete(params)
+            assert result.usage.input_tokens == 0
+            assert result.usage.output_tokens == 0

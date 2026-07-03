@@ -254,7 +254,8 @@ class DispatchClient(LLMClient):
 
         latency_ms = timer()
         result = data.get("result") or {}
-        content = result.get("content", "")
+        _content = result.get("content")
+        content = "" if _content is None else _content
         model = data.get("model") or self._model or "dispatch"
         raw_usage = result.get("usage")
         usage_data = raw_usage if isinstance(raw_usage, dict) else {}

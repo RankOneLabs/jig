@@ -464,7 +464,21 @@ async def test_tool_registry_error_handling():
 
     registry = ToolRegistry([BadTool()])
     result = await registry.execute(ToolCall(id="x", name="bad", arguments={}))
-    assert result.error == "boom"
+    assert result.error == "ValueError: boom"
+
+
+async def test_tool_registry_error_empty_message():
+    class SilentTool(Tool):
+        @property
+        def definition(self) -> ToolDefinition:
+            return ToolDefinition(name="silent", description="Raises empty", parameters={})
+
+        async def execute(self, args: dict[str, Any]) -> str:
+            raise RuntimeError()
+
+    registry = ToolRegistry([SilentTool()])
+    result = await registry.execute(ToolCall(id="x", name="silent", arguments={}))
+    assert result.error == "RuntimeError: tool raised without message"
 
 
 def test_tool_registry_rejects_non_positive_timeout():

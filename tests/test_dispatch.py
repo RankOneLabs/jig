@@ -403,3 +403,20 @@ class TestComplete:
         body = client._http.post.call_args.kwargs.get("json") or client._http.post.call_args[1].get("json")
         assert "model" not in body
         assert "machine" not in body
+
+    @pytest.mark.asyncio
+    async def test_content_none_normalizes_to_empty_string(self):
+        """result.content=None from a worker must become '' not None in LLMResponse."""
+        client = DispatchClient(model="llama-70b", poll_interval=0.01)
+
+        client._http = AsyncMock(spec=httpx.AsyncClient)
+        client._http.post.return_value = _mock_submit_response()
+        client._http.get.return_value = _mock_poll_response(
+            result={"content": None},
+        )
+
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hi")],
+        )
+        response = await client.complete(params)
+        assert response.content == ""
