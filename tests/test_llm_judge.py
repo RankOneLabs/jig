@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
+from jig.core.errors import GradeParseError
 from jig.core.types import CompletionParams, LLMClient, LLMResponse, Usage
 from jig.feedback.llm_judge import LLMJudge
 
@@ -90,14 +93,13 @@ async def test_grade_with_custom_dimensions_and_rubric() -> None:
     assert scores[1].value == 0.5
 
 
-async def test_grade_falls_back_to_zero_on_malformed_response() -> None:
-    """Malformed judge response → all dimensions score 0.0 rather
-    than raising. Matches jig's grader convention of failing soft."""
+async def test_grade_raises_on_malformed_response() -> None:
+    """Malformed judge response raises GradeParseError — not a 0.0
+    fallback. Parse failure is an infrastructure failure, not a score."""
     llm = _CannedLLM("not json at all")
     judge = LLMJudge(llm, dimensions=["a", "b"])
-    scores = await judge.grade(input="x", output="y")
-    assert len(scores) == 2
-    assert all(s.value == 0.0 for s in scores)
+    with pytest.raises(GradeParseError):
+        await judge.grade(input="x", output="y")
 
 
 async def test_grade_tolerates_fenced_json_response() -> None:
@@ -144,12 +146,9 @@ async def test_grade_tolerates_fenced_json_no_lang_tag() -> None:
     assert scores[0].value == 0.5
 
 
-async def test_grade_falls_back_on_non_numeric_value() -> None:
-    """A judge that returns a non-numeric ``value`` (e.g., the model
-    decided to write 'high' instead of 0.9) used to escape the
-    fail-soft contract: float() raises ValueError, which wasn't in
-    the except tuple, and the exception bubbled out of grade(). The
-    fallback path now catches ValueError too."""
+async def test_grade_raises_on_non_numeric_value() -> None:
+    """Non-numeric value raises GradeParseError — not a 0.0 fallback.
+    A judge writing 'high' instead of 0.9 is a protocol failure."""
     llm = _CannedLLM(
         json.dumps(
             {
@@ -161,7 +160,51 @@ async def test_grade_falls_back_on_non_numeric_value() -> None:
         )
     )
     judge = LLMJudge(llm, dimensions=["a", "b"])
-    scores = await judge.grade(input="x", output="y")
-    # All-zero fallback rather than ValueError leaking out.
-    assert len(scores) == 2
-    assert all(s.value == 0.0 for s in scores)
+    with pytest.raises(GradeParseError):
+        await judge.grade(input="x", output="y")
+
+
+async def test_grade_raises_on_missing_required_dimension() -> None:
+    """LLM returning fewer dimensions than requested raises GradeParseError.
+    Missing data cannot be safely treated as an implicit zero."""
+    llm = _CannedLLM(
+        json.dumps({"scores": [{"dimension": "a", "value": 0.5}]})
+    )
+    judge = LLMJudge(llm, dimensions=["a", "b"])
+    with pytest.raises(GradeParseError, match="missing required dimensions"):
+        await judge.grade(input="x", output="y")
+
+
+async def test_grade_raises_on_out_of_range_value() -> None:
+    """Out-of-range numeric values raise GradeParseError — not clamped.
+    A judge producing 1.7 or -0.2 indicates a judge/protocol failure."""
+    for bad_val in (1.7, -0.2):
+        llm = _CannedLLM(
+            json.dumps({"scores": [{"dimension": "a", "value": bad_val}]})
+        )
+        judge = LLMJudge(llm, dimensions=["a"])
+        with pytest.raises(GradeParseError):
+            await judge.grade(input="x", output="y")
+
+
+async def test_grade_raises_on_nan_value() -> None:
+    """NaN in a judge response raises GradeParseError."""
+    # JSON doesn't support NaN literals, but the model could embed
+    # Python's float('nan') via a non-standard serializer or the score
+    # field could be the string "NaN" that float() accepts.
+    llm = _CannedLLM(
+        json.dumps({"scores": [{"dimension": "a", "value": "NaN"}]})
+    )
+    judge = LLMJudge(llm, dimensions=["a"])
+    with pytest.raises(GradeParseError):
+        await judge.grade(input="x", output="y")
+
+
+async def test_grade_raises_on_infinite_value() -> None:
+    """Infinity in a judge response raises GradeParseError."""
+    llm = _CannedLLM(
+        json.dumps({"scores": [{"dimension": "a", "value": "Infinity"}]})
+    )
+    judge = LLMJudge(llm, dimensions=["a"])
+    with pytest.raises(GradeParseError):
+        await judge.grade(input="x", output="y")
