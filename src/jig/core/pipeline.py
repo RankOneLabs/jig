@@ -302,7 +302,7 @@ async def map_pipeline(
         )
         config.tracer.end_span(
             grade_span.id,
-            output=[{"dim": s.dimension, "val": s.value} for s in batch_scores],
+            output={"scores": [{"dimension": s.dimension, "value": s.value} for s in batch_scores]},
         )
 
     duration = (time.time() - start) * 1000
