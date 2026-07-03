@@ -24,6 +24,7 @@ import random
 import warnings
 from typing import Any
 
+from jig.core.errors import GradeParseError
 from jig.core.types import (
     CompletionParams,
     Grader,
@@ -155,16 +156,10 @@ class PairwiseLLMJudge(Grader):
         try:
             data = json.loads(strip_markdown_fence(response.content))
             winner = data["winner"]
-        except (json.JSONDecodeError, KeyError, TypeError):
-            # Malformed judge response — record as a tie rather than
-            # raise so a single bad call doesn't crash a sweep.
-            return [
-                Score(
-                    dimension=f"vs_{other_id}",
-                    value=0.5,
-                    source=ScoreSource.LLM_JUDGE,
-                )
-            ]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise GradeParseError(
+                f"PairwiseLLMJudge could not parse judge response: {exc}"
+            ) from exc
 
         if winner == "tie":
             value = 0.5
@@ -173,10 +168,10 @@ class PairwiseLLMJudge(Grader):
         elif winner == "B":
             value = 0.0 if a_is_self else 1.0
         else:
-            # Valid JSON but ``winner`` isn't one of A/B/tie — treat as
-            # a tie like the malformed-JSON path above. A meaningless
-            # verdict is "no opinion," not a loss.
-            value = 0.5
+            raise GradeParseError(
+                f"PairwiseLLMJudge: unexpected winner value {winner!r}; "
+                "expected 'A', 'B', or 'tie'"
+            )
         return [
             Score(
                 dimension=f"vs_{other_id}",
