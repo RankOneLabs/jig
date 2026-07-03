@@ -351,6 +351,32 @@ async def test_trace_diff_against_sqlite_backend(tmp_path: Any):
     assert diff.output_diff == ("done_a", "done_b")
 
 
+@pytest.mark.asyncio
+async def test_canonical_grading_span_writer_contract(tmp_path: Any):
+    """Production-style grading span (canonical {dimension,value} shape written
+    directly via the tracer) is correctly parsed by trace_diff."""
+    tracer = SQLiteTracer(db_path=str(tmp_path / "canon.db"))
+
+    def write_with_grade(name: str, quality: float) -> str:
+        root = tracer.start_trace(name, kind=SpanKind.AGENT_RUN)
+        grade = tracer.start_span(root.id, SpanKind.GRADING, "auto_grade")
+        tracer.end_span(grade.id, output={
+            "scores": [{"dimension": "quality", "value": quality}],
+            "feedback_result_id": f"fb-{name}",
+        })
+        tracer.end_span(root.id, {"output": "done", "scores": None})
+        return root.trace_id
+
+    t_a = write_with_grade("A", 0.6)
+    t_b = write_with_grade("B", 0.9)
+    await tracer.flush()
+
+    diff: TraceDiff = await trace_diff(t_a, t_b, tracer=tracer)
+    assert diff.score_deltas == {"quality": pytest.approx(0.3)}
+    assert diff.score_details["quality"] == (pytest.approx(0.6), pytest.approx(0.9))
+    assert diff.identical is False
+
+
 # --- Legacy score format support ---
 
 
