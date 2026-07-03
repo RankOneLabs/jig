@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Callable, Sequence
@@ -9,6 +10,22 @@ from typing import Any, Awaitable
 from jig.core.types import FeedbackLoop, Grader, Score, SpanKind, TracingLogger
 
 logger = logging.getLogger(__name__)
+
+
+def _serialize_for_feedback(value: Any, serializer: Callable[[Any], str] | None = None) -> str:
+    """Conservative serialization at the feedback storage boundary.
+
+    Uses the caller's serializer when provided. Falls back to: str as-is,
+    JSON text for JSON-serializable values, repr for everything else.
+    """
+    if serializer is not None:
+        return serializer(value)
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, sort_keys=True)
+    except (TypeError, ValueError):
+        return repr(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +44,7 @@ class PipelineConfig:
 
     grader: Grader | None = None
     feedback: FeedbackLoop | None = None
+    feedback_serializer: Callable[[Any], str] | None = None
     is_err: Callable[[Any], bool] | None = None
     extract_err: Callable[[Any], str] | None = None
     metadata: dict[str, Any] | None = None
@@ -141,19 +159,35 @@ async def run_pipeline(
                 try:
                     scores = await step.grader.grade(input, result, ctx)
                     step_scores[step.name] = scores
-                    config.tracer.end_span(
-                        grade_span.id,
-                        output=[{"dim": s.dimension, "val": s.value} for s in scores],
-                    )
+
+                    step_feedback_id: str | None = None
+                    if config.feedback and scores:
+                        step_meta: dict[str, Any] = {
+                            "kind": "pipeline_step_result",
+                            "pipeline_name": config.name,
+                            "step_name": step.name,
+                            "trace_id": trace_id,
+                        }
+                        if config.metadata:
+                            for _k in ("source", "tags", "model"):
+                                if _k in config.metadata:
+                                    step_meta[_k] = config.metadata[_k]
+                        step_feedback_id = await config.feedback.store_result(
+                            _serialize_for_feedback(result, config.feedback_serializer),
+                            _serialize_for_feedback(input, config.feedback_serializer),
+                            step_meta,
+                        )
+                        await config.feedback.score(step_feedback_id, scores)
+
+                    step_span_out: dict[str, Any] = {
+                        "scores": [{"dimension": s.dimension, "value": s.value} for s in scores]
+                    }
+                    if step_feedback_id is not None:
+                        step_span_out["feedback_result_id"] = step_feedback_id
+                    config.tracer.end_span(grade_span.id, output=step_span_out)
                 except Exception as exc:
                     config.tracer.end_span(grade_span.id, error=str(exc))
                     raise
-
-                # Feedback integration
-                if config.feedback and scores:
-                    await config.feedback.score(
-                        f"{trace_id}:{step.name}", scores
-                    )
 
         # 4. Pipeline-level grading
         pipeline_scores: list[Score] | None = None
@@ -174,12 +208,31 @@ async def run_pipeline(
                         "trace_id": trace_id,
                     },
                 )
-                config.tracer.end_span(
-                    grade_span.id,
-                    output=[
-                        {"dim": s.dimension, "val": s.value} for s in pipeline_scores
-                    ],
-                )
+
+                pipeline_feedback_id: str | None = None
+                if config.feedback and pipeline_scores:
+                    pl_meta: dict[str, Any] = {
+                        "kind": "pipeline_result",
+                        "pipeline_name": config.name,
+                        "trace_id": trace_id,
+                    }
+                    if config.metadata:
+                        for _k in ("source", "tags", "model"):
+                            if _k in config.metadata:
+                                pl_meta[_k] = config.metadata[_k]
+                    pipeline_feedback_id = await config.feedback.store_result(
+                        _serialize_for_feedback(last_output, config.feedback_serializer),
+                        _serialize_for_feedback(input, config.feedback_serializer),
+                        pl_meta,
+                    )
+                    await config.feedback.score(pipeline_feedback_id, pipeline_scores)
+
+                pl_span_out: dict[str, Any] = {
+                    "scores": [{"dimension": s.dimension, "value": s.value} for s in pipeline_scores]
+                }
+                if pipeline_feedback_id is not None:
+                    pl_span_out["feedback_result_id"] = pipeline_feedback_id
+                config.tracer.end_span(grade_span.id, output=pl_span_out)
             except Exception as exc:
                 config.tracer.end_span(grade_span.id, error=str(exc))
                 raise

@@ -90,10 +90,15 @@ class FakeTracer(TracingLogger):
 
 class FakeFeedback(FeedbackLoop):
     def __init__(self) -> None:
+        self.stored: list[tuple[str, str, dict | None]] = []
         self.scored: list[tuple[str, list[Score]]] = []
+        self._id_counter = 0
 
-    async def store_result(self, content, input_text, metadata=None):
-        return "r-0"
+    async def store_result(self, content: str, input_text: str, metadata: dict | None = None) -> str:
+        self._id_counter += 1
+        rid = f"r-{self._id_counter}"
+        self.stored.append((content, input_text, metadata))
+        return rid
 
     async def score(self, result_id: str, scores: list[Score]) -> None:
         self.scored.append((result_id, scores))
@@ -308,7 +313,7 @@ async def test_pipeline_level_grading():
 
 
 async def test_feedback_integration():
-    """Graded result stored via feedback.score()."""
+    """Step grading registers a feedback result before scoring; score uses the returned ID."""
     tracer = FakeTracer()
     feedback = FakeFeedback()
     grader = FixedGrader(0.95)
@@ -324,10 +329,19 @@ async def test_feedback_integration():
         ),
         input=5,
     )
+    assert len(feedback.stored) == 1
     assert len(feedback.scored) == 1
+
+    _content, _input_text, meta = feedback.stored[0]
     result_id, scores = feedback.scored[0]
-    assert result.trace_id in result_id
-    assert "add_one" in result_id
+
+    # Score uses the ID returned by store_result, not a synthetic id
+    assert result_id == "r-1"
+    # Metadata carries trace_id and step_name
+    assert meta is not None
+    assert meta["trace_id"] == result.trace_id
+    assert meta["step_name"] == "add_one"
+    assert meta["kind"] == "pipeline_step_result"
     assert scores[0].value == 0.95
 
 
