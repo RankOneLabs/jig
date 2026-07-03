@@ -349,3 +349,152 @@ async def test_trace_diff_against_sqlite_backend(tmp_path: Any):
     diff: TraceDiff = await trace_diff(t_a, t_b, tracer=tracer)
     assert diff.tool_divergence == []
     assert diff.output_diff == ("done_a", "done_b")
+
+
+@pytest.mark.asyncio
+async def test_canonical_grading_span_writer_contract(tmp_path: Any):
+    """Production-style grading span (canonical {dimension,value} shape written
+    directly via the tracer) is correctly parsed by trace_diff."""
+    tracer = SQLiteTracer(db_path=str(tmp_path / "canon.db"))
+
+    def write_with_grade(name: str, quality: float) -> str:
+        root = tracer.start_trace(name, kind=SpanKind.AGENT_RUN)
+        grade = tracer.start_span(root.id, SpanKind.GRADING, "auto_grade")
+        tracer.end_span(grade.id, output={
+            "scores": [{"dimension": "quality", "value": quality}],
+            "feedback_result_id": f"fb-{name}",
+        })
+        tracer.end_span(root.id, {"output": "done", "scores": None})
+        return root.trace_id
+
+    t_a = write_with_grade("A", 0.6)
+    t_b = write_with_grade("B", 0.9)
+    await tracer.flush()
+
+    diff: TraceDiff = await trace_diff(t_a, t_b, tracer=tracer)
+    assert diff.score_deltas == {"quality": pytest.approx(0.3)}
+    assert diff.score_details["quality"] == (pytest.approx(0.6), pytest.approx(0.9))
+    assert diff.identical is False
+
+
+# --- Legacy score format support ---
+
+
+@pytest.mark.asyncio
+async def test_legacy_dim_val_scores_are_read():
+    """Legacy {dim, val} entries must be accepted alongside canonical {dimension, value}."""
+    tracer = _StubTracer({
+        "a": [
+            _root("a"),
+            _grading("a", [{"dim": "quality", "val": 0.5}]),
+        ],
+        "b": [
+            _root("b"),
+            _grading("b", [{"dim": "quality", "val": 0.9}]),
+        ],
+    })
+    diff = await trace_diff("a", "b", tracer=tracer)
+    assert diff.score_deltas == {"quality": pytest.approx(0.4)}
+    assert diff.identical is False
+
+
+@pytest.mark.asyncio
+async def test_canonical_and_legacy_scores_mixed_across_traces():
+    """Canonical shape in one trace and legacy shape in another must both be parsed."""
+    tracer = _StubTracer({
+        "a": [
+            _root("a"),
+            _grading("a", [{"dimension": "relevance", "value": 0.6}]),
+        ],
+        "b": [
+            _root("b"),
+            _grading("b", [{"dim": "relevance", "val": 0.8}]),
+        ],
+    })
+    diff = await trace_diff("a", "b", tracer=tracer)
+    assert diff.score_deltas == {"relevance": pytest.approx(0.2)}
+    assert diff.identical is False
+
+
+@pytest.mark.asyncio
+async def test_score_details_exposes_per_dimension_old_and_new_values():
+    """score_details must record (a_avg, b_avg) for each dimension in the union."""
+    tracer = _StubTracer({
+        "a": [
+            _root("a"),
+            _grading("a", [
+                {"dimension": "quality", "value": 0.6},
+                {"dimension": "accuracy", "value": 0.8},
+            ]),
+        ],
+        "b": [
+            _root("b"),
+            _grading("b", [
+                {"dimension": "quality", "value": 0.9},
+                {"dimension": "relevance", "value": 0.7},
+            ]),
+        ],
+    })
+    diff = await trace_diff("a", "b", tracer=tracer)
+    # quality: changed
+    assert diff.score_details["quality"] == (pytest.approx(0.6), pytest.approx(0.9))
+    # accuracy: dropped (only in A)
+    assert diff.score_details["accuracy"] == (pytest.approx(0.8), None)
+    # relevance: added (only in B)
+    assert diff.score_details["relevance"] == (None, pytest.approx(0.7))
+
+
+@pytest.mark.asyncio
+async def test_score_details_identical_dimension_has_matching_values():
+    """A dimension with the same score in both traces must appear in score_details
+    but not in score_deltas."""
+    tracer = _StubTracer({
+        "a": [_root("a"), _grading("a", [{"dimension": "quality", "value": 0.7}])],
+        "b": [_root("b"), _grading("b", [{"dimension": "quality", "value": 0.7}])],
+    })
+    diff = await trace_diff("a", "b", tracer=tracer)
+    assert "quality" not in diff.score_deltas
+    assert diff.score_details["quality"] == (pytest.approx(0.7), pytest.approx(0.7))
+    assert diff.identical is True
+
+
+@pytest.mark.asyncio
+async def test_score_delta_zero_value_does_not_lose_dimension():
+    """A score of 0.0 must not be confused with an absent dimension (0.0 is falsy)."""
+    tracer = _StubTracer({
+        "a": [_root("a"), _grading("a", [{"dimension": "quality", "value": 0.0}])],
+        "b": [_root("b"), _grading("b", [{"dimension": "quality", "value": 0.5}])],
+    })
+    diff = await trace_diff("a", "b", tracer=tracer)
+    assert diff.score_deltas == {"quality": pytest.approx(0.5)}
+    assert diff.score_details["quality"] == (pytest.approx(0.0), pytest.approx(0.5))
+
+
+@pytest.mark.asyncio
+async def test_added_dimension_with_zero_score_makes_identical_false():
+    """A dimension added in B with score 0.0 must still appear in score_deltas and
+    make identical=False — the numeric delta is 0.0 but the rubric changed."""
+    tracer = _StubTracer({
+        "a": [_root("a")],
+        "b": [_root("b"), _grading("b", [{"dimension": "quality", "value": 0.0}])],
+    })
+    diff = await trace_diff("a", "b", tracer=tracer)
+    assert "quality" in diff.score_deltas
+    assert diff.score_deltas["quality"] == pytest.approx(0.0)
+    assert diff.score_details["quality"] == (None, pytest.approx(0.0))
+    assert diff.identical is False
+
+
+@pytest.mark.asyncio
+async def test_dropped_dimension_with_zero_score_makes_identical_false():
+    """A dimension dropped from A where its score was 0.0 must still appear in
+    score_deltas and make identical=False."""
+    tracer = _StubTracer({
+        "a": [_root("a"), _grading("a", [{"dimension": "quality", "value": 0.0}])],
+        "b": [_root("b")],
+    })
+    diff = await trace_diff("a", "b", tracer=tracer)
+    assert "quality" in diff.score_deltas
+    assert diff.score_deltas["quality"] == pytest.approx(0.0)
+    assert diff.score_details["quality"] == (pytest.approx(0.0), None)
+    assert diff.identical is False

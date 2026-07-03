@@ -49,6 +49,10 @@ class TraceDiff:
     output_diff: tuple[str, str] | None = None
     error_category_change: tuple[str | None, str | None] | None = None
     score_deltas: dict[str, float] = field(default_factory=dict)
+    # Per-dimension (a_avg, b_avg) — None on a side means that dimension
+    # was absent from that trace (added or dropped). Use this to recover
+    # old/new aggregate values when score_deltas only gives the difference.
+    score_details: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
     cost_delta: float = 0.0
     latency_ms_delta: float = 0.0
 
@@ -146,6 +150,11 @@ def _avg_scores(spans: list[Span]) -> dict[str, float]:
     Grading spans record their scores on the output dict; we compute a
     mean per dimension name so a diff over two traces can call out
     regressed/improved dimensions directly.
+
+    Accepts both the canonical shape ``{dimension, value}`` emitted by
+    production writers and the legacy shape ``{dim, val}`` found in
+    historical fixtures. Canonical keys take precedence when both are
+    present in the same entry.
     """
     buckets: dict[str, list[float]] = {}
     for s in spans:
@@ -157,8 +166,9 @@ def _avg_scores(spans: list[Span]) -> dict[str, float]:
         for entry in scores:
             if not isinstance(entry, dict):
                 continue
-            dim = entry.get("dimension")
-            val = entry.get("value")
+            # Canonical keys take precedence; fall back to legacy aliases.
+            dim = entry.get("dimension") if "dimension" in entry else entry.get("dim")
+            val = entry.get("value") if "value" in entry else entry.get("val")
             if not isinstance(dim, str):
                 continue
             if isinstance(val, (int, float)):
@@ -256,15 +266,20 @@ async def trace_diff(
     a_scores = _avg_scores(a_spans)
     b_scores = _avg_scores(b_spans)
     score_deltas: dict[str, float] = {}
+    score_details: dict[str, tuple[float | None, float | None]] = {}
     # Iterate the union so a grader dimension that exists in only one
     # trace still shows up — a dropped or added dimension is a real
     # regression the diff must surface. Missing side contributes 0.0
-    # (so an added dim appears as a positive delta, a dropped one
-    # negative).
+    # to the numeric delta, but asymmetric presence (one side None) is
+    # always a rubric change even when the present side scores 0.0.
     for dim in set(a_scores) | set(b_scores):
-        delta = b_scores.get(dim, 0.0) - a_scores.get(dim, 0.0)
-        if delta != 0:
+        a_val: float | None = a_scores.get(dim)
+        b_val: float | None = b_scores.get(dim)
+        delta = (b_val if b_val is not None else 0.0) - (a_val if a_val is not None else 0.0)
+        asymmetric = (a_val is None) != (b_val is None)
+        if delta != 0 or asymmetric:
             score_deltas[dim] = delta
+        score_details[dim] = (a_val, b_val)
 
     a_cost, a_duration = _trace_totals(a_spans)
     b_cost, b_duration = _trace_totals(b_spans)
@@ -276,6 +291,7 @@ async def trace_diff(
         output_diff=output_diff,
         error_category_change=error_category_change,
         score_deltas=score_deltas,
+        score_details=score_details,
         cost_delta=b_cost - a_cost,
         latency_ms_delta=b_duration - a_duration,
     )
