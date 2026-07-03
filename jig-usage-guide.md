@@ -267,7 +267,7 @@ Step(
 )
 ```
 
-Per-step scores appear in `result.step_scores["summarize"]`. If `config.feedback` is also set, the step output is first registered as a feedback result, then scores are stored against that returned feedback result ID. Trace IDs and step names remain queryable metadata; they are not used as unregistered score IDs.
+Per-step scores appear in `result.step_scores["summarize"]`. If `config.feedback` is also set, the step output is first registered as a feedback result, then scores are stored against that returned feedback result ID. Trace IDs and step names remain returned metadata; they are not used as unregistered score IDs.
 
 ### `map_pipeline`
 
