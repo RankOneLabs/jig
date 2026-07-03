@@ -151,8 +151,10 @@ class GeminiClient(LLMClient):
         except JigLLMError:
             raise
         except Exception as e:
+            msg = str(e)
+            detail = msg if msg else "no detail"
             raise JigLLMError(
-                f"Request preparation failed: {e}", "google",
+                f"Request preparation failed: {type(e).__name__}: {detail}", "google",
             ) from e
 
         timer = start_timer()

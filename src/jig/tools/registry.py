@@ -73,7 +73,7 @@ class ToolRegistry:
             return ToolResult(
                 call_id=call.id,
                 output="",
-                error=f"Tool {call.name} timed out after {self._execute_timeout}s",
+                error=f"TimeoutError: Tool {call.name} timed out after {self._execute_timeout}s",
             )
         except Exception as e:
             msg = str(e)
@@ -121,12 +121,11 @@ class ToolRegistry:
                     **kwargs,
                 )
         except asyncio.TimeoutError:
-            timeout_msg = f"Dispatched tool {call.name} timed out after {self._execute_timeout}s"
             logger.warning("tool.execute dispatch timeout name=%s after=%ss", call.name, self._execute_timeout)
             return ToolResult(
                 call_id=call.id,
                 output="",
-                error=timeout_msg,
+                error=f"TimeoutError: Dispatched tool {call.name} timed out after {self._execute_timeout}s",
             )
         except DispatchError as e:
             msg = str(e)
@@ -140,7 +139,7 @@ class ToolRegistry:
         except Exception as e:
             msg = str(e)
             error = f"{type(e).__name__}: {msg}" if msg else f"{type(e).__name__}: tool raised without message"
-            logger.warning("tool.execute dispatch error name=%s err=%s", call.name, error)
+            logger.warning("tool.execute dispatch error name=%s err=%s", call.name, error, exc_info=True)
             return ToolResult(call_id=call.id, output="", error=error)
 
         # Workers can return any JSON-serializable shape; coerce to string

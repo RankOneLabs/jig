@@ -89,8 +89,8 @@ class OllamaClient(LLMClient):
 
         try:
             response = await with_retry(_call, max_attempts=3, retryable=_retryable)
-        except ConnectionError:
-            raise JigLLMError("Cannot reach Ollama", "ollama", retryable=True)
+        except ConnectionError as e:
+            raise JigLLMError("Cannot reach Ollama", "ollama", retryable=True) from e
         except httpx.ConnectError as e:
             raise JigLLMError("Cannot reach Ollama", "ollama", retryable=True) from e
         except httpx.HTTPStatusError as e:
