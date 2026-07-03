@@ -349,3 +349,96 @@ async def test_trace_diff_against_sqlite_backend(tmp_path: Any):
     diff: TraceDiff = await trace_diff(t_a, t_b, tracer=tracer)
     assert diff.tool_divergence == []
     assert diff.output_diff == ("done_a", "done_b")
+
+
+# --- Legacy score format support ---
+
+
+@pytest.mark.asyncio
+async def test_legacy_dim_val_scores_are_read():
+    """Legacy {dim, val} entries must be accepted alongside canonical {dimension, value}."""
+    tracer = _StubTracer({
+        "a": [
+            _root("a"),
+            _grading("a", [{"dim": "quality", "val": 0.5}]),
+        ],
+        "b": [
+            _root("b"),
+            _grading("b", [{"dim": "quality", "val": 0.9}]),
+        ],
+    })
+    diff = await trace_diff("a", "b", tracer=tracer)
+    assert diff.score_deltas == {"quality": pytest.approx(0.4)}
+    assert diff.identical is False
+
+
+@pytest.mark.asyncio
+async def test_canonical_and_legacy_scores_mixed_across_traces():
+    """Canonical shape in one trace and legacy shape in another must both be parsed."""
+    tracer = _StubTracer({
+        "a": [
+            _root("a"),
+            _grading("a", [{"dimension": "relevance", "value": 0.6}]),
+        ],
+        "b": [
+            _root("b"),
+            _grading("b", [{"dim": "relevance", "val": 0.8}]),
+        ],
+    })
+    diff = await trace_diff("a", "b", tracer=tracer)
+    assert diff.score_deltas == {"relevance": pytest.approx(0.2)}
+    assert diff.identical is False
+
+
+@pytest.mark.asyncio
+async def test_score_details_exposes_per_dimension_old_and_new_values():
+    """score_details must record (a_avg, b_avg) for each dimension in the union."""
+    tracer = _StubTracer({
+        "a": [
+            _root("a"),
+            _grading("a", [
+                {"dimension": "quality", "value": 0.6},
+                {"dimension": "accuracy", "value": 0.8},
+            ]),
+        ],
+        "b": [
+            _root("b"),
+            _grading("b", [
+                {"dimension": "quality", "value": 0.9},
+                {"dimension": "relevance", "value": 0.7},
+            ]),
+        ],
+    })
+    diff = await trace_diff("a", "b", tracer=tracer)
+    # quality: changed
+    assert diff.score_details["quality"] == (pytest.approx(0.6), pytest.approx(0.9))
+    # accuracy: dropped (only in A)
+    assert diff.score_details["accuracy"] == (pytest.approx(0.8), None)
+    # relevance: added (only in B)
+    assert diff.score_details["relevance"] == (None, pytest.approx(0.7))
+
+
+@pytest.mark.asyncio
+async def test_score_details_identical_dimension_has_matching_values():
+    """A dimension with the same score in both traces must appear in score_details
+    but not in score_deltas."""
+    tracer = _StubTracer({
+        "a": [_root("a"), _grading("a", [{"dimension": "quality", "value": 0.7}])],
+        "b": [_root("b"), _grading("b", [{"dimension": "quality", "value": 0.7}])],
+    })
+    diff = await trace_diff("a", "b", tracer=tracer)
+    assert "quality" not in diff.score_deltas
+    assert diff.score_details["quality"] == (pytest.approx(0.7), pytest.approx(0.7))
+    assert diff.identical is True
+
+
+@pytest.mark.asyncio
+async def test_score_delta_zero_value_does_not_lose_dimension():
+    """A score of 0.0 must not be confused with an absent dimension (0.0 is falsy)."""
+    tracer = _StubTracer({
+        "a": [_root("a"), _grading("a", [{"dimension": "quality", "value": 0.0}])],
+        "b": [_root("b"), _grading("b", [{"dimension": "quality", "value": 0.5}])],
+    })
+    diff = await trace_diff("a", "b", tracer=tracer)
+    assert diff.score_deltas == {"quality": pytest.approx(0.5)}
+    assert diff.score_details["quality"] == (pytest.approx(0.0), pytest.approx(0.5))
