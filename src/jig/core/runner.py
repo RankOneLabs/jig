@@ -662,15 +662,12 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                 total_usage["tool_calls"] += 1
 
         # 7. Persist to the memory store (if one is configured).
-        # Agents without a store still need a result_id for grading; use
-        # the trace id as a stable fallback.
+        memory_id: str | None = None
         if config.store is not None:
-            result_id = await config.store.add(
+            memory_id = await config.store.add(
                 final_output,
                 {"agent": config.name, "input": input, "trace_id": trace.trace_id},
             )
-        else:
-            result_id = trace.trace_id
 
         if config.session_id and config.store is not None:
             await config.store.add_to_session(
@@ -680,10 +677,10 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                 config.session_id, Message(role=Role.ASSISTANT, content=final_output)
             )
 
-        # 8. Auto-grade — pass parsed output when available, raw otherwise.
-        # Graders that want the raw string even when parsed is present can read
-        # it from context["raw_output"]. trace_id is provided so trajectory
-        # graders can read the run's spans via tracer.get_trace.
+        # 8. Auto-grade: register the output as a feedback result first so
+        # scores reference a real result row that query/get_signals/export can
+        # join against. Memory IDs and trace IDs are separate namespaces and
+        # must not be used as the feedback result ID.
         if config.grader:
             # Flush so trajectory graders can read pre-grade spans via
             # get_trace. SQLiteTracer retains unended spans (notably the
@@ -701,9 +698,29 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                     "trace_id": trace.trace_id,
                 },
             )
-            await config.feedback.score(result_id, scores)
+            fb_meta: dict[str, Any] = {
+                "kind": "agent_result",
+                "agent_name": config.name,
+                "source": "run_agent",
+                "trace_id": trace.trace_id,
+            }
+            model_id = _resolve_model_id(config.llm)
+            if model_id is not None:
+                fb_meta["model"] = model_id
+            if config.session_id is not None:
+                fb_meta["session_id"] = config.session_id
+            if memory_id is not None:
+                fb_meta["memory_id"] = memory_id
+            feedback_result_id = await config.feedback.store_result(
+                final_output, input, fb_meta
+            )
+            await config.feedback.score(feedback_result_id, scores)
             config.tracer.end_span(
-                grade_span.id, [{"dim": s.dimension, "val": s.value} for s in scores]
+                grade_span.id,
+                {
+                    "feedback_result_id": feedback_result_id,
+                    "scores": [{"dimension": s.dimension, "value": s.value} for s in scores],
+                },
             )
     finally:
         # Always close the root span + flush the tracer, even if an
