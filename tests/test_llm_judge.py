@@ -208,3 +208,29 @@ async def test_grade_raises_on_infinite_value() -> None:
     judge = LLMJudge(llm, dimensions=["a"])
     with pytest.raises(GradeParseError):
         await judge.grade(input="x", output="y")
+
+
+class _UnhashableDimLLM(_CannedLLM):
+    """Returns a Score with a list as the dimension — unhashable, so
+    building a set of dimensions would raise TypeError if not caught."""
+
+    async def complete(self, params):  # type: ignore[override]
+        from jig.core.types import LLMResponse, Usage
+        # Return valid JSON structure; the list dimension is injected
+        # post-parse by overriding the score list directly in a subclass
+        # that's simpler to wire via the canned response path.
+        return LLMResponse(
+            content='{"scores": [{"dimension": ["not", "a", "string"], "value": 0.5}]}',
+            tool_calls=None,
+            usage=Usage(1, 1, cost=0.0),
+            latency_ms=1.0,
+            model="canned",
+        )
+
+
+async def test_grade_raises_on_unhashable_dimension() -> None:
+    """A dimension value that is unhashable (e.g. a list) must raise
+    GradeParseError, not a raw TypeError leaking from the set build."""
+    judge = LLMJudge(_UnhashableDimLLM(""), dimensions=["a"])
+    with pytest.raises(GradeParseError):
+        await judge.grade(input="x", output="y")

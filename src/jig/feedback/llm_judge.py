@@ -73,7 +73,13 @@ class LLMJudge(Grader):
                 f"LLMJudge could not parse judge response: {exc}"
             ) from exc
 
-        missing = [d for d in self._dimensions if d not in {s.dimension for s in scores}]
+        try:
+            returned_dims = {s.dimension for s in scores}
+        except TypeError as exc:
+            raise GradeParseError(
+                f"LLMJudge response contains unhashable dimension value: {exc}"
+            ) from exc
+        missing = [d for d in self._dimensions if d not in returned_dims]
         if missing:
             raise GradeParseError(
                 f"LLMJudge response missing required dimensions: {missing}"
