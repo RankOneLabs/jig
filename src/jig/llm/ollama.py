@@ -4,6 +4,8 @@ import logging
 import uuid
 from typing import Any, AsyncIterator
 
+import httpx
+
 from jig.core.errors import JigLLMError
 from jig.core.retry import with_retry
 from jig.core.types import (
@@ -89,10 +91,17 @@ class OllamaClient(LLMClient):
             response = await with_retry(_call, max_attempts=3, retryable=_retryable)
         except ConnectionError:
             raise JigLLMError("Cannot reach Ollama", "ollama", retryable=True)
+        except httpx.ConnectError as e:
+            raise JigLLMError("Cannot reach Ollama", "ollama", retryable=True) from e
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else None
+            raise JigLLMError(str(e), "ollama", status_code=status) from e
+        except httpx.TransportError as e:
+            raise JigLLMError(str(e), "ollama", retryable=True) from e
         except Exception as e:
             if _ollama and isinstance(e, _ollama.ResponseError):
                 raise JigLLMError(str(e), "ollama") from e
-            raise
+            raise JigLLMError(str(e), "ollama") from e
 
         latency_ms = timer()
 
