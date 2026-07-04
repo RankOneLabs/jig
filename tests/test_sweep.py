@@ -374,6 +374,15 @@ class TestSweepWorkerErrorIsolation:
         assert len(result.runs) == 3
         error_categories = [r.result.error.category for r in result.runs if r.result.error]
         assert "budget_exhausted" in error_categories
+        for run in result.runs:
+            if run.result.error is not None:
+                assert run.result.usage == {
+                    "total_input_tokens": 0,
+                    "total_output_tokens": 0,
+                    "total_cost": 0.0,
+                    "llm_calls": 0,
+                    "tool_calls": 0,
+                }
 
     async def test_infrastructure_error_becomes_per_case_error(self):
         """Unexpected Exception from run_agent → structured SweepRun error, worker continues."""
@@ -410,6 +419,13 @@ class TestSweepWorkerErrorIsolation:
         errors = [r for r in result.runs if r.result.error is not None]
         assert len(successes) == 2
         assert len(errors) == 1
+        assert errors[0].result.usage == {
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_cost": 0.0,
+            "llm_calls": 0,
+            "tool_calls": 0,
+        }
 
     async def test_successes_preserved_alongside_failures(self):
         """Successful results are not discarded when some cases fail."""

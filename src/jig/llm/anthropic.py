@@ -37,8 +37,8 @@ class AnthropicClient(LLMClient):
 
     async def aclose(self) -> None:
         if not self._closed:
-            self._closed = True
             await self._client.close()
+            self._closed = True
 
     def _convert_messages(self, params: CompletionParams) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []

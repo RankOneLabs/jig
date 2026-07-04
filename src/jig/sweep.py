@@ -231,7 +231,13 @@ def _error_result(error: AgentError) -> AgentResult[Any]:
     return AgentResult(
         output="",
         trace_id="",
-        usage={},
+        usage={
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_cost": 0.0,
+            "llm_calls": 0,
+            "tool_calls": 0,
+        },
         scores=None,
         duration_ms=0.0,
         error=error,

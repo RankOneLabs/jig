@@ -39,11 +39,11 @@ class OllamaClient(LLMClient):
 
     async def aclose(self) -> None:
         if not self._closed:
-            self._closed = True
             # OllamaAsyncClient wraps an httpx.AsyncClient at ._client
             inner = getattr(self._client, "_client", None)
             if inner is not None and hasattr(inner, "aclose"):
                 await inner.aclose()
+            self._closed = True
 
     def _convert_messages(self, params: CompletionParams) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []

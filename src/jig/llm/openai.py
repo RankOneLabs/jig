@@ -48,8 +48,8 @@ class OpenAIClient(LLMClient):
 
     async def aclose(self) -> None:
         if not self._closed:
-            self._closed = True
             await self._client.close()
+            self._closed = True
 
     def _apply_extra_kwargs(self, kwargs: dict[str, Any]) -> None:
         """Subclass hook: inject defaults into the chat.completions.create()

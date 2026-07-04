@@ -372,3 +372,9 @@ class TestScoreBatchAtomicity:
                 task.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+
+
+class TestFeedbackWriteLockLifecycle:
+    def test_write_lock_is_created_lazily(self, tmp_path) -> None:
+        loop = SQLiteFeedbackLoop(db_path=str(tmp_path / "lazy-lock.db"))
+        assert loop._write_lock is None

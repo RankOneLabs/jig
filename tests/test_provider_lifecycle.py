@@ -70,6 +70,24 @@ class TestAnthropicLifecycle:
 
         sdk_client.close.assert_awaited_once()
 
+    async def test_aclose_failure_can_be_retried(self):
+        sdk_client = MagicMock()
+        sdk_client.close = AsyncMock(
+            side_effect=[RuntimeError("close failed"), None]
+        )
+
+        from jig.llm.anthropic import AnthropicClient
+        client = AnthropicClient.__new__(AnthropicClient)
+        client._client = sdk_client
+        client._model = "claude-test"
+        client._closed = False
+
+        with pytest.raises(RuntimeError, match="close failed"):
+            await client.aclose()
+        await client.aclose()
+
+        assert sdk_client.close.await_count == 2
+
     async def test_sdk_max_retries_defaults_to_zero(self):
         """Constructor must pass max_retries=0 to the SDK to disable built-in retries."""
         anthropic_stub = MagicMock()
@@ -118,6 +136,25 @@ class TestOpenAILifecycle:
         await client.aclose()
         await client.aclose()
         sdk_client.close.assert_awaited_once()
+
+    async def test_aclose_failure_can_be_retried(self):
+        sdk_client = MagicMock()
+        sdk_client.close = AsyncMock(
+            side_effect=[RuntimeError("close failed"), None]
+        )
+
+        from jig.llm.openai import OpenAIClient
+        client = OpenAIClient.__new__(OpenAIClient)
+        client._client = sdk_client
+        client._model = "gpt-test"
+        client._provider_label = "openai"
+        client._closed = False
+
+        with pytest.raises(RuntimeError, match="close failed"):
+            await client.aclose()
+        await client.aclose()
+
+        assert sdk_client.close.await_count == 2
 
     async def test_sdk_max_retries_defaults_to_zero(self):
         openai_stub = MagicMock()
@@ -173,6 +210,24 @@ class TestGeminiLifecycle:
         await client.aclose()
         sdk_client.aio.aclose.assert_awaited_once()
 
+    async def test_aclose_failure_can_be_retried(self):
+        sdk_client = MagicMock()
+        sdk_client.aio.aclose = AsyncMock(
+            side_effect=[RuntimeError("close failed"), None]
+        )
+
+        from jig.llm.google import GeminiClient
+        client = GeminiClient.__new__(GeminiClient)
+        client._client = sdk_client
+        client._model = "gemini-test"
+        client._closed = False
+
+        with pytest.raises(RuntimeError, match="close failed"):
+            await client.aclose()
+        await client.aclose()
+
+        assert sdk_client.aio.aclose.await_count == 2
+
     async def test_attempt_accounting_contract_documents_sdk_limit(self):
         from jig.llm.google import GeminiClient
 
@@ -221,6 +276,26 @@ class TestOllamaLifecycle:
         await client.aclose()
         await client.aclose()
         inner_http.aclose.assert_awaited_once()
+
+    async def test_aclose_failure_can_be_retried(self):
+        inner_http = MagicMock()
+        inner_http.aclose = AsyncMock(
+            side_effect=[RuntimeError("close failed"), None]
+        )
+        sdk_client = MagicMock()
+        sdk_client._client = inner_http
+
+        from jig.llm.ollama import OllamaClient
+        client = OllamaClient.__new__(OllamaClient)
+        client._client = sdk_client
+        client._model = "llama3.1"
+        client._closed = False
+
+        with pytest.raises(RuntimeError, match="close failed"):
+            await client.aclose()
+        await client.aclose()
+
+        assert inner_http.aclose.await_count == 2
 
     async def test_aclose_tolerates_missing_inner_client(self):
         """If the Ollama SDK changes its internals, aclose() must not crash."""
@@ -354,6 +429,23 @@ class TestManagedMemorySdkLifecycle:
 
         sdk_client.aclose.assert_awaited_once()
 
+    async def test_honcho_memory_close_failure_can_be_retried(self):
+        sdk_client = MagicMock(spec=["aclose"])
+        sdk_client.aclose = AsyncMock(
+            side_effect=[RuntimeError("close failed"), None]
+        )
+
+        with patch("jig.memory.honcho.AsyncHoncho", return_value=sdk_client):
+            from jig.memory.honcho import HonchoMemory
+
+            memory = HonchoMemory(app_id="app", user_id="user")
+
+        with pytest.raises(RuntimeError, match="close failed"):
+            await memory.close()
+        await memory.close()
+
+        assert sdk_client.aclose.await_count == 2
+
     async def test_honcho_memory_falls_back_to_sync_close(self):
         sdk_client = MagicMock(spec=["close"])
         sdk_client.close = MagicMock()
@@ -381,6 +473,23 @@ class TestManagedMemorySdkLifecycle:
         await memory.aclose()
 
         sdk_client.aclose.assert_awaited_once()
+
+    async def test_zep_memory_close_failure_can_be_retried(self):
+        sdk_client = MagicMock(spec=["aclose"])
+        sdk_client.aclose = AsyncMock(
+            side_effect=[RuntimeError("close failed"), None]
+        )
+
+        with patch("jig.memory.zep.AsyncZep", return_value=sdk_client):
+            from jig.memory.zep import ZepMemory
+
+            memory = ZepMemory(session_id="session")
+
+        with pytest.raises(RuntimeError, match="close failed"):
+            await memory.close()
+        await memory.close()
+
+        assert sdk_client.aclose.await_count == 2
 
     async def test_zep_memory_falls_back_to_sync_close(self):
         sdk_client = MagicMock(spec=["close"])

@@ -37,13 +37,13 @@ class ZepMemory(MemoryStore, Retriever):
         """Release the owned Zep SDK client, if it exposes a close hook."""
         if self._closed:
             return
-        self._closed = True
 
         aclose = getattr(self._client, "aclose", None)
         if callable(aclose):
             result = aclose()
             if isawaitable(result):
                 await result
+            self._closed = True
             return
 
         close = getattr(self._client, "close", None)
@@ -51,6 +51,7 @@ class ZepMemory(MemoryStore, Retriever):
             result = close()
             if isawaitable(result):
                 await result
+        self._closed = True
 
     async def aclose(self) -> None:
         await self.close()

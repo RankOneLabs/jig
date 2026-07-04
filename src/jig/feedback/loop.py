@@ -61,10 +61,15 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         self._embed_model = embed_model
         self._ollama_host = ollama_host
         self._conn = LazyConnection(db_path, _SCHEMA)
-        self._write_lock = asyncio.Lock()
+        self._write_lock: asyncio.Lock | None = None
 
     async def _get_db(self) -> aiosqlite.Connection:
         return await self._conn.get()
+
+    def _get_write_lock(self) -> asyncio.Lock:
+        if self._write_lock is None:
+            self._write_lock = asyncio.Lock()
+        return self._write_lock
 
     async def _embed(self, text: str) -> np.ndarray:
         return await ollama_embed(text, self._embed_model, self._ollama_host)
@@ -77,7 +82,7 @@ class SQLiteFeedbackLoop(FeedbackLoop):
     ) -> str:
         result_id = str(uuid.uuid4())
         embedding = await self._embed(input_text)
-        async with self._write_lock:
+        async with self._get_write_lock():
             db = await self._get_db()
             try:
                 await db.execute(
@@ -100,7 +105,7 @@ class SQLiteFeedbackLoop(FeedbackLoop):
     async def score(self, result_id: str, scores: list[Score]) -> None:
         validate_scores(scores)
         now = datetime.now().isoformat()
-        async with self._write_lock:
+        async with self._get_write_lock():
             db = await self._get_db()
             # Explicit BEGIN pins the batch boundary before the first insert.
             # The write lock keeps other feedback writes from committing or
