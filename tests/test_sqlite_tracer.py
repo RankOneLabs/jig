@@ -265,6 +265,70 @@ async def test_pipeline_step_failure_immediately_readable(tmp_path: Any) -> None
 
 
 @pytest.mark.asyncio
+async def test_span_end_during_flush_is_retained_and_persists_final_state(
+    tracer: SQLiteTracer,
+) -> None:
+    """A span that ends during flush() must not be permanently frozen as open.
+
+    Pre-fix: flush() evicted spans using current ``span.ended_at`` at eviction
+    time. A span open at snapshot time but ended during the DB writes would be
+    evicted immediately — the row in SQLite remained open forever because
+    ``_spans`` no longer held the entry needed for a follow-up flush.
+
+    Post-fix: eviction uses the open-at-snapshot set captured before any await.
+    A span open at snapshot time is retained even if end_span() fires during
+    the DB writes, giving it one more flush cycle to persist its final state.
+    """
+    span = tracer.start_trace("root", kind=SpanKind.AGENT_RUN)
+    # span is open at this point — ended_at is None
+
+    # Intercept db.execute to call end_span() immediately after the span row
+    # is first written.  This simulates a caller ending the span between
+    # flush()'s snapshot (where ended_at was None) and the DB write commit.
+    db = await tracer._get_db()
+    original_execute = db.execute
+    end_injected = False
+
+    async def intercepting_execute(*args: Any, **kwargs: Any) -> Any:
+        nonlocal end_injected
+        result = await original_execute(*args, **kwargs)
+        if not end_injected and args and "INSERT OR REPLACE INTO spans" in str(args[0]):
+            # Row was just written with ended_at=NULL (span was open at snapshot).
+            # End the span now — simulating concurrent end_span during flush.
+            tracer.end_span(span.id, output="ended-mid-flush")
+            end_injected = True
+        return result
+
+    db.execute = intercepting_execute  # type: ignore[method-assign]
+    try:
+        await tracer.flush()
+    finally:
+        db.execute = original_execute  # type: ignore[method-assign]
+
+    assert end_injected, "test setup error: intercepting_execute was never triggered"
+
+    # After first flush: span was open at snapshot time, so it must still
+    # be in _spans even though end_span() fired during the DB write.
+    # Pre-fix: span would be evicted here (s.ended_at is not None at eviction time).
+    assert span.id in tracer._spans, (
+        "span open at snapshot time must be retained after flush even if "
+        "end_span() fired during the DB writes"
+    )
+
+    # Second flush captures the final ended_at / output.
+    await tracer.flush()
+
+    # Now evicted — span was ended when this flush snapshotted it.
+    assert span.id not in tracer._spans, "ended span must be evicted after second flush"
+
+    # DB must contain the final state, not the stale open-row.
+    spans = await tracer.get_trace(span.trace_id)
+    assert len(spans) == 1
+    assert spans[0].ended_at is not None, "final ended_at must be persisted"
+    assert spans[0].output == "ended-mid-flush", "final output must be persisted"
+
+
+@pytest.mark.asyncio
 async def test_graderless_pipeline_success_immediately_readable(tmp_path: Any) -> None:
     """A pipeline with no grader still flushes spans immediately on success.
 
