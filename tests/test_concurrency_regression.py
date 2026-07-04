@@ -32,18 +32,14 @@ from jig import (
     BudgetTracker,
     JigBudgetError,
     LLMResponse,
-    Message,
-    Role,
     Usage,
     sweep,
 )
 from jig.core.types import (
-    CompletionParams,
     FeedbackLoop,
     LLMClient,
     MemoryStore,
     Retriever,
-    ScoredResult,
     Span,
     SpanKind,
     TracingLogger,
@@ -194,8 +190,8 @@ class TestBudgetAdmissionInvariant:
         """The invariant spent + active_reserved <= limit must hold at every
         moment during concurrent reservation admission.
 
-        Strategy: wrap BudgetTracker._lock's __aenter__ to sample the
-        invariant immediately after each state mutation inside the lock.
+        Strategy: wrap BudgetTracker.reserve to sample the invariant
+        immediately after each successful reserve() call returns.
         Any violation is recorded so the test can fail cleanly after gather().
         """
         limit = 0.10
@@ -296,7 +292,6 @@ class TestLazyConnectionRepeatedCycles:
 
         # Wrap aiosqlite.connect to count calls and produce trackable mocks
         active_conns: list[Any] = []
-        original_connect = None  # captured inside patch
 
         async def fake_connect(*args, **kwargs):
             nonlocal connect_calls
@@ -387,11 +382,8 @@ class TestBudgetedClientConcurrentAdmission:
         check, not just the final spend.
         """
         budget = BudgetTracker(limit_usd=0.05)
-        inner_call_count = 0
 
         async def _fake_complete(params):
-            nonlocal inner_call_count
-            inner_call_count += 1
             await asyncio.sleep(0)  # yield — keeps reservation live
             return _ok_response(cost=0.02)
 

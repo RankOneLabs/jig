@@ -232,26 +232,23 @@ class TestNonProviderRetriesExcluded:
 
     The ``with_retry`` utility in ``jig.core.retry`` is used for infrastructure
     operations (e.g. listener startup, network retries) that are completely
-    separate from LLM provider calls. This class verifies that:
-
-    1. ``with_retry`` retrying a non-LLM function N times does not touch any
-       LLM client — provider call count remains zero.
-    2. Schema-parsing retries (``max_parse_retries``) increment ``llm_calls``
-       because they genuinely call the provider, but they are counted separately
-       from the ``parse_retries`` dimension so callers can distinguish them.
+    separate from LLM provider calls. This class verifies that ``with_retry``
+    retrying a non-LLM function N times is independent of LLM call accounting,
+    and that concurrent infra retries and provider retries do not bleed into
+    each other's counters.
     """
 
     async def test_with_retry_for_non_llm_op_does_not_touch_provider(self):
-        """with_retry wrapping a non-LLM function must not increment any LLM counter.
+        """with_retry wrapping a non-LLM function is architecturally separate from
+        provider generation.
 
-        This is the architectural boundary test: infrastructure retries (listener
-        startup, HTTP probes, smithers polling) are completely separate from
-        provider generation. A CountingFakeLLM with call_count=0 after N retries
-        proves no hidden LLM call multiplier exists.
+        Verifies that with_retry retries the non-LLM operation the expected
+        number of times and succeeds, with no LLM client involved in the path.
+        This is the boundary test: infrastructure retries (listener startup,
+        HTTP probes, smithers polling) live in a different call stack from
+        run_agent's LLM retry loop.
         """
         from jig.core.retry import with_retry
-
-        llm = CountingFakeLLM(JigLLMError("never called", "fake"))
 
         non_llm_attempts = 0
 
@@ -271,11 +268,6 @@ class TestNonProviderRetriesExcluded:
 
         assert result == "connected"
         assert non_llm_attempts == 3, "retried exactly twice before success"
-        # The LLM client must never have been touched — provider calls = 0
-        assert llm.call_count == 0, (
-            f"non-LLM with_retry retries must not affect provider call count; "
-            f"got {llm.call_count}"
-        )
 
     async def test_polling_retries_are_distinct_from_provider_attempts(self):
         """Separate retry budgets for infrastructure vs. provider calls must not
