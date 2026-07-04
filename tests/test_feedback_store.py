@@ -11,7 +11,6 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime
 from typing import Any
-from unittest.mock import AsyncMock
 
 import aiosqlite
 import numpy as np
