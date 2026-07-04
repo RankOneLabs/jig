@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -313,3 +314,36 @@ class TestNonProviderRetriesExcluded:
         assert agent_result.usage["llm_calls"] == 3
         # Infrastructure retries must not have leaked into llm_calls
         assert agent_result.usage["llm_calls"] != infra_attempts
+
+
+@pytest.mark.asyncio
+class TestGeminiRetryAccountingBoundary:
+    async def test_gemini_adapter_invokes_sdk_once_per_complete_call(self):
+        """Gemini has no adapter-level retry loop around generate_content().
+
+        The google-genai SDK may still retry internally; GeminiClient exposes
+        that as a non-strict accounting contract in provider_attempt_accounting.
+        """
+        genai_types_stub = MagicMock()
+        genai_types_stub.GenerateContentConfig.return_value = MagicMock()
+        genai_types_stub.Content = MagicMock
+        genai_types_stub.Part = MagicMock
+
+        sdk_client = MagicMock()
+        sdk_client.aio.models.generate_content = AsyncMock(side_effect=RuntimeError("boom"))
+
+        with patch("jig.llm.google.genai_types", genai_types_stub):
+            from jig.llm.google import GeminiClient
+
+            client = GeminiClient.__new__(GeminiClient)
+            client._client = sdk_client
+            client._model = "gemini-test"
+            client._closed = False
+
+            with pytest.raises(JigLLMError, match="boom"):
+                await client.complete(
+                    CompletionParams(messages=[Message(role=Role.USER, content="hi")])
+                )
+
+        sdk_client.aio.models.generate_content.assert_awaited_once()
+        assert GeminiClient.strict_provider_attempt_accounting is False

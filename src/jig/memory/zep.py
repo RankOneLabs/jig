@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime
+from inspect import isawaitable
 from typing import Any
 
 from jig.core.types import MemoryEntry, MemoryStore, Message, Retriever, Role
@@ -30,6 +31,29 @@ class ZepMemory(MemoryStore, Retriever):
             raise ImportError("Install zep: pip install 'jig[zep]'")
         self._client = AsyncZep(**client_kwargs)
         self._default_session_id = session_id
+        self._closed = False
+
+    async def close(self) -> None:
+        """Release the owned Zep SDK client, if it exposes a close hook."""
+        if self._closed:
+            return
+        self._closed = True
+
+        aclose = getattr(self._client, "aclose", None)
+        if callable(aclose):
+            result = aclose()
+            if isawaitable(result):
+                await result
+            return
+
+        close = getattr(self._client, "close", None)
+        if callable(close):
+            result = close()
+            if isawaitable(result):
+                await result
+
+    async def aclose(self) -> None:
+        await self.close()
 
     async def _ensure_session(self, session_id: str) -> None:
         try:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from inspect import isawaitable
 from typing import Any
 
 from jig.core.types import MemoryEntry, MemoryStore, Message, Retriever, Role
@@ -34,6 +35,29 @@ class HonchoMemory(MemoryStore, Retriever):
         self._app_id = app_id
         self._user_id = user_id
         self._collection_name = collection_name
+        self._closed = False
+
+    async def close(self) -> None:
+        """Release the owned Honcho SDK client, if it exposes a close hook."""
+        if self._closed:
+            return
+        self._closed = True
+
+        aclose = getattr(self._client, "aclose", None)
+        if callable(aclose):
+            result = aclose()
+            if isawaitable(result):
+                await result
+            return
+
+        close = getattr(self._client, "close", None)
+        if callable(close):
+            result = close()
+            if isawaitable(result):
+                await result
+
+    async def aclose(self) -> None:
+        await self.close()
 
     async def add(self, content: str, metadata: dict[str, Any] | None = None) -> str:
         collection = await self._client.apps.users.collections.get_or_create(

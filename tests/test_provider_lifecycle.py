@@ -171,6 +171,13 @@ class TestGeminiLifecycle:
         await client.aclose()
         sdk_client.close.assert_called_once()
 
+    async def test_attempt_accounting_contract_documents_sdk_limit(self):
+        from jig.llm.google import GeminiClient
+
+        assert GeminiClient.strict_provider_attempt_accounting is False
+        assert "google-genai SDK" in GeminiClient.provider_attempt_accounting
+        assert "not included" in GeminiClient.provider_attempt_accounting
+
 
 # ---------------------------------------------------------------------------
 # OllamaClient
@@ -304,3 +311,67 @@ class TestOllamaEmbedLifecycle:
                 await ollama_embed("hello", model="nomic-embed-text")
 
         inner_http.aclose.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Managed memory SDK lifecycle
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestManagedMemorySdkLifecycle:
+    async def test_honcho_memory_closes_owned_async_client_once(self):
+        sdk_client = MagicMock(spec=["aclose"])
+        sdk_client.aclose = AsyncMock()
+
+        with patch("jig.memory.honcho.AsyncHoncho", return_value=sdk_client):
+            from jig.memory.honcho import HonchoMemory
+
+            memory = HonchoMemory(app_id="app", user_id="user")
+
+        await memory.close()
+        await memory.aclose()
+
+        sdk_client.aclose.assert_awaited_once()
+
+    async def test_honcho_memory_falls_back_to_sync_close(self):
+        sdk_client = MagicMock(spec=["close"])
+        sdk_client.close = MagicMock()
+
+        with patch("jig.memory.honcho.AsyncHoncho", return_value=sdk_client):
+            from jig.memory.honcho import HonchoMemory
+
+            memory = HonchoMemory(app_id="app", user_id="user")
+
+        await memory.close()
+        await memory.close()
+
+        sdk_client.close.assert_called_once()
+
+    async def test_zep_memory_closes_owned_async_client_once(self):
+        sdk_client = MagicMock(spec=["aclose"])
+        sdk_client.aclose = AsyncMock()
+
+        with patch("jig.memory.zep.AsyncZep", return_value=sdk_client):
+            from jig.memory.zep import ZepMemory
+
+            memory = ZepMemory(session_id="session")
+
+        await memory.close()
+        await memory.aclose()
+
+        sdk_client.aclose.assert_awaited_once()
+
+    async def test_zep_memory_falls_back_to_sync_close(self):
+        sdk_client = MagicMock(spec=["close"])
+        sdk_client.close = MagicMock()
+
+        with patch("jig.memory.zep.AsyncZep", return_value=sdk_client):
+            from jig.memory.zep import ZepMemory
+
+            memory = ZepMemory(session_id="session")
+
+        await memory.close()
+        await memory.close()
+
+        sdk_client.close.assert_called_once()
