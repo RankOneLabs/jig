@@ -41,6 +41,7 @@ from jig.core.types import (
     TracingLogger,
 )
 from jig.tools import ToolRegistry
+from jig.tracing.spans import span_guard
 
 
 # --- Fakes ---
@@ -667,6 +668,18 @@ class TestTerminatedRunSkipsBookkeeping:
 class TestPreOutputSpanLifecycle:
     """Pre-output spans must be closed even when the underlying operation raises."""
 
+    async def test_span_guard_closes_success_without_explicit_finish(self):
+        """The span lifecycle helper owns the success close by default."""
+        tracer = FakeTracer()
+        root = tracer.start_trace("root")
+
+        with span_guard(tracer, root.id, SpanKind.MEMORY_QUERY, "implicit_success"):
+            pass
+
+        guarded = next(s for s in tracer.spans if s.name == "implicit_success")
+        assert guarded.ended_at is not None
+        assert guarded.error is None
+
     async def test_retriever_failure_closes_mem_span(self):
         """If retriever.retrieve raises, the memory query span is closed with error."""
         class BrokenRetriever(FakeMemory):
@@ -767,6 +780,128 @@ class TestPostOutputFailSoft:
 
         assert result.output == "result"
         assert result.error is None
+
+    async def test_trace_flush_failure_does_not_erase_output(self):
+        """tracer.flush failure after valid output is fail-soft."""
+
+        class BrokenFlushTracer(FakeTracer):
+            async def flush(self):
+                raise RuntimeError("trace sink unavailable")
+
+        llm = FakeLLM([
+            LLMResponse(content="result", tool_calls=None, usage=Usage(1, 1), latency_ms=1, model="fake"),
+        ])
+        result = await run_agent(
+            _config(llm, tracer=BrokenFlushTracer()),
+            "hi",
+        )
+
+        assert result.output == "result"
+        assert result.error is None
+
+    async def test_schema_not_called_skips_all_bookkeeping(self):
+        """Schema-not-called termination does not persist sentinel output."""
+        class Out(BaseModel):
+            value: int
+
+        calls: list[str] = []
+
+        class TrackingMemory(FakeMemory):
+            async def add(self, content, metadata=None):
+                calls.append(f"memory:{content}")
+                return "m"
+
+            async def add_to_session(self, session_id, message):
+                calls.append(f"session:{message.role.value}:{message.content}")
+
+        class TrackingFeedback(FakeFeedback):
+            async def store_result(self, content, input_text, metadata=None):
+                calls.append(f"feedback:{content}")
+                return "r"
+
+            async def score(self, result_id, scores):
+                calls.append(f"score:{result_id}")
+
+        from jig.core.types import Grader, Score, ScoreSource
+
+        class TrackingGrader(Grader):
+            async def grade(self, input, output, context=None):
+                calls.append(f"grade:{output}")
+                return [Score(dimension="q", value=1.0, source=ScoreSource.HEURISTIC)]
+
+        llm = FakeLLM([
+            LLMResponse(content="plain", tool_calls=None, usage=Usage(1, 1), latency_ms=1, model="fake"),
+        ])
+        result = await run_agent(
+            _config(
+                llm,
+                output_schema=Out,
+                max_parse_retries=0,
+                store=TrackingMemory(),
+                session_id="s1",
+                feedback=TrackingFeedback(),
+                grader=TrackingGrader(),
+            ),
+            "hi",
+        )
+
+        assert isinstance(result.error, AgentSchemaNotCalledError)
+        assert calls == []
+
+    async def test_schema_validation_failure_skips_all_bookkeeping(self):
+        """Schema-validation termination does not persist sentinel output."""
+        class Out(BaseModel):
+            value: int
+
+        calls: list[str] = []
+
+        class TrackingMemory(FakeMemory):
+            async def add(self, content, metadata=None):
+                calls.append(f"memory:{content}")
+                return "m"
+
+            async def add_to_session(self, session_id, message):
+                calls.append(f"session:{message.role.value}:{message.content}")
+
+        class TrackingFeedback(FakeFeedback):
+            async def store_result(self, content, input_text, metadata=None):
+                calls.append(f"feedback:{content}")
+                return "r"
+
+            async def score(self, result_id, scores):
+                calls.append(f"score:{result_id}")
+
+        from jig.core.types import Grader, Score, ScoreSource
+
+        class TrackingGrader(Grader):
+            async def grade(self, input, output, context=None):
+                calls.append(f"grade:{output}")
+                return [Score(dimension="q", value=1.0, source=ScoreSource.HEURISTIC)]
+
+        llm = FakeLLM([
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCall(id="c", name="submit_output", arguments={"wrong": 1})],
+                usage=Usage(1, 1),
+                latency_ms=1,
+                model="fake",
+            ),
+        ])
+        result = await run_agent(
+            _config(
+                llm,
+                output_schema=Out,
+                max_parse_retries=0,
+                store=TrackingMemory(),
+                session_id="s1",
+                feedback=TrackingFeedback(),
+                grader=TrackingGrader(),
+            ),
+            "hi",
+        )
+
+        assert isinstance(result.error, AgentSchemaValidationError)
+        assert calls == []
 
 
 # ---------------------------------------------------------------------------

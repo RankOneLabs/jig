@@ -61,23 +61,31 @@ class OllamaClient(LLMClient):
         ]
 
     async def complete(self, params: CompletionParams) -> LLMResponse:
-        messages = self._convert_messages(params)
-        kwargs: dict[str, Any] = {
-            "model": self._model,
-            "messages": messages,
-        }
-        if params.tools:
-            kwargs["tools"] = self._convert_tools(params.tools)
+        try:
+            messages = self._convert_messages(params)
+            kwargs: dict[str, Any] = {
+                "model": self._model,
+                "messages": messages,
+            }
+            if params.tools:
+                kwargs["tools"] = self._convert_tools(params.tools)
 
-        options: dict[str, Any] = {}
-        if params.temperature is not None:
-            options["temperature"] = params.temperature
-        if params.max_tokens is not None:
-            options["num_predict"] = params.max_tokens
-        if params.provider_params:
-            options.update(params.provider_params)
-        if options:
-            kwargs["options"] = options
+            options: dict[str, Any] = {}
+            if params.temperature is not None:
+                options["temperature"] = params.temperature
+            if params.max_tokens is not None:
+                options["num_predict"] = params.max_tokens
+            if params.provider_params:
+                options.update(params.provider_params)
+            if options:
+                kwargs["options"] = options
+        except JigLLMError:
+            raise
+        except Exception as e:
+            raise JigLLMError(
+                f"Request preparation failed: {type(e).__name__}: {e}",
+                "ollama",
+            ) from e
 
         timer = start_timer()
 
@@ -105,41 +113,49 @@ class OllamaClient(LLMClient):
 
         latency_ms = timer()
 
-        # ollama-python >= 0.4 returns a typed ``ChatResponse`` pydantic
-        # model. We require that floor (see pyproject's
-        # ``ollama = ["ollama>=0.4"]`` extra) and access fields via
-        # attributes rather than dict ``.get()``.
-        message = response.message
-        tool_calls: list[ToolCall] | None = None
-        raw_calls = message.tool_calls
-        if raw_calls:
-            try:
-                tool_calls = [
-                    ToolCall(
-                        id=str(uuid.uuid4()),
-                        name=tc.function.name,
-                        arguments=parse_tool_arguments(tc.function.arguments, "ollama"),
-                    )
-                    for tc in raw_calls
-                ]
-            except (AttributeError, TypeError) as e:
-                raise JigLLMError(
-                    f"Malformed tool call: {e}. Raw: {raw_calls}",
-                    "ollama",
-                    retryable=True,
-                ) from e
+        try:
+            # ollama-python >= 0.4 returns a typed ``ChatResponse`` pydantic
+            # model. We require that floor (see pyproject's
+            # ``ollama = ["ollama>=0.4"]`` extra) and access fields via
+            # attributes rather than dict ``.get()``.
+            message = response.message
+            tool_calls: list[ToolCall] | None = None
+            raw_calls = message.tool_calls
+            if raw_calls:
+                try:
+                    tool_calls = [
+                        ToolCall(
+                            id=str(uuid.uuid4()),
+                            name=tc.function.name,
+                            arguments=parse_tool_arguments(tc.function.arguments, "ollama"),
+                        )
+                        for tc in raw_calls
+                    ]
+                except (AttributeError, TypeError) as e:
+                    raise JigLLMError(
+                        f"Malformed tool call: {e}. Raw: {raw_calls}",
+                        "ollama",
+                        retryable=True,
+                    ) from e
 
-        return LLMResponse(
-            content=message.content or "",
-            tool_calls=tool_calls,
-            usage=Usage(
-                input_tokens=response.prompt_eval_count or 0,
-                output_tokens=response.eval_count or 0,
-                cost=0.0,
-            ),
-            latency_ms=latency_ms,
-            model=self._model,
-        )
+            return LLMResponse(
+                content=message.content or "",
+                tool_calls=tool_calls,
+                usage=Usage(
+                    input_tokens=response.prompt_eval_count or 0,
+                    output_tokens=response.eval_count or 0,
+                    cost=0.0,
+                ),
+                latency_ms=latency_ms,
+                model=self._model,
+            )
+        except JigLLMError:
+            raise
+        except Exception as e:
+            raise JigLLMError(
+                f"Response parsing failed: {type(e).__name__}: {e}",
+                "ollama",
+            ) from e
 
     async def stream(self, params: CompletionParams) -> AsyncIterator[str]:
         messages = self._convert_messages(params)

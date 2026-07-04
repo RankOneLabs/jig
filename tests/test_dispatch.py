@@ -420,3 +420,23 @@ class TestComplete:
         )
         response = await client.complete(params)
         assert response.content == ""
+
+    @pytest.mark.asyncio
+    async def test_malformed_result_shape_raises_jig_llm_error(self):
+        """A malformed worker result is classified, not leaked as AttributeError."""
+        client = DispatchClient(model="llama-70b", poll_interval=0.01)
+
+        client._http = AsyncMock(spec=httpx.AsyncClient)
+        client._http.post.return_value = _mock_submit_response()
+        client._http.get.return_value = _mock_poll_response(
+            result=["not", "a", "dict"],
+        )
+
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hi")],
+        )
+        with pytest.raises(JigLLMError) as exc:
+            await client.complete(params)
+
+        assert exc.value.provider == "dispatch"
+        assert "Response parsing failed" in str(exc.value)

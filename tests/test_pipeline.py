@@ -179,6 +179,28 @@ async def test_linear_pipeline():
     assert kinds.count(SpanKind.PIPELINE_STEP) == 3
 
 
+async def test_pipeline_flush_failure_after_success_is_fail_soft():
+    """A tracer.flush failure must not erase a valid pipeline output."""
+
+    class BrokenFlushTracer(FakeTracer):
+        async def flush(self) -> None:
+            raise RuntimeError("trace sink unavailable")
+
+    tracer = BrokenFlushTracer()
+    result = await run_pipeline(
+        PipelineConfig(
+            name="flush_fail",
+            steps=[Step(name="add_one", fn=add_one)],
+            tracer=tracer,
+        ),
+        input=5,
+    )
+
+    assert result.output == 6
+    root = next(s for s in tracer.spans if s.kind == SpanKind.PIPELINE_RUN)
+    assert root.ended_at is not None
+
+
 async def test_short_circuit_on_err():
     """Step 2 returns error, step 3 never runs."""
 
@@ -556,4 +578,6 @@ async def test_map_pipeline_closes_parent_on_exception():
         assert batch_root is not None, "batch parent span must be flushed to DB on exception"
         assert batch_root.ended_at is not None
         assert batch_root.error is not None
+        assert "RuntimeError" in batch_root.error
+        assert "item failed" in batch_root.error
         await tracer.close()

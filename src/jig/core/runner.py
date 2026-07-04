@@ -332,8 +332,7 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                 # Span output carries retrieved-id scores so downstream
                 # analytics can group "which retriever picked what?" without
                 # replaying the corpus.
-                config.tracer.end_span(
-                    mem_span.id,
+                mem_span.finish(
                     {
                         "retrieved": [
                             {"id": e.id, "score": e.score, "preview": e.content[:120]}
@@ -352,7 +351,7 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                 logger.debug("feedback.get_signals start (limit=3, min_score=0.7)")
                 feedback_signals = await config.feedback.get_signals(input, limit=3, min_score=0.7)
                 logger.debug("feedback.get_signals done (signals=%d)", len(feedback_signals))
-                config.tracer.end_span(fb_span.id, [s.content[:100] for s in feedback_signals])
+                fb_span.finish([s.content[:100] for s in feedback_signals])
 
         # 5. Assemble messages (system prompt is separate, not in messages list)
         system_message = build_system_message(system_prompt, memory_context, feedback_signals)
@@ -421,7 +420,7 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                         len(response.tool_calls or []),
                     )
                 except JigLLMError as e:
-                    config.tracer.end_span(llm_span.id, None, error=str(e))
+                    llm_span.finish(error=str(e))
                     # Fast-fail only on known-permanent errors (auth, bad
                     # request, not-found). Unknown errors and 5xx go through
                     # the retry path — adapters default `retryable=False`
@@ -456,8 +455,7 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                     continue
 
                 consecutive_llm_errors = 0
-                config.tracer.end_span(
-                    llm_span.id,
+                llm_span.finish(
                     {"content": response.content[:200], "tool_calls": len(response.tool_calls or [])},
                     usage=response.usage,
                 )
@@ -531,7 +529,7 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                         parsed = config.output_schema.model_validate(submit_call.arguments)  # type: ignore[union-attr]
                     except ValidationError as ve:
                         parse_retries += 1
-                        config.tracer.end_span(extract_span.id, None, error=str(ve))
+                        extract_span.finish(error=str(ve))
                         logger.info(
                             "submit_output validation failed (%d/%d): %s",
                             parse_retries, config.max_parse_retries, ve,
@@ -572,7 +570,7 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                         continue
 
                     # Validation succeeded — finalize.
-                    config.tracer.end_span(extract_span.id, submit_call.arguments)
+                    extract_span.finish(submit_call.arguments)
                     final_output = parsed.model_dump_json()
                     messages.append(
                         Message(
@@ -735,7 +733,7 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                         }
                         if feedback_result_id is not None:
                             span_output["feedback_result_id"] = feedback_result_id
-                        config.tracer.end_span(grade_span.id, span_output)
+                        grade_span.finish(span_output)
                 except Exception:
                     logger.exception("auto-grading failed after successful run (non-fatal)")
     finally:

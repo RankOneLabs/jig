@@ -307,8 +307,7 @@ async def map_pipeline(
                         "trace_id": parent.trace_id,
                     },
                 )
-                config.tracer.end_span(
-                    grade_span.id,
+                grade_span.finish(
                     output={"scores": [{"dimension": s.dimension, "value": s.value} for s in batch_scores]},
                 )
 
