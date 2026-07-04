@@ -3,7 +3,6 @@
 Verifies that:
 - Each adapter's aclose() is idempotent (safe to call multiple times).
 - Adapters close their owned SDK client/transport on aclose().
-- Adapters constructed with an injected mock client do NOT close it.
 - factory.complete() calls aclose() in a finally block on success and failure.
 - ollama_embed() closes its transport after embedding work completes.
 """
@@ -233,7 +232,7 @@ class TestOllamaLifecycle:
 
 
 @pytest.mark.asyncio
-class TestFactoryCompletLifecycle:
+class TestFactoryCompleteLifecycle:
     async def test_aclose_called_on_success(self):
         """factory.complete() calls aclose() after a successful completion."""
         with patch("jig.llm.anthropic.AnthropicClient") as mock_cls:
