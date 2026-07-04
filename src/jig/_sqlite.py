@@ -14,18 +14,20 @@ import aiosqlite
 class LazyConnection:
     """Event-loop-safe lazy aiosqlite connection with schema initialization.
 
-    The lock is created on first get() call (not in __init__) so it binds
-    to the running event loop rather than whatever loop (if any) existed
-    at construction time.
+    A single lock is created on the first get() or close() call and kept
+    for the lifetime of the instance. All state transitions (_db, _lock)
+    must go through this one stable lock so that queued callers always
+    observe a coherent state — close() resetting the lock would leave
+    callers already waiting on the old lock in a broken state machine.
     """
 
     def __init__(self, db_path: str, schema: str) -> None:
         self._db_path = db_path
         self._schema = schema
         self._db: aiosqlite.Connection | None = None
-        # Constructed lazily inside get() so the lock binds to the
-        # event loop that's actually running, not whatever loop existed
-        # (or didn't) at __init__ time.
+        # Created lazily on first use so it binds to the running event loop,
+        # not whatever loop (if any) existed at __init__ time. Once set, it
+        # is never replaced — this is the stable-lock guarantee.
         self._lock: asyncio.Lock | None = None
 
     async def get(self) -> aiosqlite.Connection:
@@ -58,8 +60,10 @@ class LazyConnection:
             if self._db is not None:
                 await self._db.close()
                 self._db = None
-        # Reset the lock so re-use after close() works across event loops.
-        self._lock = None
+        # Do NOT reset self._lock here. Callers already queued on the lock
+        # hold a reference to it; replacing it would strand them on a lock
+        # that is never released, and future get() calls would create a
+        # second lock racing with the first. The lock is stable for life.
 
 
 def json_dumps(obj: Any) -> str:

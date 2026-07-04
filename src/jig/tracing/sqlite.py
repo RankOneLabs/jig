@@ -123,60 +123,67 @@ class SQLiteTracer(TracingLogger):
 
     async def flush(self) -> None:
         db = await self._get_db()
-        # Snapshot before iterating: start_span / start_trace mutate
-        # self._spans synchronously between our awaits below. Each
-        # individual write is atomic on the event loop, so a list
-        # snapshot at this moment captures a consistent view — spans
-        # added during the flush body are picked up by the next flush.
-        # Without the snapshot, iterating .values() while concurrent
-        # tasks insert raises RuntimeError: dictionary changed size.
-        pending = list(self._spans.values())
-        logger.debug("sqlite tracer flush start (pending=%d)", len(pending))
-        for span in pending:
+        # Capture a stable snapshot of every span's fields and open/closed
+        # state in one synchronous pass before any await. This gives us:
+        #   1. A consistent view immune to dict-mutation-during-iteration
+        #      errors (RuntimeError: dictionary changed size).
+        #   2. Stable field values for DB writes — span objects are mutable
+        #      and end_span() can update them between our awaits below.
+        #   3. A record of which spans were open *at snapshot time*, so
+        #      eviction does not depend on the span's current state after
+        #      the DB writes complete.
+        pending_ids: set[str] = set()
+        open_at_snapshot: set[str] = set()
+        row_data: list[tuple[Any, ...]] = []
+        for sid, span in self._spans.items():
+            pending_ids.add(sid)
+            if span.ended_at is None:
+                open_at_snapshot.add(sid)
+            row_data.append((
+                span.id,
+                span.trace_id,
+                span.parent_id,
+                span.kind.value,
+                span.name,
+                _safe_json(span.input),
+                _safe_json(span.output),
+                span.started_at.isoformat(),
+                span.ended_at.isoformat() if span.ended_at else None,
+                span.duration_ms,
+                _safe_json(span.metadata),
+                span.error,
+                span.usage.input_tokens if span.usage else None,
+                span.usage.output_tokens if span.usage else None,
+                span.usage.cost if span.usage else None,
+            ))
+        logger.debug("sqlite tracer flush start (pending=%d)", len(row_data))
+        for row in row_data:
             await db.execute(
                 """INSERT OR REPLACE INTO spans
                    (id, trace_id, parent_id, kind, name, input, output,
                     started_at, ended_at, duration_ms, metadata, error,
                     usage_input_tokens, usage_output_tokens, usage_cost)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    span.id,
-                    span.trace_id,
-                    span.parent_id,
-                    span.kind.value,
-                    span.name,
-                    _safe_json(span.input),
-                    _safe_json(span.output),
-                    span.started_at.isoformat(),
-                    span.ended_at.isoformat() if span.ended_at else None,
-                    span.duration_ms,
-                    _safe_json(span.metadata),
-                    span.error,
-                    span.usage.input_tokens if span.usage else None,
-                    span.usage.output_tokens if span.usage else None,
-                    span.usage.cost if span.usage else None,
-                ),
+                row,
             )
         await db.commit()
-        # Drop only the spans we just persisted. Two cases survive:
-        #  - Open spans (``ended_at is None``): a subsequent end_span
-        #    needs the entry to update ended_at/duration. This is the
-        #    mid-run-flush case (e.g. before trajectory grading).
-        #  - Concurrent spans added *after* the snapshot — including
-        #    spans the writer task ended synchronously while we were
-        #    awaiting db.execute. They never reached the DB this round
-        #    and must stay in _spans so the next flush picks them up.
-        # The dict comprehension is sync (no await inside) so it can't
-        # interleave with concurrent inserts.
-        flushed_ids = {span.id for span in pending}
+        # Eviction rules — a span is retained if either condition holds:
+        #  1. It was open at snapshot time: end_span() may have fired during
+        #     our DB awaits, giving it final ended_at/duration/output/error.
+        #     The row we just wrote still shows it as open. One more flush
+        #     cycle is needed to persist the final state.
+        #  2. It was added after the snapshot (not in pending_ids): it was
+        #     never written this round and must survive for the next flush.
+        # The dict comprehension has no await so it cannot interleave with
+        # concurrent inserts.
         self._spans = {
             sid: s
             for sid, s in self._spans.items()
-            if s.ended_at is None or sid not in flushed_ids
+            if sid in open_at_snapshot or sid not in pending_ids
         }
         logger.debug(
             "sqlite tracer flush done (persisted=%d, retained=%d)",
-            len(flushed_ids), len(self._spans),
+            len(pending_ids), len(self._spans),
         )
 
     async def get_trace(self, trace_id: str) -> list[Span]:

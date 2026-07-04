@@ -85,12 +85,20 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         validate_scores(scores)
         db = await self._get_db()
         now = datetime.now().isoformat()
-        for s in scores:
-            await db.execute(
-                "INSERT INTO scores (result_id, dimension, value, source, created_at) VALUES (?, ?, ?, ?, ?)",
-                (result_id, s.dimension, s.value, s.source.value, now),
-            )
-        await db.commit()
+        # All dimension inserts are wrapped in one explicit transaction so
+        # the batch is all-or-nothing: any constraint error or insert failure
+        # rolls back every insert in this call, preventing partial dimension
+        # visibility that would corrupt per-result score aggregates.
+        try:
+            for s in scores:
+                await db.execute(
+                    "INSERT INTO scores (result_id, dimension, value, source, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (result_id, s.dimension, s.value, s.source.value, now),
+                )
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
 
     async def get_signals(
         self,
