@@ -680,6 +680,19 @@ class TestPreOutputSpanLifecycle:
         assert guarded.ended_at is not None
         assert guarded.error is None
 
+    async def test_span_guard_empty_exception_message_has_fallback(self):
+        """Empty-message exceptions still produce useful span errors."""
+        tracer = FakeTracer()
+        root = tracer.start_trace("root")
+
+        with pytest.raises(RuntimeError):
+            with span_guard(tracer, root.id, SpanKind.MEMORY_QUERY, "empty_error"):
+                raise RuntimeError()
+
+        guarded = next(s for s in tracer.spans if s.name == "empty_error")
+        assert guarded.ended_at is not None
+        assert guarded.error == "RuntimeError: exception raised without message"
+
     async def test_retriever_failure_closes_mem_span(self):
         """If retriever.retrieve raises, the memory query span is closed with error."""
         class BrokenRetriever(FakeMemory):
@@ -1109,3 +1122,34 @@ class TestOllamaAdapterErrorBoundaries:
         err = exc_info.value
         assert err.provider == "ollama"
         assert err.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_ollama_response_error_preserves_status_code(self):
+        """ollama.ResponseError status code is preserved in JigLLMError."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        class FakeResponseError(Exception):
+            def __init__(self, message: str, status_code: int):
+                super().__init__(message)
+                self.status_code = status_code
+
+        ollama_stub = MagicMock()
+        ollama_stub.ResponseError = FakeResponseError
+
+        with patch("jig.llm.ollama._ollama", ollama_stub), \
+             patch("jig.llm.ollama.OllamaAsyncClient", ollama_stub.AsyncClient):
+            from jig.llm.ollama import OllamaClient
+            client = OllamaClient.__new__(OllamaClient)
+            client._client = MagicMock()
+            client._model = "llama3.1"
+            client._client.chat = AsyncMock(
+                side_effect=FakeResponseError("bad request", 400)
+            )
+
+            params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
+            with pytest.raises(JigLLMError) as exc_info:
+                await client.complete(params)
+
+        err = exc_info.value
+        assert err.provider == "ollama"
+        assert err.status_code == 400

@@ -10,6 +10,13 @@ from jig.core.types import Span, SpanKind, TracingLogger, Usage
 logger = logging.getLogger(__name__)
 
 
+def _format_span_exception(exc: BaseException) -> str:
+    detail = str(exc)
+    if not detail:
+        detail = "exception raised without message"
+    return f"{type(exc).__name__}: {detail}"
+
+
 @dataclass
 class SpanGuard:
     """Handle yielded by :func:`span_guard`.
@@ -71,7 +78,7 @@ def span_guard(
     except BaseException as exc:
         if not guard.finished:
             try:
-                guard.finish(error=f"{type(exc).__name__}: {exc}")
+                guard.finish(error=_format_span_exception(exc))
             except Exception:
                 logger.exception("tracer.end_span failed while closing failed span")
         raise

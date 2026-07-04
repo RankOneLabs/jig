@@ -108,7 +108,10 @@ class OllamaClient(LLMClient):
             raise JigLLMError(str(e), "ollama", retryable=True) from e
         except Exception as e:
             if _ollama and isinstance(e, _ollama.ResponseError):
-                raise JigLLMError(str(e), "ollama") from e
+                status = getattr(e, "status_code", None)
+                if status is None:
+                    status = getattr(e, "code", None)
+                raise JigLLMError(str(e), "ollama", status_code=status) from e
             raise JigLLMError(str(e), "ollama") from e
 
         latency_ms = timer()
