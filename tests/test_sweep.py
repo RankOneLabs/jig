@@ -343,3 +343,163 @@ class TestSweepErrorCounting:
         # All three runs terminated with llm_permanent_error
         assert roll["bad"]["success_rate"] == 0.0
         assert roll["bad"]["error_categories"] == {"llm_permanent_error": 3}
+
+
+@pytest.mark.asyncio
+class TestSweepWorkerErrorIsolation:
+    """Budget and infrastructure failures must not kill workers or wedge queues."""
+
+    async def test_budget_exhaustion_becomes_per_case_error(self):
+        """JigBudgetError from run_agent → structured SweepRun error, not worker death."""
+        from jig.core.errors import JigBudgetError as _JigBudgetError
+        from jig import AgentBudgetError, BudgetedLLMClient, BudgetTracker
+
+        # Budget so tight it's exhausted after the first call
+        budget = BudgetTracker(limit_usd=0.001)
+        llm = _FakeLLM("ok", cost=0.001)
+        budgeted_llm = BudgetedLLMClient(inner=llm, budget=budget, estimate_cost_usd=0.001)
+
+        cfg = AgentConfig(
+            name="budget-cfg",
+            description="budget-constrained",
+            system_prompt="x",
+            llm=budgeted_llm,
+            store=_FakeMem(), retriever=None,
+            feedback=_FakeFB(),
+            tracer=_FakeTracer(),
+            tools=ToolRegistry(),
+        )
+
+        # 3 cases but budget only covers ~1 call; remaining should be budget_exhausted errors
+        result = await sweep(["c1", "c2", "c3"], [cfg], concurrency=1)
+        assert len(result.runs) == 3
+        error_categories = [r.result.error.category for r in result.runs if r.result.error]
+        assert "budget_exhausted" in error_categories
+
+    async def test_infrastructure_error_becomes_per_case_error(self):
+        """Unexpected Exception from run_agent → structured SweepRun error, worker continues."""
+
+        call_count = 0
+
+        class _FlakyLLM(LLMClient):
+            async def complete(self, params):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 2:
+                    raise RuntimeError("transient infra failure")
+                return LLMResponse(
+                    content="ok", tool_calls=None,
+                    usage=Usage(10, 10, cost=0.001),
+                    latency_ms=1.0, model="fake",
+                )
+
+        cfg = AgentConfig(
+            name="flaky",
+            description="flaky infra",
+            system_prompt="x",
+            llm=_FlakyLLM(),
+            store=_FakeMem(), retriever=None,
+            feedback=_FakeFB(),
+            tracer=_FakeTracer(),
+            tools=ToolRegistry(),
+        )
+
+        result = await sweep(["c1", "c2", "c3"], [cfg], concurrency=1)
+        # All 3 slots filled — worker did not die on case 2's error
+        assert len(result.runs) == 3
+        successes = [r for r in result.runs if r.result.error is None]
+        errors = [r for r in result.runs if r.result.error is not None]
+        assert len(successes) == 2
+        assert len(errors) == 1
+
+    async def test_successes_preserved_alongside_failures(self):
+        """Successful results are not discarded when some cases fail."""
+        call_count = 0
+
+        class _PartialLLM(LLMClient):
+            async def complete(self, params):
+                nonlocal call_count
+                call_count += 1
+                if call_count % 2 == 0:
+                    raise RuntimeError("every other call fails")
+                return LLMResponse(
+                    content="ok", tool_calls=None,
+                    usage=Usage(10, 10, cost=0.001),
+                    latency_ms=1.0, model="fake",
+                )
+
+        cfg = AgentConfig(
+            name="partial",
+            description="partial failures",
+            system_prompt="x",
+            llm=_PartialLLM(),
+            store=_FakeMem(), retriever=None,
+            feedback=_FakeFB(),
+            tracer=_FakeTracer(),
+            tools=ToolRegistry(),
+        )
+
+        result = await sweep(["c1", "c2", "c3", "c4"], [cfg], concurrency=2)
+        assert len(result.runs) == 4
+        successes = [r for r in result.runs if r.result.error is None]
+        assert len(successes) == 2
+
+
+@pytest.mark.asyncio
+class TestCompareErrorIsolation:
+    """Budget and infrastructure failures in compare() → structured CompareRun results."""
+
+    async def test_budget_error_becomes_structured_result(self):
+        """JigBudgetError in a config → CompareRun with error, not exception propagation."""
+        from jig import AgentBudgetError, BudgetedLLMClient, BudgetTracker
+
+        budget = BudgetTracker(limit_usd=0.0001)
+        llm = _FakeLLM("ok", cost=0.001)
+        budgeted_llm = BudgetedLLMClient(inner=llm, budget=budget, estimate_cost_usd=0.001)
+
+        good_cfg = _config("good")
+        bad_cfg = AgentConfig(
+            name="budget-limited",
+            description="over budget",
+            system_prompt="x",
+            llm=budgeted_llm,
+            store=_FakeMem(), retriever=None,
+            feedback=_FakeFB(),
+            tracer=_FakeTracer(),
+            tools=ToolRegistry(),
+        )
+
+        result = await compare("input", [good_cfg, bad_cfg])
+        assert len(result.runs) == 2
+        bad_run = next(r for r in result.runs if r.config_name == "budget-limited")
+        assert bad_run.result.error is not None
+        assert bad_run.result.error.category == "budget_exhausted"
+        # Good config still succeeded
+        good_run = next(r for r in result.runs if r.config_name == "good")
+        assert good_run.result.error is None
+
+    async def test_infrastructure_error_becomes_structured_result(self):
+        """Exception in a config → CompareRun with error, not exception propagation."""
+
+        class _CrashLLM(LLMClient):
+            async def complete(self, params):
+                raise RuntimeError("disk full")
+
+        crash_cfg = AgentConfig(
+            name="crash",
+            description="crashes",
+            system_prompt="x",
+            llm=_CrashLLM(),
+            store=_FakeMem(), retriever=None,
+            feedback=_FakeFB(),
+            tracer=_FakeTracer(),
+            tools=ToolRegistry(),
+        )
+        good_cfg = _config("good")
+
+        result = await compare("input", [good_cfg, crash_cfg])
+        assert len(result.runs) == 2
+        crash_run = next(r for r in result.runs if r.config_name == "crash")
+        assert crash_run.result.error is not None
+        good_run = next(r for r in result.runs if r.config_name == "good")
+        assert good_run.result.error is None
