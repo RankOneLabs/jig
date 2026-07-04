@@ -92,20 +92,109 @@ class TestBudgetTracker:
 
 
 @pytest.mark.asyncio
+class TestBudgetTrackerReservations:
+    async def test_reserve_claims_budget_before_call(self):
+        budget = BudgetTracker(limit_usd=0.10)
+        reservation = await budget.reserve(0.06)
+        # Second reservation would push projected to 0.12, over the cap
+        with pytest.raises(JigBudgetError):
+            await budget.reserve(0.06)
+        await reservation.release()
+
+    async def test_reconcile_charges_actual_cost(self):
+        budget = BudgetTracker(limit_usd=1.0)
+        reservation = await budget.reserve(0.10)
+        assert budget._active_reserved_usd == pytest.approx(0.10)
+        await reservation.reconcile(0.07)
+        assert budget.spent_usd == pytest.approx(0.07)
+        assert budget._active_reserved_usd == pytest.approx(0.0)
+
+    async def test_reconcile_charges_estimate_when_actual_unknown(self):
+        budget = BudgetTracker(limit_usd=1.0)
+        reservation = await budget.reserve(0.10)
+        await reservation.reconcile(None)
+        assert budget.spent_usd == pytest.approx(0.10)
+
+    async def test_release_frees_reservation_without_cost(self):
+        budget = BudgetTracker(limit_usd=0.10)
+        reservation = await budget.reserve(0.08)
+        await reservation.release()
+        assert budget.spent_usd == pytest.approx(0.0)
+        assert budget._active_reserved_usd == pytest.approx(0.0)
+        # Budget is available again
+        r2 = await budget.reserve(0.08)
+        await r2.release()
+
+    async def test_release_is_idempotent(self):
+        budget = BudgetTracker(limit_usd=1.0)
+        reservation = await budget.reserve(0.10)
+        await reservation.release()
+        await reservation.release()  # second call must not double-subtract
+        assert budget._active_reserved_usd == pytest.approx(0.0)
+
+    async def test_reconcile_is_idempotent(self):
+        budget = BudgetTracker(limit_usd=1.0)
+        reservation = await budget.reserve(0.10)
+        await reservation.reconcile(0.07)
+        await reservation.reconcile(0.07)  # second call must not double-charge
+        assert budget.spent_usd == pytest.approx(0.07)
+
+    async def test_reconcile_raises_when_actual_exceeds_cap(self):
+        budget = BudgetTracker(limit_usd=0.10)
+        reservation = await budget.reserve(0.09)
+        # Actual cost exceeds the cap
+        with pytest.raises(JigBudgetError):
+            await reservation.reconcile(0.15)
+        # Reservation was settled; active reserved is cleared
+        assert budget._active_reserved_usd == pytest.approx(0.0)
+
+    async def test_concurrent_reservations_respect_cap(self):
+        """Two concurrent reserves that together exceed the cap — only one admitted.
+
+        The coroutines must hold their reservation across an await point (the
+        simulated provider call) so the lock can observe overlapping reservations.
+        Without the yield, one coroutine finishes before the other starts and
+        both would succeed sequentially.
+        """
+        import asyncio
+
+        budget = BudgetTracker(limit_usd=0.10)
+        results: list[bool] = []
+
+        async def try_reserve() -> None:
+            try:
+                r = await budget.reserve(0.07)
+                results.append(True)
+                await asyncio.sleep(0)  # yield — simulates in-flight provider call
+                await r.release()
+            except JigBudgetError:
+                results.append(False)
+
+        await asyncio.gather(try_reserve(), try_reserve())
+        # Exactly one reservation admitted, one rejected
+        assert results.count(True) == 1
+        assert results.count(False) == 1
+
+
+@pytest.mark.asyncio
 class TestBudgetedLLMClient:
-    async def test_tallies_on_every_call(self):
+    def _make_inner(self, cost: float = 0.02) -> AsyncMock:
         inner = AsyncMock()
         inner.complete = AsyncMock(
             return_value=LLMResponse(
                 content="ok",
                 tool_calls=None,
-                usage=Usage(input_tokens=100, output_tokens=50, cost=0.02),
+                usage=Usage(input_tokens=100, output_tokens=50, cost=cost),
                 latency_ms=1.0,
                 model="claude-sonnet-4-5",
             )
         )
+        return inner
+
+    async def test_tallies_on_every_call(self):
+        inner = self._make_inner(cost=0.02)
         budget = BudgetTracker(limit_usd=0.10)
-        client = BudgetedLLMClient(inner=inner, budget=budget)
+        client = BudgetedLLMClient(inner=inner, budget=budget, estimate_cost_usd=0.01)
 
         params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
         await client.complete(params)
@@ -113,18 +202,9 @@ class TestBudgetedLLMClient:
         assert budget.spent_usd == pytest.approx(0.04)
 
     async def test_raises_when_exceeded(self):
-        inner = AsyncMock()
-        inner.complete = AsyncMock(
-            return_value=LLMResponse(
-                content="ok",
-                tool_calls=None,
-                usage=Usage(input_tokens=100, output_tokens=50, cost=0.08),
-                latency_ms=1.0,
-                model="claude-sonnet-4-5",
-            )
-        )
+        inner = self._make_inner(cost=0.08)
         budget = BudgetTracker(limit_usd=0.10)
-        client = BudgetedLLMClient(inner=inner, budget=budget)
+        client = BudgetedLLMClient(inner=inner, budget=budget, estimate_cost_usd=0.01)
 
         params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
         await client.complete(params)
@@ -136,18 +216,69 @@ class TestBudgetedLLMClient:
         inner.complete = AsyncMock()
         budget = BudgetTracker(limit_usd=1.0)
         budget.spent_usd = 2.0  # already over
-        client = BudgetedLLMClient(inner=inner, budget=budget)
+        client = BudgetedLLMClient(inner=inner, budget=budget, estimate_cost_usd=0.01)
 
         params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
         with pytest.raises(JigBudgetError):
             await client.complete(params)
         inner.complete.assert_not_called()
 
+    async def test_no_estimate_raises_before_call(self):
+        """No estimate_cost_usd → JigBudgetError before provider call."""
+        inner = AsyncMock()
+        inner.complete = AsyncMock()
+        budget = BudgetTracker(limit_usd=1.0)
+        client = BudgetedLLMClient(inner=inner, budget=budget)
+
+        params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
+        with pytest.raises(JigBudgetError, match="estimate_cost_usd"):
+            await client.complete(params)
+        inner.complete.assert_not_called()
+
+    async def test_reservation_released_on_provider_failure(self):
+        """If the provider call raises, the reservation is freed."""
+        inner = AsyncMock()
+        inner.complete = AsyncMock(side_effect=RuntimeError("network error"))
+        budget = BudgetTracker(limit_usd=0.10)
+        client = BudgetedLLMClient(inner=inner, budget=budget, estimate_cost_usd=0.08)
+
+        params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
+        with pytest.raises(RuntimeError):
+            await client.complete(params)
+
+        # Reservation must be released — budget is not stranded
+        assert budget._active_reserved_usd == pytest.approx(0.0)
+        assert budget.spent_usd == pytest.approx(0.0)
+        # A subsequent call can still be admitted
+        inner.complete = AsyncMock(
+            return_value=LLMResponse(
+                content="ok", tool_calls=None,
+                usage=Usage(10, 10, cost=0.05),
+                latency_ms=1.0, model="x",
+            )
+        )
+        await client.complete(params)
+        assert budget.spent_usd == pytest.approx(0.05)
+
+    async def test_aclose_delegates_to_inner(self):
+        inner = AsyncMock()
+        inner.aclose = AsyncMock()
+        budget = BudgetTracker(limit_usd=1.0)
+        client = BudgetedLLMClient(inner=inner, budget=budget, estimate_cost_usd=0.01)
+        await client.aclose()
+        inner.aclose.assert_called_once()
+
+    async def test_aclose_no_op_when_inner_lacks_aclose(self):
+        inner = AsyncMock(spec=[])  # no aclose attribute
+        budget = BudgetTracker(limit_usd=1.0)
+        client = BudgetedLLMClient(inner=inner, budget=budget, estimate_cost_usd=0.01)
+        await client.aclose()  # must not raise
+
     async def test_stream_fails_closed(self):
         """Streaming can't be enforced until usage is surfaced — refuse."""
         inner = AsyncMock()
         budget = BudgetTracker(limit_usd=1.0)
-        client = BudgetedLLMClient(inner=inner, budget=budget)
+        client = BudgetedLLMClient(inner=inner, budget=budget, estimate_cost_usd=0.01)
 
         params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
         with pytest.raises(NotImplementedError, match="streaming"):

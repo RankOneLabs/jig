@@ -240,7 +240,7 @@ async def test_model_recorded_through_wrapped_llm_client():
         LLMResponse(content="ok", tool_calls=None, usage=Usage(1, 1), latency_ms=1, model="fake"),
     ])
     inner._model = "openrouter/qwen/qwen3-coder"
-    wrapped = BudgetedLLMClient(inner, BudgetTracker(limit_usd=1.0))
+    wrapped = BudgetedLLMClient(inner, BudgetTracker(limit_usd=1.0), estimate_cost_usd=0.01)
 
     tracer = FakeTracer()
     await run_agent(
