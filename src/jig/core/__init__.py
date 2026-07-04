@@ -1,5 +1,6 @@
 from jig.core.errors import (
     AgentAmbiguousTurnError,
+    AgentBudgetError,
     AgentError,
     AgentLLMPermanentError,
     AgentMaxLLMCallsError,
@@ -49,6 +50,7 @@ __all__ = [
     "MemoryStore",
     "Retriever",
     "AgentAmbiguousTurnError",
+    "AgentBudgetError",
     "AgentError",
     "AgentLLMPermanentError",
     "AgentMaxLLMCallsError",

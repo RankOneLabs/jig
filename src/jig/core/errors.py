@@ -227,3 +227,20 @@ class AgentLLMPermanentError(AgentError):
         self.provider = provider
         self.status_code = status_code
         self.last_error = message
+
+
+class AgentBudgetError(AgentError):
+    """Budget cap was reached; this run was not admitted or could not complete.
+
+    Non-retryable by definition — re-submitting the same call under the same
+    budget will fail again. Sweep workers catch :class:`JigBudgetError` and
+    convert it into this structured result so budget exhaustion becomes a
+    per-case outcome rather than a worker-killing exception.
+    """
+
+    category = "budget_exhausted"
+
+    def __init__(self, message: str, *, spent_usd: float, limit_usd: float):
+        super().__init__(message, spent_usd=spent_usd, limit_usd=limit_usd)
+        self.spent_usd = spent_usd
+        self.limit_usd = limit_usd
