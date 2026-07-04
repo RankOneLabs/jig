@@ -52,13 +52,13 @@ class _BudgetReservation:
         If ``actual_usd`` is ``None`` (unknown), the reserved estimate is
         charged instead — the only defensible cost already admitted by policy.
         """
-        if self._settled:
-            return
         cost = actual_usd if actual_usd is not None else self._estimate_usd
         if not math.isfinite(cost) or cost < 0:
             # Guard against bad values from providers without poisoning the tracker.
             cost = self._estimate_usd
         async with self._tracker._lock:
+            if self._settled:
+                return
             self._tracker._active_reserved_usd -= self._estimate_usd
             self._tracker.spent_usd += cost
             self._settled = True
@@ -66,9 +66,9 @@ class _BudgetReservation:
 
     async def release(self) -> None:
         """Remove the reservation without recording any spend."""
-        if self._settled:
-            return
         async with self._tracker._lock:
+            if self._settled:
+                return
             self._tracker._active_reserved_usd -= self._estimate_usd
             self._settled = True
 
@@ -82,8 +82,12 @@ class BudgetTracker:
     before the provider call so concurrent callers cannot all pass a
     pre-flight check and jointly overshoot the cap.
 
-    All state-mutating operations are protected by an ``asyncio.Lock`` so
-    the tracker is safe to share across concurrent workers.
+    The reservation API (:meth:`reserve` and the returned
+    :class:`_BudgetReservation`) is concurrency-safe: all reservation
+    state mutations are protected by an ``asyncio.Lock``. The simple
+    ``record`` / ``check`` / ``reset`` methods are synchronous and not
+    lock-protected — use them only from a single coroutine, or switch to
+    the reservation API for concurrent callers.
     """
 
     def __init__(self, limit_usd: float) -> None:
@@ -208,7 +212,11 @@ class BudgetedLLMClient(LLMClient):
             await reservation.reconcile(response.usage.cost)
             return response
         except BaseException:
-            await reservation.release()
+            # asyncio.shield() ensures the release coroutine runs to completion
+            # even if this task is being cancelled — without it, a CancelledError
+            # re-raised at the next await inside release() would strand the
+            # reservation and block future admissions.
+            await asyncio.shield(reservation.release())
             raise
 
     async def aclose(self) -> None:
