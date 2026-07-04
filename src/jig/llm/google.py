@@ -29,6 +29,12 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+GEMINI_ATTEMPT_ACCOUNTING_NOTE = (
+    "Runner llm_calls counts GeminiClient.complete() invocations. The "
+    "google-genai SDK does not expose a public retry-disable or real HTTP "
+    "attempt-count hook, so SDK-internal retries are not included."
+)
+
 
 def _sanitize_for_gemini(obj: Any) -> Any:
     """Sanitize a value so it passes google-genai FunctionResponse validation.
@@ -50,6 +56,9 @@ def _sanitize_for_gemini(obj: Any) -> Any:
 
 
 class GeminiClient(LLMClient):
+    strict_provider_attempt_accounting = False
+    provider_attempt_accounting = GEMINI_ATTEMPT_ACCOUNTING_NOTE
+
     def __init__(self, model: str = "gemini-2.5-pro", **client_kwargs: Any):
         if genai is None:
             raise ImportError("Install google-genai: pip install 'jig[google]'")
