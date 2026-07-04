@@ -138,9 +138,8 @@ async def test_concurrent_close_and_get_no_error(tmp_path: Any) -> None:
     """Concurrent close() and get() must not raise, deadlock, or produce
     inconsistent connection state.
 
-    close() holds the lock during ``await conn.close()``.  A get() that
-    arrives while the lock is held will queue.  After close() releases the
-    lock and sets _db=None, the queued get() reconnects cleanly.
+    close() holds the lock during ``await conn.close()``. A racing get()
+    queues behind close() and receives a live connection after reconnect.
     Pre-fix: the lock was reset to None AFTER releasing it, which could
     strand waiters already holding a reference to the old lock object.
     """
@@ -155,5 +154,9 @@ async def test_concurrent_close_and_get_no_error(tmp_path: Any) -> None:
         assert all(c is get_results[0] for c in get_results), (
             "concurrent get() calls must return the same connection"
         )
+        for conn in get_results:
+            cursor = await conn.execute("SELECT 1")
+            row = await cursor.fetchone()
+            assert row == (1,)
 
     await lc.close()  # cleanup (idempotent if already closed)

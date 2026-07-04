@@ -138,10 +138,11 @@ class TestOpenAILifecycle:
 
 @pytest.mark.asyncio
 class TestGeminiLifecycle:
-    async def test_aclose_calls_sdk_close(self):
-        """aclose() calls the (sync) genai.Client.close()."""
+    async def test_aclose_calls_async_sdk_close(self):
+        """aclose() releases the async genai client used by complete()."""
         genai_stub = MagicMock()
         sdk_client = MagicMock()
+        sdk_client.aio.aclose = AsyncMock()
         sdk_client.close = MagicMock()
         genai_stub.Client.return_value = sdk_client
 
@@ -155,11 +156,12 @@ class TestGeminiLifecycle:
 
             await client.aclose()
 
-        sdk_client.close.assert_called_once()
+        sdk_client.aio.aclose.assert_awaited_once()
+        sdk_client.close.assert_not_called()
 
     async def test_aclose_idempotent(self):
         sdk_client = MagicMock()
-        sdk_client.close = MagicMock()
+        sdk_client.aio.aclose = AsyncMock()
 
         from jig.llm.google import GeminiClient
         client = GeminiClient.__new__(GeminiClient)
@@ -169,7 +171,7 @@ class TestGeminiLifecycle:
 
         await client.aclose()
         await client.aclose()
-        sdk_client.close.assert_called_once()
+        sdk_client.aio.aclose.assert_awaited_once()
 
     async def test_attempt_accounting_contract_documents_sdk_limit(self):
         from jig.llm.google import GeminiClient
@@ -308,6 +310,24 @@ class TestOllamaEmbedLifecycle:
         with patch("jig._embed.OllamaAsyncClient", OllamaAsyncClientStub):
             from jig._embed import ollama_embed
             with pytest.raises(RuntimeError, match="ollama down"):
+                await ollama_embed("hello", model="nomic-embed-text")
+
+        inner_http.aclose.assert_awaited_once()
+
+    async def test_embed_cleanup_error_does_not_mask_primary_failure(self):
+        """A cleanup failure must not replace the original embed failure."""
+        inner_http = MagicMock()
+        inner_http.aclose = AsyncMock(side_effect=RuntimeError("close failed"))
+
+        sdk_client = MagicMock()
+        sdk_client._client = inner_http
+        sdk_client.embed = AsyncMock(side_effect=RuntimeError("embed failed"))
+
+        OllamaAsyncClientStub = MagicMock(return_value=sdk_client)
+
+        with patch("jig._embed.OllamaAsyncClient", OllamaAsyncClientStub):
+            from jig._embed import ollama_embed
+            with pytest.raises(RuntimeError, match="embed failed"):
                 await ollama_embed("hello", model="nomic-embed-text")
 
         inner_http.aclose.assert_awaited_once()

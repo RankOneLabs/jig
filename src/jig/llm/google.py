@@ -69,7 +69,7 @@ class GeminiClient(LLMClient):
     async def aclose(self) -> None:
         if not self._closed:
             self._closed = True
-            self._client.close()
+            await self._client.aio.aclose()
 
     def _convert_messages(self, params: CompletionParams) -> list[Any]:
         contents: list[genai_types.Content] = []

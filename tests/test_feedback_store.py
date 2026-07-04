@@ -8,6 +8,7 @@ Covers:
 """
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from datetime import datetime
 from typing import Any
@@ -30,10 +31,13 @@ async def _fake_embed(text: str) -> np.ndarray:
 
 
 @pytest.fixture
-def feedback_db(tmp_path):
+async def feedback_db(tmp_path):
     loop = SQLiteFeedbackLoop(db_path=str(tmp_path / "test.db"))
     loop._embed = _fake_embed  # type: ignore[method-assign]
-    return loop
+    try:
+        yield loop
+    finally:
+        await loop.close()
 
 
 # ---------------------------------------------------------------------------
@@ -318,3 +322,53 @@ class TestScoreBatchAtomicity:
         )
         row = await cursor.fetchone()
         assert row[0] == 3, "all three dimensions must be persisted on success"
+
+    async def test_feedback_writes_are_serialized_on_shared_connection(
+        self, feedback_db: SQLiteFeedbackLoop
+    ) -> None:
+        """A concurrent feedback write must not enter during a score transaction."""
+        rid = await feedback_db.store_result("content", "input", {})
+        db = await feedback_db._get_db()
+
+        score_insert_started = asyncio.Event()
+        allow_score_insert = asyncio.Event()
+        result_insert_started = asyncio.Event()
+        original_execute = db.execute
+
+        async def blocking_execute(sql: str, params: Any = ()) -> Any:
+            if "INSERT INTO scores" in sql:
+                score_insert_started.set()
+                await allow_score_insert.wait()
+            if "INSERT INTO results" in sql:
+                result_insert_started.set()
+            return await original_execute(sql, params)
+
+        db.execute = blocking_execute  # type: ignore[method-assign]
+        score_task = asyncio.create_task(
+            feedback_db.score(rid, [Score("q", 0.8, ScoreSource.HEURISTIC)])
+        )
+        store_task: asyncio.Task[str] | None = None
+        try:
+            await asyncio.wait_for(score_insert_started.wait(), timeout=1)
+            store_task = asyncio.create_task(
+                feedback_db.store_result("other", "input", {})
+            )
+            await asyncio.sleep(0)
+            assert not result_insert_started.is_set(), (
+                "store_result entered the shared connection during score transaction"
+            )
+            allow_score_insert.set()
+            await score_task
+            await store_task
+            assert result_insert_started.is_set()
+        finally:
+            allow_score_insert.set()
+            db.execute = original_execute  # type: ignore[method-assign]
+            pending = [
+                task for task in (score_task, store_task)
+                if task is not None and not task.done()
+            ]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)

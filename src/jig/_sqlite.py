@@ -31,13 +31,9 @@ class LazyConnection:
         self._lock: asyncio.Lock | None = None
 
     async def get(self) -> aiosqlite.Connection:
-        if self._db is not None:
-            return self._db
         if self._lock is None:
             self._lock = asyncio.Lock()
         async with self._lock:
-            # Re-check after acquiring — another waiter may have
-            # initialized the connection while we blocked on the lock.
             if self._db is None:
                 conn = await aiosqlite.connect(self._db_path)
                 try:
@@ -47,8 +43,8 @@ class LazyConnection:
                     await conn.close()
                     raise
                 self._db = conn
-        assert self._db is not None
-        return self._db
+            assert self._db is not None
+            return self._db
 
     async def close(self) -> None:
         # Acquire the lock so close() cannot race with an in-flight get():

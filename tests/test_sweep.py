@@ -351,8 +351,7 @@ class TestSweepWorkerErrorIsolation:
 
     async def test_budget_exhaustion_becomes_per_case_error(self):
         """JigBudgetError from run_agent → structured SweepRun error, not worker death."""
-        from jig.core.errors import JigBudgetError as _JigBudgetError
-        from jig import AgentBudgetError, BudgetedLLMClient, BudgetTracker
+        from jig import BudgetedLLMClient, BudgetTracker
 
         # Budget so tight it's exhausted after the first call
         budget = BudgetTracker(limit_usd=0.001)
@@ -451,7 +450,7 @@ class TestCompareErrorIsolation:
 
     async def test_budget_error_becomes_structured_result(self):
         """JigBudgetError in a config → CompareRun with error, not exception propagation."""
-        from jig import AgentBudgetError, BudgetedLLMClient, BudgetTracker
+        from jig import BudgetedLLMClient, BudgetTracker
 
         budget = BudgetTracker(limit_usd=0.0001)
         llm = _FakeLLM("ok", cost=0.001)
