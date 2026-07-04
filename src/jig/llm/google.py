@@ -7,7 +7,6 @@ import uuid
 from typing import Any
 
 from jig.core.errors import JigLLMError
-from jig.core.retry import with_retry
 from jig.core.types import (
     CompletionParams,
     LLMClient,
@@ -30,6 +29,12 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+GEMINI_ATTEMPT_ACCOUNTING_NOTE = (
+    "Runner llm_calls counts GeminiClient.complete() invocations. The "
+    "google-genai SDK does not expose a public retry-disable or real HTTP "
+    "attempt-count hook, so SDK-internal retries are not included."
+)
+
 
 def _sanitize_for_gemini(obj: Any) -> Any:
     """Sanitize a value so it passes google-genai FunctionResponse validation.
@@ -51,11 +56,20 @@ def _sanitize_for_gemini(obj: Any) -> Any:
 
 
 class GeminiClient(LLMClient):
+    strict_provider_attempt_accounting = False
+    provider_attempt_accounting = GEMINI_ATTEMPT_ACCOUNTING_NOTE
+
     def __init__(self, model: str = "gemini-2.5-pro", **client_kwargs: Any):
         if genai is None:
             raise ImportError("Install google-genai: pip install 'jig[google]'")
         self._client = genai.Client(**client_kwargs)
         self._model = model
+        self._closed = False
+
+    async def aclose(self) -> None:
+        if not self._closed:
+            await self._client.aio.aclose()
+            self._closed = True
 
     def _convert_messages(self, params: CompletionParams) -> list[Any]:
         contents: list[genai_types.Content] = []
@@ -159,20 +173,12 @@ class GeminiClient(LLMClient):
 
         timer = start_timer()
 
-        async def _call() -> Any:
-            return await self._client.aio.models.generate_content(
+        try:
+            response = await self._client.aio.models.generate_content(
                 model=self._model,
                 contents=contents,
                 config=config,
             )
-
-        def _retryable(e: Exception) -> bool:
-            # Retry on 429 / resource exhausted
-            status = getattr(e, "status_code", None) or getattr(e, "code", None)
-            return status in (429, 503)
-
-        try:
-            response = await with_retry(_call, max_attempts=3, retryable=_retryable)
         except JigLLMError:
             raise
         except Exception as e:

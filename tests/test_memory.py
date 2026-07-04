@@ -18,10 +18,13 @@ async def _fake_embed(text: str) -> np.ndarray:
 
 
 @pytest.fixture
-def store(tmp_path):
+async def store(tmp_path):
     s = SqliteStore(db_path=str(tmp_path / "m.db"))
     s._custom_embedder = _fake_embed
-    return s
+    try:
+        yield s
+    finally:
+        await s.close()
 
 
 @pytest.fixture
@@ -132,6 +135,7 @@ class TestLocalMemoryFactory:
         store._custom_embedder = _fake_embed  # type: ignore[method-assign]
         await store.add("hello", {})
         assert await retriever.retrieve("hello", k=1)
+        await store.close()
 
 
 class TestProtocolConformance:

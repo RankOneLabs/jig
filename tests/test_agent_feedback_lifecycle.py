@@ -137,10 +137,13 @@ class StubTracer(TracingLogger):
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def feedback_loop(tmp_path):
+async def feedback_loop(tmp_path):
     loop = SQLiteFeedbackLoop(db_path=str(tmp_path / "feedback.db"))
     loop._embed = _fake_embed  # type: ignore[method-assign]
-    return loop
+    try:
+        yield loop
+    finally:
+        await loop.close()
 
 
 def _make_config(name: str, content: str, feedback_loop, tracer, grader, store=None):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime
 from typing import Any
@@ -41,6 +42,15 @@ CREATE INDEX IF NOT EXISTS idx_scores_result ON scores(result_id);
 """
 
 
+async def _rollback_safely(db: aiosqlite.Connection) -> None:
+    rollback = asyncio.create_task(db.rollback())
+    try:
+        await asyncio.shield(rollback)
+    except BaseException:
+        await rollback
+        raise
+
+
 class SQLiteFeedbackLoop(FeedbackLoop):
     def __init__(
         self,
@@ -51,9 +61,15 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         self._embed_model = embed_model
         self._ollama_host = ollama_host
         self._conn = LazyConnection(db_path, _SCHEMA)
+        self._write_lock: asyncio.Lock | None = None
 
     async def _get_db(self) -> aiosqlite.Connection:
         return await self._conn.get()
+
+    def _get_write_lock(self) -> asyncio.Lock:
+        if self._write_lock is None:
+            self._write_lock = asyncio.Lock()
+        return self._write_lock
 
     async def _embed(self, text: str) -> np.ndarray:
         return await ollama_embed(text, self._embed_model, self._ollama_host)
@@ -64,33 +80,47 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         input_text: str,
         metadata: dict[str, Any] | None = None,
     ) -> str:
-        db = await self._get_db()
         result_id = str(uuid.uuid4())
         embedding = await self._embed(input_text)
-        await db.execute(
-            "INSERT INTO results (id, content, input, metadata, embedding, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                result_id,
-                content,
-                input_text,
-                json_dumps(metadata or {}),
-                embedding.tobytes(),
-                datetime.now().isoformat(),
-            ),
-        )
-        await db.commit()
+        async with self._get_write_lock():
+            db = await self._get_db()
+            try:
+                await db.execute(
+                    "INSERT INTO results (id, content, input, metadata, embedding, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        result_id,
+                        content,
+                        input_text,
+                        json_dumps(metadata or {}),
+                        embedding.tobytes(),
+                        datetime.now().isoformat(),
+                    ),
+                )
+                await db.commit()
+            except BaseException:
+                await _rollback_safely(db)
+                raise
         return result_id
 
     async def score(self, result_id: str, scores: list[Score]) -> None:
         validate_scores(scores)
-        db = await self._get_db()
         now = datetime.now().isoformat()
-        for s in scores:
-            await db.execute(
-                "INSERT INTO scores (result_id, dimension, value, source, created_at) VALUES (?, ?, ?, ?, ?)",
-                (result_id, s.dimension, s.value, s.source.value, now),
-            )
-        await db.commit()
+        async with self._get_write_lock():
+            db = await self._get_db()
+            # Explicit BEGIN pins the batch boundary before the first insert.
+            # The write lock keeps other feedback writes from committing or
+            # rolling back this shared connection until the batch is complete.
+            try:
+                await db.execute("BEGIN")
+                for s in scores:
+                    await db.execute(
+                        "INSERT INTO scores (result_id, dimension, value, source, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (result_id, s.dimension, s.value, s.source.value, now),
+                    )
+                await db.commit()
+            except BaseException:
+                await _rollback_safely(db)
+                raise
 
     async def get_signals(
         self,

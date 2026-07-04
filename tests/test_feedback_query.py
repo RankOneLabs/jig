@@ -27,10 +27,13 @@ async def _fake_embed(text: str) -> np.ndarray:
 
 
 @pytest.fixture
-def feedback_db(tmp_path):
+async def feedback_db(tmp_path):
     loop = SQLiteFeedbackLoop(db_path=str(tmp_path / "test.db"))
     loop._embed = _fake_embed  # type: ignore[method-assign]
-    return loop
+    try:
+        yield loop
+    finally:
+        await loop.close()
 
 
 async def _seed(loop: SQLiteFeedbackLoop, entries: list[dict]) -> list[str]:

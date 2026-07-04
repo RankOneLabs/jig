@@ -4,12 +4,16 @@ Covers:
 - SQLite foreign-key enforcement (orphan scores must fail loudly)
 - Score validation via validate_scores (shared helper)
 - export_eval_set: filter-before-limit semantics and edge cases
+- Atomic score batch: partial inserts must be rolled back on failure
 """
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from datetime import datetime
+from typing import Any
 
+import aiosqlite
 import numpy as np
 import pytest
 
@@ -27,10 +31,13 @@ async def _fake_embed(text: str) -> np.ndarray:
 
 
 @pytest.fixture
-def feedback_db(tmp_path):
+async def feedback_db(tmp_path):
     loop = SQLiteFeedbackLoop(db_path=str(tmp_path / "test.db"))
     loop._embed = _fake_embed  # type: ignore[method-assign]
-    return loop
+    try:
+        yield loop
+    finally:
+        await loop.close()
 
 
 # ---------------------------------------------------------------------------
@@ -235,3 +242,139 @@ class TestExportEvalSet:
 
         result = await feedback_db.export_eval_set(since=cutoff, min_score=0.5)
         assert [c.expected for c in result] == ["after"]
+
+
+# ---------------------------------------------------------------------------
+# Atomic score batch: partial inserts must be rolled back on failure
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestScoreBatchAtomicity:
+    """score() must be all-or-nothing: a failure on any dimension insert
+    must roll back every insert already executed in that call.
+
+    Pre-fix: inserts ran without an explicit transaction boundary.  A failure
+    after the Nth insert left N-1 inserts in an open implicit transaction that
+    was visible on the same connection and would be committed by the next
+    unrelated commit — partial batch corruption.
+
+    Post-fix: explicit BEGIN → rollback on exception ensures zero rows persist.
+    """
+
+    async def test_partial_insert_failure_rolls_back_entire_batch(
+        self, feedback_db: SQLiteFeedbackLoop
+    ) -> None:
+        rid = await feedback_db.store_result("content", "input", {})
+        db = await feedback_db._get_db()
+
+        insert_count = 0
+        original_execute = db.execute
+
+        async def failing_execute(sql: str, params: Any = ()) -> Any:
+            nonlocal insert_count
+            if "INSERT INTO scores" in sql:
+                insert_count += 1
+                if insert_count == 2:
+                    raise aiosqlite.Error("simulated second-insert failure")
+            return await original_execute(sql, params)
+
+        db.execute = failing_execute  # type: ignore[method-assign]
+        try:
+            with pytest.raises(aiosqlite.Error):
+                await feedback_db.score(
+                    rid,
+                    [
+                        Score("dim1", 0.8, ScoreSource.HEURISTIC),
+                        Score("dim2", 0.6, ScoreSource.HEURISTIC),
+                        Score("dim3", 0.4, ScoreSource.HEURISTIC),
+                    ],
+                )
+        finally:
+            db.execute = original_execute  # type: ignore[method-assign]
+
+        # No scores must survive — the rollback must have undone insert #1.
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM scores WHERE result_id = ?", (rid,)
+        )
+        row = await cursor.fetchone()
+        assert row[0] == 0, (
+            f"expected 0 score rows after rollback, got {row[0]}; "
+            "partial batch was not rolled back"
+        )
+
+    async def test_successful_batch_persists_all_dimensions(
+        self, feedback_db: SQLiteFeedbackLoop
+    ) -> None:
+        """Sanity-check: a clean batch with 3 dimensions commits all 3."""
+        rid = await feedback_db.store_result("content", "input", {})
+        await feedback_db.score(
+            rid,
+            [
+                Score("accuracy", 0.9, ScoreSource.HEURISTIC),
+                Score("relevance", 0.8, ScoreSource.HEURISTIC),
+                Score("fluency", 0.7, ScoreSource.HEURISTIC),
+            ],
+        )
+        db = await feedback_db._get_db()
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM scores WHERE result_id = ?", (rid,)
+        )
+        row = await cursor.fetchone()
+        assert row[0] == 3, "all three dimensions must be persisted on success"
+
+    async def test_feedback_writes_are_serialized_on_shared_connection(
+        self, feedback_db: SQLiteFeedbackLoop
+    ) -> None:
+        """A concurrent feedback write must not enter during a score transaction."""
+        rid = await feedback_db.store_result("content", "input", {})
+        db = await feedback_db._get_db()
+
+        score_insert_started = asyncio.Event()
+        allow_score_insert = asyncio.Event()
+        result_insert_started = asyncio.Event()
+        original_execute = db.execute
+
+        async def blocking_execute(sql: str, params: Any = ()) -> Any:
+            if "INSERT INTO scores" in sql:
+                score_insert_started.set()
+                await allow_score_insert.wait()
+            if "INSERT INTO results" in sql:
+                result_insert_started.set()
+            return await original_execute(sql, params)
+
+        db.execute = blocking_execute  # type: ignore[method-assign]
+        score_task = asyncio.create_task(
+            feedback_db.score(rid, [Score("q", 0.8, ScoreSource.HEURISTIC)])
+        )
+        store_task: asyncio.Task[str] | None = None
+        try:
+            await asyncio.wait_for(score_insert_started.wait(), timeout=1)
+            store_task = asyncio.create_task(
+                feedback_db.store_result("other", "input", {})
+            )
+            await asyncio.sleep(0)
+            assert not result_insert_started.is_set(), (
+                "store_result entered the shared connection during score transaction"
+            )
+            allow_score_insert.set()
+            await score_task
+            await store_task
+            assert result_insert_started.is_set()
+        finally:
+            allow_score_insert.set()
+            db.execute = original_execute  # type: ignore[method-assign]
+            pending = [
+                task for task in (score_task, store_task)
+                if task is not None and not task.done()
+            ]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+
+class TestFeedbackWriteLockLifecycle:
+    def test_write_lock_is_created_lazily(self, tmp_path) -> None:
+        loop = SQLiteFeedbackLoop(db_path=str(tmp_path / "lazy-lock.db"))
+        assert loop._write_lock is None

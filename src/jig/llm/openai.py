@@ -5,7 +5,6 @@ import logging
 from typing import Any, AsyncIterator
 
 from jig.core.errors import JigLLMError
-from jig.core.retry import with_retry
 from jig.core.types import (
     CompletionParams,
     LLMClient,
@@ -41,8 +40,16 @@ class OpenAIClient(LLMClient):
     def __init__(self, model: str = "gpt-4o", **client_kwargs: Any):
         if openai is None:
             raise ImportError("Install openai: pip install 'jig[openai]'")
+        # Disable SDK-level retries — runner owns the retry policy.
+        client_kwargs.setdefault("max_retries", 0)
         self._client = openai.AsyncOpenAI(**client_kwargs)
         self._model = model
+        self._closed = False
+
+    async def aclose(self) -> None:
+        if not self._closed:
+            await self._client.close()
+            self._closed = True
 
     def _apply_extra_kwargs(self, kwargs: dict[str, Any]) -> None:
         """Subclass hook: inject defaults into the chat.completions.create()
@@ -128,16 +135,8 @@ class OpenAIClient(LLMClient):
             len(kwargs.get("tools") or ()),
         )
 
-        async def _call() -> Any:
-            return await self._client.chat.completions.create(**kwargs)
-
-        def _retryable(e: Exception) -> bool:
-            if openai is None:
-                return False
-            return isinstance(e, openai.RateLimitError)
-
         try:
-            response = await with_retry(_call, max_attempts=3, retryable=_retryable)
+            response = await self._client.chat.completions.create(**kwargs)
         except Exception as e:
             err = wrap_llm_error(e, self._provider_label)
             logger.debug(

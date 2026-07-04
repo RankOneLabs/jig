@@ -21,6 +21,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
+from jig.core.errors import AgentBudgetError, AgentError, JigBudgetError
 from jig.core.runner import AgentConfig, AgentResult, run_agent
 from jig.core.types import EvalCase
 
@@ -225,6 +226,40 @@ def _ensure_unique_names(configs: Sequence[AgentConfig[Any]]) -> None:
         )
 
 
+def _error_result(error: AgentError) -> AgentResult[Any]:
+    """Synthetic AgentResult for a run that could not be dispatched."""
+    return AgentResult(
+        output="",
+        trace_id="",
+        usage={
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_cost": 0.0,
+            "llm_calls": 0,
+            "tool_calls": 0,
+        },
+        scores=None,
+        duration_ms=0.0,
+        error=error,
+    )
+
+
+def _budget_error_result(exc: JigBudgetError) -> AgentResult[Any]:
+    return _error_result(
+        AgentBudgetError(
+            str(exc),
+            spent_usd=exc.spent_usd,
+            limit_usd=exc.limit_usd,
+        )
+    )
+
+
+def _infra_error_result(exc: Exception) -> AgentResult[Any]:
+    detail = str(exc)
+    message = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+    return _error_result(AgentError(message))
+
+
 async def compare[T](
     input: str,
     configs: list[AgentConfig[T]],
@@ -242,6 +277,11 @@ async def compare[T](
     lifecycle. Configs that route LLM calls through smithers get the
     callback path automatically; configs that run locally are
     unaffected.
+
+    Per-config budget and infrastructure failures become structured
+    :class:`CompareRun` results (``result.error`` is set) rather than
+    propagating exceptions. True global errors (dispatch setup, etc.)
+    still abort the call.
     """
     if concurrency <= 0:
         raise ValueError(f"concurrency must be positive, got {concurrency}")
@@ -251,7 +291,18 @@ async def compare[T](
 
     async def _one(idx: int, cfg: AgentConfig[T]) -> CompareRun[T]:
         async with sem:
-            result = await run_agent(cfg, input)
+            try:
+                result = await run_agent(cfg, input)
+            except JigBudgetError as exc:
+                logger.debug(
+                    "compare config=%s budget exhausted: %s", cfg.name, exc
+                )
+                result = _budget_error_result(exc)
+            except Exception as exc:
+                logger.debug(
+                    "compare config=%s infrastructure error: %s", cfg.name, exc
+                )
+                result = _infra_error_result(exc)
             return CompareRun(
                 config_index=idx,
                 config_name=cfg.name,
@@ -293,6 +344,12 @@ async def sweep[T](
     on temperature variance for sample diversity; with
     ``temperature=0`` configs every repetition is identical and
     ``pass_at_k`` will warn at analysis time.
+
+    Per-case budget and infrastructure failures from ``run_agent``
+    become structured :class:`SweepRun` results (``result.error`` is
+    set) and are preserved alongside successes — workers continue
+    after isolated per-case failures. Only global setup errors (dispatch
+    startup, cancellation) abort the sweep without partial results.
     """
     if concurrency <= 0:
         raise ValueError(f"concurrency must be positive, got {concurrency}")
@@ -332,7 +389,20 @@ async def sweep[T](
                     "sweep worker %d dispatching slot=%d case=%d cfg=%s seed=%d",
                     worker_id, slot, case_idx, cfg.name, seed_idx,
                 )
-                result = await run_agent(cfg, input_text)
+                try:
+                    result = await run_agent(cfg, input_text)
+                except JigBudgetError as exc:
+                    logger.debug(
+                        "sweep worker %d slot=%d cfg=%s budget exhausted: %s",
+                        worker_id, slot, cfg.name, exc,
+                    )
+                    result = _budget_error_result(exc)
+                except Exception as exc:
+                    logger.debug(
+                        "sweep worker %d slot=%d cfg=%s infrastructure error: %s",
+                        worker_id, slot, cfg.name, exc,
+                    )
+                    result = _infra_error_result(exc)
                 logger.debug(
                     "sweep worker %d completed slot=%d cfg=%s",
                     worker_id, slot, cfg.name,
@@ -348,6 +418,16 @@ async def sweep[T](
             finally:
                 queue.task_done()
 
+    async def _produce() -> None:
+        slot = 0
+        for ci, case in enumerate(cases):
+            for gi, cfg in enumerate(configs):
+                for si in range(seeds):
+                    await queue.put((slot, ci, gi, si, case, cfg))
+                    slot += 1
+        for _ in range(n_workers):
+            await queue.put(None)
+
     async with _dispatch_listener(dispatch):
         # Cap the worker count at the actual workload — spinning up
         # more workers than items just wastes scheduler overhead.
@@ -356,25 +436,22 @@ async def sweep[T](
             "sweep starting: total=%d concurrency=%d workers=%d cases=%d configs=%d seeds=%d",
             total, concurrency, n_workers, len(cases), len(configs), seeds,
         )
-        workers = [asyncio.create_task(_worker(i)) for i in range(n_workers)]
+        worker_tasks = [asyncio.create_task(_worker(i)) for i in range(n_workers)]
+        producer_task = asyncio.create_task(_produce())
         try:
-            slot = 0
-            for ci, case in enumerate(cases):
-                for gi, cfg in enumerate(configs):
-                    for si in range(seeds):
-                        await queue.put((slot, ci, gi, si, case, cfg))
-                        slot += 1
-            # Sentinel per worker — graceful shutdown.
-            for _ in range(n_workers):
-                await queue.put(None)
-            await asyncio.gather(*workers)
+            await asyncio.gather(producer_task, *worker_tasks)
         except BaseException:
-            # On cancellation / any exception, cancel workers so they
-            # don't outlive the sweep call.
-            for w in workers:
+            # On cancellation or unexpected worker/producer failure, cancel
+            # everything so neither a blocked producer nor idle workers outlive
+            # the sweep call.
+            producer_task.cancel()
+            for w in worker_tasks:
                 w.cancel()
+            await asyncio.gather(producer_task, *worker_tasks, return_exceptions=True)
             raise
 
-    # All slots populated by workers; the cast satisfies the type
-    # checker without a runtime cost.
-    return SweepResult(sweep_id=resolved_sweep_id, runs=runs)  # type: ignore[arg-type]
+    # Filter None slots (empty sweep) and cast for type checker.
+    return SweepResult(
+        sweep_id=resolved_sweep_id,
+        runs=[r for r in runs if r is not None],  # type: ignore[misc]
+    )

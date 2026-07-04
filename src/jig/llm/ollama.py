@@ -7,7 +7,6 @@ from typing import Any, AsyncIterator
 import httpx
 
 from jig.core.errors import JigLLMError
-from jig.core.retry import with_retry
 from jig.core.types import (
     CompletionParams,
     LLMClient,
@@ -36,6 +35,15 @@ class OllamaClient(LLMClient):
             raise ImportError("Install ollama: pip install 'jig[ollama]'")
         self._client = OllamaAsyncClient(host=host)
         self._model = model
+        self._closed = False
+
+    async def aclose(self) -> None:
+        if not self._closed:
+            # OllamaAsyncClient wraps an httpx.AsyncClient at ._client
+            inner = getattr(self._client, "_client", None)
+            if inner is not None and hasattr(inner, "aclose"):
+                await inner.aclose()
+            self._closed = True
 
     def _convert_messages(self, params: CompletionParams) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
@@ -89,14 +97,8 @@ class OllamaClient(LLMClient):
 
         timer = start_timer()
 
-        async def _call() -> Any:
-            return await self._client.chat(**kwargs)
-
-        def _retryable(e: Exception) -> bool:
-            return isinstance(e, ConnectionError)
-
         try:
-            response = await with_retry(_call, max_attempts=3, retryable=_retryable)
+            response = await self._client.chat(**kwargs)
         except ConnectionError as e:
             raise JigLLMError("Cannot reach Ollama", "ollama", retryable=True) from e
         except httpx.ConnectError as e:
