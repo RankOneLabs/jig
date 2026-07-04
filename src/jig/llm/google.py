@@ -132,21 +132,30 @@ class GeminiClient(LLMClient):
         return [genai_types.Tool(function_declarations=declarations)]
 
     async def complete(self, params: CompletionParams) -> LLMResponse:
-        contents = self._convert_messages(params)
+        try:
+            contents = self._convert_messages(params)
 
-        config_kwargs: dict[str, Any] = {}
-        if params.system:
-            config_kwargs["system_instruction"] = params.system
-        if params.tools:
-            config_kwargs["tools"] = self._convert_tools(params.tools)
-        if params.temperature is not None:
-            config_kwargs["temperature"] = params.temperature
-        if params.max_tokens is not None:
-            config_kwargs["max_output_tokens"] = params.max_tokens
-        if params.provider_params:
-            config_kwargs.update(params.provider_params)
+            config_kwargs: dict[str, Any] = {}
+            if params.system:
+                config_kwargs["system_instruction"] = params.system
+            if params.tools:
+                config_kwargs["tools"] = self._convert_tools(params.tools)
+            if params.temperature is not None:
+                config_kwargs["temperature"] = params.temperature
+            if params.max_tokens is not None:
+                config_kwargs["max_output_tokens"] = params.max_tokens
+            if params.provider_params:
+                config_kwargs.update(params.provider_params)
 
-        config = genai_types.GenerateContentConfig(**config_kwargs)
+            config = genai_types.GenerateContentConfig(**config_kwargs)
+        except JigLLMError:
+            raise
+        except Exception as e:
+            msg = str(e)
+            detail = msg if msg else "no detail"
+            raise JigLLMError(
+                f"Request preparation failed: {type(e).__name__}: {detail}", "google",
+            ) from e
 
         timer = start_timer()
 
@@ -164,40 +173,51 @@ class GeminiClient(LLMClient):
 
         try:
             response = await with_retry(_call, max_attempts=3, retryable=_retryable)
+        except JigLLMError:
+            raise
         except Exception as e:
             status = getattr(e, "status_code", None) or getattr(e, "code", None)
             raise JigLLMError(str(e), "google", status_code=status) from e
 
         latency_ms = timer()
 
-        text_parts: list[str] = []
-        tool_calls: list[ToolCall] = []
+        try:
+            text_parts: list[str] = []
+            tool_calls: list[ToolCall] = []
 
-        if response.candidates and response.candidates[0].content:
-            parts = response.candidates[0].content.parts or []
-            for part in parts:
-                if part.text:
-                    text_parts.append(part.text)
-                elif part.function_call:
-                    tool_calls.append(ToolCall(
-                        id=f"call_{uuid.uuid4().hex[:12]}",
-                        name=part.function_call.name,
-                        arguments=dict(part.function_call.args) if part.function_call.args else {},
-                    ))
+            if response.candidates and response.candidates[0].content:
+                parts = response.candidates[0].content.parts or []
+                for part in parts:
+                    if part.text:
+                        text_parts.append(part.text)
+                    elif part.function_call:
+                        tool_calls.append(ToolCall(
+                            id=f"call_{uuid.uuid4().hex[:12]}",
+                            name=part.function_call.name,
+                            arguments=dict(part.function_call.args) if part.function_call.args else {},
+                        ))
 
-        usage_meta = response.usage_metadata
-        input_tokens = usage_meta.prompt_token_count if usage_meta else 0
-        output_tokens = usage_meta.candidates_token_count if usage_meta else 0
+            usage_meta = response.usage_metadata
+            input_tokens = (usage_meta.prompt_token_count if usage_meta else None) or 0
+            output_tokens = (usage_meta.candidates_token_count if usage_meta else None) or 0
 
-        usage = Usage(input_tokens=input_tokens, output_tokens=output_tokens)
-        stamp_cost(usage, self._model)
-        return LLMResponse(
-            content="\n".join(text_parts),
-            tool_calls=tool_calls or None,
-            usage=usage,
-            latency_ms=latency_ms,
-            model=self._model,
-        )
+            usage = Usage(input_tokens=input_tokens, output_tokens=output_tokens)
+            stamp_cost(usage, self._model)
+            return LLMResponse(
+                content="\n".join(text_parts),
+                tool_calls=tool_calls or None,
+                usage=usage,
+                latency_ms=latency_ms,
+                model=self._model,
+            )
+        except JigLLMError:
+            raise
+        except Exception as e:
+            msg = str(e)
+            detail = msg if msg else "no detail"
+            raise JigLLMError(
+                f"Response parsing failed: {type(e).__name__}: {detail}", "google",
+            ) from e
 
 
 def _find_tool_name(messages: list[Message], tool_call_id: str | None) -> str:

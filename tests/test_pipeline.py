@@ -179,6 +179,28 @@ async def test_linear_pipeline():
     assert kinds.count(SpanKind.PIPELINE_STEP) == 3
 
 
+async def test_pipeline_flush_failure_after_success_is_fail_soft():
+    """A tracer.flush failure must not erase a valid pipeline output."""
+
+    class BrokenFlushTracer(FakeTracer):
+        async def flush(self) -> None:
+            raise RuntimeError("trace sink unavailable")
+
+    tracer = BrokenFlushTracer()
+    result = await run_pipeline(
+        PipelineConfig(
+            name="flush_fail",
+            steps=[Step(name="add_one", fn=add_one)],
+            tracer=tracer,
+        ),
+        input=5,
+    )
+
+    assert result.output == 6
+    root = next(s for s in tracer.spans if s.kind == SpanKind.PIPELINE_RUN)
+    assert root.ended_at is not None
+
+
 async def test_short_circuit_on_err():
     """Step 2 returns error, step 3 never runs."""
 
@@ -452,3 +474,110 @@ async def test_caller_context_cannot_override_internal_trace_id():
     assert ctx["trace_id"].startswith("trace-")  # FakeTracer ids
     assert ctx["_tracer"] is tracer
     assert ctx["_span_id"] != "FAKE-SPAN"
+
+
+async def test_pipeline_flushes_tracer_on_success():
+    """run_pipeline flushes the tracer on success so SQLiteTracer callers see
+    completed spans without a separate flush call."""
+    import os
+    import tempfile
+    from jig.tracing import SQLiteTracer
+
+    with tempfile.TemporaryDirectory() as d:
+        tracer = SQLiteTracer(db_path=os.path.join(d, "test.db"))
+        result = await run_pipeline(
+            PipelineConfig(
+                name="flush_test",
+                steps=[Step(name="add_one", fn=add_one)],
+                tracer=tracer,
+            ),
+            input=5,
+        )
+        assert result.output == 6
+
+        # Spans must be readable immediately without a separate flush
+        spans = await tracer.get_trace(result.trace_id)
+        assert len(spans) == 2  # pipeline_run + pipeline_step
+        # Root span must be ended
+        root = next(s for s in spans if s.kind == SpanKind.PIPELINE_RUN)
+        assert root.ended_at is not None
+        await tracer.close()
+
+
+async def test_pipeline_flushes_tracer_on_exception():
+    """run_pipeline flushes and closes the root span even when a step raises."""
+    import os
+    import tempfile
+    from jig.tracing import SQLiteTracer
+
+    async def boom(ctx: dict[str, Any]) -> str:
+        raise RuntimeError("step exploded")
+
+    with tempfile.TemporaryDirectory() as d:
+        tracer = SQLiteTracer(db_path=os.path.join(d, "test.db"))
+        # Capture the trace_id before the exception clears _spans
+        captured_trace_ids: list[str] = []
+        _orig_start_trace = tracer.start_trace
+        def _capturing_start_trace(*args, **kwargs):
+            span = _orig_start_trace(*args, **kwargs)
+            captured_trace_ids.append(span.trace_id)
+            return span
+        tracer.start_trace = _capturing_start_trace  # type: ignore[method-assign]
+
+        try:
+            await run_pipeline(
+                PipelineConfig(name="boom_test", steps=[Step(name="boom", fn=boom)], tracer=tracer),
+                input=1,
+            )
+        except RuntimeError:
+            pass
+
+        assert captured_trace_ids, "start_trace must have been called"
+        spans = await tracer.get_trace(captured_trace_ids[0])
+        root = next((s for s in spans if s.kind == SpanKind.PIPELINE_RUN), None)
+        assert root is not None, "root pipeline span must be flushed to DB on exception"
+        assert root.ended_at is not None
+        assert root.error is not None
+        await tracer.close()
+
+
+async def test_map_pipeline_closes_parent_on_exception():
+    """map_pipeline closes the parent batch span and flushes on exception."""
+    import os
+    import tempfile
+    from jig.tracing import SQLiteTracer
+
+    async def boom(ctx: dict[str, Any]) -> str:
+        raise RuntimeError("item failed")
+
+    with tempfile.TemporaryDirectory() as d:
+        tracer = SQLiteTracer(db_path=os.path.join(d, "test.db"))
+        # map_pipeline calls start_trace once for the batch parent
+        captured_trace_ids: list[str] = []
+        _orig_start_trace = tracer.start_trace
+        def _capturing_start_trace(*args, **kwargs):
+            span = _orig_start_trace(*args, **kwargs)
+            captured_trace_ids.append(span.trace_id)
+            return span
+        tracer.start_trace = _capturing_start_trace  # type: ignore[method-assign]
+
+        try:
+            await map_pipeline(
+                PipelineConfig(name="boom_map", steps=[Step(name="boom", fn=boom)], tracer=tracer),
+                items=[1, 2],
+            )
+        except RuntimeError:
+            pass
+
+        assert captured_trace_ids, "start_trace must have been called for the batch parent"
+        batch_trace_id = captured_trace_ids[0]
+        spans = await tracer.get_trace(batch_trace_id)
+        batch_root = next(
+            (s for s in spans if s.kind == SpanKind.PIPELINE_RUN and "batch" in s.name), None
+        )
+        assert batch_root is not None, "batch parent span must be flushed to DB on exception"
+        assert batch_root.ended_at is not None
+        assert batch_root.error is not None
+        assert "RuntimeError" in batch_root.error
+        assert "item failed" in batch_root.error
+        await tracer.close()

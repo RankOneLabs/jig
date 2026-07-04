@@ -37,6 +37,7 @@ from jig.core.types import (
     TracingLogger,
 )
 from jig.tools.registry import ToolRegistry
+from jig.tracing.spans import span_guard
 
 logger = logging.getLogger(__name__)
 
@@ -321,35 +322,36 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
         # 3. Retrieve memory context via the swappable Retriever
         memory_context: list[MemoryEntry] = []
         if config.include_memory_in_prompt and config.retriever is not None:
-            mem_span = config.tracer.start_span(
-                trace.id, SpanKind.MEMORY_QUERY, "retrieve", {"query": input}
-            )
-            logger.debug("retriever.retrieve start (k=5)")
-            memory_context = await config.retriever.retrieve(input, k=5)
-            logger.debug("retriever.retrieve done (hits=%d)", len(memory_context))
-            # Span output carries retrieved-id scores so downstream
-            # analytics can group "which retriever picked what?" without
-            # replaying the corpus.
-            config.tracer.end_span(
-                mem_span.id,
-                {
-                    "retrieved": [
-                        {"id": e.id, "score": e.score, "preview": e.content[:120]}
-                        for e in memory_context
-                    ],
-                },
-            )
+            with span_guard(
+                config.tracer, trace.id, SpanKind.MEMORY_QUERY, "retrieve",
+                input={"query": input},
+            ) as mem_span:
+                logger.debug("retriever.retrieve start (k=5)")
+                memory_context = await config.retriever.retrieve(input, k=5)
+                logger.debug("retriever.retrieve done (hits=%d)", len(memory_context))
+                # Span output carries retrieved-id scores so downstream
+                # analytics can group "which retriever picked what?" without
+                # replaying the corpus.
+                mem_span.finish(
+                    {
+                        "retrieved": [
+                            {"id": e.id, "score": e.score, "preview": e.content[:120]}
+                            for e in memory_context
+                        ],
+                    },
+                )
 
         # 4. Query feedback signals
         feedback_signals: list[ScoredResult] = []
         if config.include_feedback_in_prompt:
-            fb_span = config.tracer.start_span(
-                trace.id, SpanKind.MEMORY_QUERY, "query_feedback", {"query": input}
-            )
-            logger.debug("feedback.get_signals start (limit=3, min_score=0.7)")
-            feedback_signals = await config.feedback.get_signals(input, limit=3, min_score=0.7)
-            logger.debug("feedback.get_signals done (signals=%d)", len(feedback_signals))
-            config.tracer.end_span(fb_span.id, [s.content[:100] for s in feedback_signals])
+            with span_guard(
+                config.tracer, trace.id, SpanKind.MEMORY_QUERY, "query_feedback",
+                input={"query": input},
+            ) as fb_span:
+                logger.debug("feedback.get_signals start (limit=3, min_score=0.7)")
+                feedback_signals = await config.feedback.get_signals(input, limit=3, min_score=0.7)
+                logger.debug("feedback.get_signals done (signals=%d)", len(feedback_signals))
+                fb_span.finish([s.content[:100] for s in feedback_signals])
 
         # 5. Assemble messages (system prompt is separate, not in messages list)
         system_message = build_system_message(system_prompt, memory_context, feedback_signals)
@@ -388,77 +390,75 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
             # too, not just successes. A flaky LLM would otherwise be able to
             # race past max_llm_calls via the consecutive-errors retry path.
             total_usage["llm_calls"] += 1
-            # Stamp the configured model on the span at start time so the
-            # trace records which model was requested even if the call
-            # subsequently errors (the failure path doesn't have an
-            # LLMResponse to consult).
-            llm_span = config.tracer.start_span(
-                trace.id,
-                SpanKind.LLM_CALL,
-                "completion",
+            # span_guard ensures the LLM span is closed even if llm.complete
+            # raises a non-JigLLMError exception (e.g. RuntimeError from a
+            # buggy adapter). JigLLMError is still handled explicitly inside
+            # the block so the runner can record the right error string and
+            # choose break vs. continue.
+            with span_guard(
+                config.tracer, trace.id, SpanKind.LLM_CALL, "completion",
                 metadata={"model": _resolve_model_id(config.llm)},
-            )
-            params = CompletionParams(
-                messages=messages,
-                system=system_message,
-                tools=tools_for_llm,
-            )
+            ) as llm_span:
+                params = CompletionParams(
+                    messages=messages,
+                    system=system_message,
+                    tools=tools_for_llm,
+                )
 
-            try:
-                logger.debug(
-                    "llm.complete start (call %d/%d, messages=%d, tools=%d)",
-                    total_usage["llm_calls"],
-                    config.max_llm_calls,
-                    len(messages),
-                    len(tools_for_llm) if tools_for_llm else 0,
-                )
-                response = await config.llm.complete(params)
-                logger.debug(
-                    "llm.complete done (latency_ms=%s, tool_calls=%d)",
-                    getattr(response, "latency_ms", "?"),
-                    len(response.tool_calls or []),
-                )
-            except JigLLMError as e:
-                config.tracer.end_span(llm_span.id, None, error=str(e))
-                # Fast-fail only on known-permanent errors (auth, bad
-                # request, not-found). Unknown errors and 5xx go through
-                # the retry path — adapters default `retryable=False`
-                # broadly, so reading that flag would collapse transient
-                # server errors into immediate termination.
-                if e.status_code in _PERMANENT_LLM_STATUS_CODES:
-                    agent_error = AgentLLMPermanentError(
-                        provider=e.provider,
-                        message=str(e),
-                        status_code=e.status_code,
+                try:
+                    logger.debug(
+                        "llm.complete start (call %d/%d, messages=%d, tools=%d)",
+                        total_usage["llm_calls"],
+                        config.max_llm_calls,
+                        len(messages),
+                        len(tools_for_llm) if tools_for_llm else 0,
                     )
-                    final_output = f"[agent terminated: {agent_error}]"
+                    response = await config.llm.complete(params)
+                    logger.debug(
+                        "llm.complete done (latency_ms=%s, tool_calls=%d)",
+                        getattr(response, "latency_ms", "?"),
+                        len(response.tool_calls or []),
+                    )
+                except JigLLMError as e:
+                    llm_span.finish(error=str(e))
+                    # Fast-fail only on known-permanent errors (auth, bad
+                    # request, not-found). Unknown errors and 5xx go through
+                    # the retry path — adapters default `retryable=False`
+                    # broadly, so reading that flag would collapse transient
+                    # server errors into immediate termination.
+                    if e.status_code in _PERMANENT_LLM_STATUS_CODES:
+                        agent_error = AgentLLMPermanentError(
+                            provider=e.provider,
+                            message=str(e),
+                            status_code=e.status_code,
+                        )
+                        final_output = f"[agent terminated: {agent_error}]"
+                        logger.warning(
+                            "Permanent LLM error (status %s); terminating: %s",
+                            e.status_code, e,
+                        )
+                        break
+                    consecutive_llm_errors += 1
                     logger.warning(
-                        "Permanent LLM error (status %s); terminating: %s",
-                        e.status_code, e,
+                        "LLM call failed (%d/%d): %s",
+                        consecutive_llm_errors, config.max_llm_retries, e,
                     )
-                    break
-                consecutive_llm_errors += 1
-                logger.warning(
-                    "LLM call failed (%d/%d): %s",
-                    consecutive_llm_errors, config.max_llm_retries, e,
-                )
-                if consecutive_llm_errors >= config.max_llm_retries:
-                    agent_error = AgentMaxLLMRetriesError(consecutive_llm_errors, str(e))
-                    final_output = f"[agent terminated: {agent_error}]"
-                    break
-                # Inject an error message so the model can see it on next turn
-                messages.append(Message(
-                    role=Role.USER,
-                    content=f"[system: LLM call failed: {e}. Please continue.]",
-                ))
-                continue
+                    if consecutive_llm_errors >= config.max_llm_retries:
+                        agent_error = AgentMaxLLMRetriesError(consecutive_llm_errors, str(e))
+                        final_output = f"[agent terminated: {agent_error}]"
+                        break
+                    # Inject an error message so the model can see it on next turn
+                    messages.append(Message(
+                        role=Role.USER,
+                        content=f"[system: LLM call failed: {e}. Please continue.]",
+                    ))
+                    continue
 
-            consecutive_llm_errors = 0
-            config.tracer.end_span(
-                llm_span.id,
-                {"content": response.content[:200], "tool_calls": len(response.tool_calls or [])},
-                usage=response.usage,
-            )
+                consecutive_llm_errors = 0
+                llm_span.finish(
+                    {"content": response.content[:200], "tool_calls": len(response.tool_calls or [])},
+                    usage=response.usage,
+                )
 
             total_usage["total_input_tokens"] += response.usage.input_tokens
             total_usage["total_output_tokens"] += response.usage.output_tokens
@@ -521,24 +521,57 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
             submit_call: ToolCall | None = submit_calls[0] if submit_calls else None
 
             if submit_call is not None:
-                extract_span = config.tracer.start_span(
-                    trace.id,
-                    SpanKind.TOOL_CALL,
-                    SUBMIT_OUTPUT_TOOL,
-                    submit_call.arguments,
-                )
-                try:
-                    parsed = config.output_schema.model_validate(submit_call.arguments)  # type: ignore[union-attr]
-                except ValidationError as ve:
-                    parse_retries += 1
-                    config.tracer.end_span(extract_span.id, None, error=str(ve))
-                    logger.info(
-                        "submit_output validation failed (%d/%d): %s",
-                        parse_retries, config.max_parse_retries, ve,
-                    )
-                    # Record the assistant's attempt and feed the validation
-                    # errors back so the model can correct. Do not execute any
-                    # other tools in this turn — the model is in retry mode.
+                with span_guard(
+                    config.tracer, trace.id, SpanKind.TOOL_CALL, SUBMIT_OUTPUT_TOOL,
+                    input=submit_call.arguments,
+                ) as extract_span:
+                    try:
+                        parsed = config.output_schema.model_validate(submit_call.arguments)  # type: ignore[union-attr]
+                    except ValidationError as ve:
+                        parse_retries += 1
+                        extract_span.finish(error=str(ve))
+                        logger.info(
+                            "submit_output validation failed (%d/%d): %s",
+                            parse_retries, config.max_parse_retries, ve,
+                        )
+                        # Record the assistant's attempt and feed the validation
+                        # errors back so the model can correct. Do not execute any
+                        # other tools in this turn — the model is in retry mode.
+                        messages.append(
+                            Message(
+                                role=Role.ASSISTANT,
+                                content=response.content,
+                                tool_calls=response.tool_calls,
+                            )
+                        )
+                        # Every tool call in this turn must receive a response
+                        # (providers reject assistant-with-tool_calls followed by
+                        # user text without matching tool messages in between).
+                        for call in response.tool_calls:
+                            if call.name == SUBMIT_OUTPUT_TOOL:
+                                content = (
+                                    f"Validation failed: {ve.error_count()} error(s).\n"
+                                    f"{ve}\n"
+                                    f"Call {SUBMIT_OUTPUT_TOOL} again with corrected arguments."
+                                )
+                            else:
+                                content = (
+                                    f"[skipped: submit_output retry in progress — "
+                                    f"please call {SUBMIT_OUTPUT_TOOL} with valid "
+                                    f"arguments]"
+                                )
+                            messages.append(
+                                Message(role=Role.TOOL, content=content, tool_call_id=call.id)
+                            )
+                        if parse_retries > config.max_parse_retries:
+                            agent_error = AgentSchemaValidationError(parse_retries, str(ve))
+                            final_output = f"[agent terminated: {agent_error}]"
+                            break
+                        continue
+
+                    # Validation succeeded — finalize.
+                    extract_span.finish(submit_call.arguments)
+                    final_output = parsed.model_dump_json()
                     messages.append(
                         Message(
                             role=Role.ASSISTANT,
@@ -546,42 +579,7 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                             tool_calls=response.tool_calls,
                         )
                     )
-                    # Every tool call in this turn must receive a response
-                    # (providers reject assistant-with-tool_calls followed by
-                    # user text without matching tool messages in between).
-                    for call in response.tool_calls:
-                        if call.name == SUBMIT_OUTPUT_TOOL:
-                            content = (
-                                f"Validation failed: {ve.error_count()} error(s).\n"
-                                f"{ve}\n"
-                                f"Call {SUBMIT_OUTPUT_TOOL} again with corrected arguments."
-                            )
-                        else:
-                            content = (
-                                f"[skipped: submit_output retry in progress — "
-                                f"please call {SUBMIT_OUTPUT_TOOL} with valid "
-                                f"arguments]"
-                            )
-                        messages.append(
-                            Message(role=Role.TOOL, content=content, tool_call_id=call.id)
-                        )
-                    if parse_retries > config.max_parse_retries:
-                        agent_error = AgentSchemaValidationError(parse_retries, str(ve))
-                        final_output = f"[agent terminated: {agent_error}]"
-                        break
-                    continue
-
-                # Validation succeeded — finalize.
-                config.tracer.end_span(extract_span.id, submit_call.arguments)
-                final_output = parsed.model_dump_json()
-                messages.append(
-                    Message(
-                        role=Role.ASSISTANT,
-                        content=response.content,
-                        tool_calls=response.tool_calls,
-                    )
-                )
-                break
+                    break
 
             # --- Plain-text termination path (no schema, or schema set but model
             # didn't call submit_output this turn). ---
@@ -661,68 +659,83 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                 tool_call_count += 1
                 total_usage["tool_calls"] += 1
 
-        # 7. Persist to the memory store (if one is configured).
+        # 7. Post-output bookkeeping: only for successful (non-terminated) runs.
+        # Terminated runs (agent_error set) skip all persistence so sentinel text
+        # does not pollute memory, session history, or feedback signals. After a
+        # valid output is produced, each bookkeeping operation is fail-soft:
+        # exceptions are logged and the valid output is still returned.
         memory_id: str | None = None
-        if config.store is not None:
-            memory_id = await config.store.add(
-                final_output,
-                {"agent": config.name, "input": input, "trace_id": trace.trace_id},
-            )
+        if agent_error is None:
+            if config.store is not None:
+                try:
+                    memory_id = await config.store.add(
+                        final_output,
+                        {"agent": config.name, "input": input, "trace_id": trace.trace_id},
+                    )
+                except Exception:
+                    logger.exception("memory.add failed after successful run (non-fatal)")
 
-        if config.session_id and config.store is not None:
-            await config.store.add_to_session(
-                config.session_id, Message(role=Role.USER, content=input)
-            )
-            await config.store.add_to_session(
-                config.session_id, Message(role=Role.ASSISTANT, content=final_output)
-            )
+            if config.session_id and config.store is not None:
+                try:
+                    await config.store.add_to_session(
+                        config.session_id, Message(role=Role.USER, content=input)
+                    )
+                    await config.store.add_to_session(
+                        config.session_id, Message(role=Role.ASSISTANT, content=final_output)
+                    )
+                except Exception:
+                    logger.exception("store.add_to_session failed after successful run (non-fatal)")
 
-        # 8. Auto-grade: register the output as a feedback result first so
-        # scores reference a real result row that query/get_signals/export can
-        # join against. Memory IDs and trace IDs are separate namespaces and
-        # must not be used as the feedback result ID.
-        if config.grader:
-            # Flush so trajectory graders can read pre-grade spans via
-            # get_trace. SQLiteTracer retains unended spans (notably the
-            # root) so _finalize_trace's end_span still works.
-            await config.tracer.flush()
-            grade_span = config.tracer.start_span(
-                trace.id, SpanKind.GRADING, "auto_grade", {"input": input}
-            )
-            grade_output: Any = parsed if parsed is not None else final_output
-            scores = await config.grader.grade(
-                input,
-                grade_output,
-                context={
-                    "raw_output": final_output,
-                    "trace_id": trace.trace_id,
-                },
-            )
-            feedback_result_id: str | None = None
-            if scores:
-                fb_meta: dict[str, Any] = {
-                    "kind": "agent_result",
-                    "agent_name": config.name,
-                    "source": "run_agent",
-                    "trace_id": trace.trace_id,
-                }
-                model_id = _resolve_model_id(config.llm)
-                if model_id is not None:
-                    fb_meta["model"] = model_id
-                if config.session_id is not None:
-                    fb_meta["session_id"] = config.session_id
-                if memory_id is not None:
-                    fb_meta["memory_id"] = memory_id
-                feedback_result_id = await config.feedback.store_result(
-                    final_output, input, fb_meta
-                )
-                await config.feedback.score(feedback_result_id, scores)
-            span_output: dict[str, Any] = {
-                "scores": [{"dimension": s.dimension, "value": s.value} for s in scores],
-            }
-            if feedback_result_id is not None:
-                span_output["feedback_result_id"] = feedback_result_id
-            config.tracer.end_span(grade_span.id, span_output)
+            # 8. Auto-grade: register the output as a feedback result first so
+            # scores reference a real result row that query/get_signals/export can
+            # join against. Memory IDs and trace IDs are separate namespaces and
+            # must not be used as the feedback result ID.
+            if config.grader:
+                try:
+                    # Flush so trajectory graders can read pre-grade spans via
+                    # get_trace. SQLiteTracer retains unended spans (notably the
+                    # root) so _finalize_trace's end_span still works.
+                    await config.tracer.flush()
+                    with span_guard(
+                        config.tracer, trace.id, SpanKind.GRADING, "auto_grade",
+                        input={"input": input},
+                    ) as grade_span:
+                        grade_output: Any = parsed if parsed is not None else final_output
+                        scores = await config.grader.grade(
+                            input,
+                            grade_output,
+                            context={
+                                "raw_output": final_output,
+                                "trace_id": trace.trace_id,
+                            },
+                        )
+                        feedback_result_id: str | None = None
+                        if scores:
+                            fb_meta: dict[str, Any] = {
+                                "kind": "agent_result",
+                                "agent_name": config.name,
+                                "source": "run_agent",
+                                "trace_id": trace.trace_id,
+                            }
+                            model_id = _resolve_model_id(config.llm)
+                            if model_id is not None:
+                                fb_meta["model"] = model_id
+                            if config.session_id is not None:
+                                fb_meta["session_id"] = config.session_id
+                            if memory_id is not None:
+                                fb_meta["memory_id"] = memory_id
+                            feedback_result_id = await config.feedback.store_result(
+                                final_output, input, fb_meta
+                            )
+                            await config.feedback.score(feedback_result_id, scores)
+                        span_output: dict[str, Any] = {
+                            "scores": [{"dimension": s.dimension, "value": s.value} for s in scores],
+                        }
+                        if feedback_result_id is not None:
+                            span_output["feedback_result_id"] = feedback_result_id
+                        grade_span.finish(span_output)
+                except Exception:
+                    logger.exception("auto-grading failed after successful run (non-fatal)")
     finally:
         # Always close the root span + flush the tracer, even if an
         # exception propagates mid-run. Buffered tracers (SQLiteTracer)

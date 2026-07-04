@@ -69,15 +69,17 @@ class ToolRegistry:
             logger.debug("tool.execute done name=%s", call.name)
             return ToolResult(call_id=call.id, output=output)
         except asyncio.TimeoutError:
-            logger.debug("tool.execute timeout name=%s after=%ss", call.name, self._execute_timeout)
+            logger.warning("tool.execute timeout name=%s after=%ss", call.name, self._execute_timeout)
             return ToolResult(
                 call_id=call.id,
                 output="",
-                error=f"Tool {call.name} timed out after {self._execute_timeout}s",
+                error=f"TimeoutError: Tool {call.name} timed out after {self._execute_timeout}s",
             )
         except Exception as e:
-            logger.debug("tool.execute error name=%s err=%s", call.name, e)
-            return ToolResult(call_id=call.id, output="", error=str(e))
+            msg = str(e)
+            error = f"{type(e).__name__}: {msg}" if msg else f"{type(e).__name__}: tool raised without message"
+            logger.warning("tool.execute error name=%s err=%s", call.name, error, exc_info=True)
+            return ToolResult(call_id=call.id, output="", error=error)
 
     async def _execute_dispatched(self, tool: Tool, call: ToolCall) -> ToolResult:
         """Route a dispatch=True tool through :func:`jig.dispatch.run`.
@@ -119,19 +121,26 @@ class ToolRegistry:
                     **kwargs,
                 )
         except asyncio.TimeoutError:
+            logger.warning("tool.execute dispatch timeout name=%s after=%ss", call.name, self._execute_timeout)
             return ToolResult(
                 call_id=call.id,
                 output="",
-                error=f"Dispatched tool {call.name} timed out after {self._execute_timeout}s",
+                error=f"TimeoutError: Dispatched tool {call.name} timed out after {self._execute_timeout}s",
             )
         except DispatchError as e:
+            msg = str(e)
+            error = f"{type(e).__name__}: {msg}" if msg else f"{type(e).__name__}: tool raised without message"
+            logger.warning("tool.execute dispatch error name=%s err=%s", call.name, error)
             return ToolResult(
                 call_id=call.id,
                 output="",
-                error=f"Dispatch failed for {call.name}: {e}",
+                error=error,
             )
         except Exception as e:
-            return ToolResult(call_id=call.id, output="", error=str(e))
+            msg = str(e)
+            error = f"{type(e).__name__}: {msg}" if msg else f"{type(e).__name__}: tool raised without message"
+            logger.warning("tool.execute dispatch error name=%s err=%s", call.name, error, exc_info=True)
+            return ToolResult(call_id=call.id, output="", error=error)
 
         # Workers can return any JSON-serializable shape; coerce to string
         # so the agent loop's Message(role=TOOL) content is always a string.

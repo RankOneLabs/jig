@@ -90,17 +90,25 @@ class AnthropicClient(LLMClient):
         ]
 
     async def complete(self, params: CompletionParams) -> LLMResponse:
-        messages = self._convert_messages(params)
-        kwargs: dict[str, Any] = {
-            "model": self._model,
-            "messages": messages,
-            "max_tokens": params.max_tokens or 4096,
-        }
-        if params.system:
-            kwargs["system"] = params.system
-        if params.tools:
-            kwargs["tools"] = self._convert_tools(params.tools)
-        merge_completion_kwargs(kwargs, params)
+        try:
+            messages = self._convert_messages(params)
+            kwargs: dict[str, Any] = {
+                "model": self._model,
+                "messages": messages,
+                "max_tokens": params.max_tokens or 4096,
+            }
+            if params.system:
+                kwargs["system"] = params.system
+            if params.tools:
+                kwargs["tools"] = self._convert_tools(params.tools)
+            merge_completion_kwargs(kwargs, params)
+        except JigLLMError:
+            raise
+        except Exception as e:
+            raise JigLLMError(
+                f"Request preparation failed: {type(e).__name__}: {e}",
+                "anthropic",
+            ) from e
 
         timer = start_timer()
 
@@ -119,28 +127,36 @@ class AnthropicClient(LLMClient):
 
         latency_ms = timer()
 
-        text_parts: list[str] = []
-        tool_calls: list[ToolCall] = []
-        for block in response.content:
-            if block.type == "text":
-                text_parts.append(block.text)
-            elif block.type == "tool_use":
-                tool_calls.append(
-                    ToolCall(id=block.id, name=block.name, arguments=block.input)
-                )
+        try:
+            text_parts: list[str] = []
+            tool_calls: list[ToolCall] = []
+            for block in response.content:
+                if block.type == "text":
+                    text_parts.append(block.text)
+                elif block.type == "tool_use":
+                    tool_calls.append(
+                        ToolCall(id=block.id, name=block.name, arguments=block.input)
+                    )
 
-        usage = Usage(
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-        )
-        stamp_cost(usage, response.model)
-        return LLMResponse(
-            content="\n".join(text_parts),
-            tool_calls=tool_calls or None,
-            usage=usage,
-            latency_ms=latency_ms,
-            model=response.model,
-        )
+            usage = Usage(
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+            )
+            stamp_cost(usage, response.model)
+            return LLMResponse(
+                content="\n".join(text_parts),
+                tool_calls=tool_calls or None,
+                usage=usage,
+                latency_ms=latency_ms,
+                model=response.model,
+            )
+        except JigLLMError:
+            raise
+        except Exception as e:
+            raise JigLLMError(
+                f"Response parsing failed: {type(e).__name__}: {e}",
+                "anthropic",
+            ) from e
 
     async def stream(self, params: CompletionParams) -> AsyncIterator[str]:
         messages = self._convert_messages(params)

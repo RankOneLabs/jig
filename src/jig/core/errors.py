@@ -40,6 +40,12 @@ class JigLLMError(JigError):
         super().__init__(message)
         self.provider = provider
         self.status_code = status_code
+        # Diagnostic metadata set by the adapter — indicates whether the
+        # provider considers the error transient. The runner does NOT use
+        # this flag to decide retry behavior; it routes via status_code
+        # (permanent on 400/401/403/404/422) and consecutive-error counts.
+        # Callers inspecting retryable are reading provider intent, not a
+        # runner retry contract.
         self.retryable = retryable
 
 
@@ -57,6 +63,9 @@ class JigMemoryError(JigError):
         super().__init__(message)
         self.source = source        # e.g. "local_memory", "honcho", "zep"
         self.operation = operation  # e.g. "query", "add", "get_session"
+        # Provider-local diagnostic hint — not a runner retry contract.
+        # The runner's fail-soft bookkeeping catches all exceptions after a
+        # valid output; callers must not rely on this flag to drive retries.
         self.retryable = retryable
 
 
@@ -200,21 +209,18 @@ class AgentAmbiguousTurnError(AgentError):
 
 
 class AgentLLMPermanentError(AgentError):
-    """Runner terminated because the LLM raised a non-retryable error.
+    """Runner terminated because the LLM raised a known-permanent error.
 
-    Adapters set ``JigLLMError.retryable = False`` for permanent failures
-    (auth, invalid model, bad request). Retrying those burns call budget
-    and would surface as ``AgentMaxLLMRetriesError`` even though only one
-    attempt was needed to diagnose. Surface the provider error directly
-    so rollups can distinguish "Haiku auth broken" from "Haiku rate-limit
-    exhausted."
+    The runner treats specific HTTP status codes as permanent (auth, invalid
+    model, bad request). It does not use ``JigLLMError.retryable`` as an
+    authoritative retry contract.
     """
 
     category = "llm_permanent_error"
 
     def __init__(self, provider: str, message: str, status_code: int | None = None):
         super().__init__(
-            f"Non-retryable LLM error from {provider}: {message}",
+            f"Permanent LLM error from {provider}: {message}",
             provider=provider,
             status_code=status_code,
         )
