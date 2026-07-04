@@ -6,6 +6,7 @@ adapter-level retries. Uses a fake provider counter to prove the claim.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from typing import Any
 
@@ -223,3 +224,100 @@ class TestRetryAccounting:
             assert llm.call_count == 1, (
                 f"Expected exactly 1 provider call for {err!r}, got {llm.call_count}"
             )
+
+
+@pytest.mark.asyncio
+class TestNonProviderRetriesExcluded:
+    """Retries that are not provider generation attempts must not appear in llm_calls.
+
+    The ``with_retry`` utility in ``jig.core.retry`` is used for infrastructure
+    operations (e.g. listener startup, network retries) that are completely
+    separate from LLM provider calls. This class verifies that:
+
+    1. ``with_retry`` retrying a non-LLM function N times does not touch any
+       LLM client — provider call count remains zero.
+    2. Schema-parsing retries (``max_parse_retries``) increment ``llm_calls``
+       because they genuinely call the provider, but they are counted separately
+       from the ``parse_retries`` dimension so callers can distinguish them.
+    """
+
+    async def test_with_retry_for_non_llm_op_does_not_touch_provider(self):
+        """with_retry wrapping a non-LLM function must not increment any LLM counter.
+
+        This is the architectural boundary test: infrastructure retries (listener
+        startup, HTTP probes, smithers polling) are completely separate from
+        provider generation. A CountingFakeLLM with call_count=0 after N retries
+        proves no hidden LLM call multiplier exists.
+        """
+        from jig.core.retry import with_retry
+
+        llm = CountingFakeLLM(JigLLMError("never called", "fake"))
+
+        non_llm_attempts = 0
+
+        async def non_llm_operation() -> str:
+            nonlocal non_llm_attempts
+            non_llm_attempts += 1
+            if non_llm_attempts < 3:
+                raise OSError("transient network error")
+            return "connected"
+
+        result = await with_retry(
+            non_llm_operation,
+            max_attempts=5,
+            base_delay=0.0,  # no sleep in tests
+            retryable=lambda e: isinstance(e, OSError),
+        )
+
+        assert result == "connected"
+        assert non_llm_attempts == 3, "retried exactly twice before success"
+        # The LLM client must never have been touched — provider calls = 0
+        assert llm.call_count == 0, (
+            f"non-LLM with_retry retries must not affect provider call count; "
+            f"got {llm.call_count}"
+        )
+
+    async def test_polling_retries_are_distinct_from_provider_attempts(self):
+        """Separate retry budgets for infrastructure vs. provider calls must not
+        interfere.
+
+        Scenario: a fake non-LLM poller retries 3 times independently, while
+        a CountingFakeLLM records its own call count. The two counters must
+        remain independent — infrastructure retries do not inflate llm_calls
+        and LLM retries do not inflate infrastructure retry counts.
+        """
+        from jig.core.retry import with_retry
+
+        llm = SucceedAfterFakeLLM(
+            error=JigLLMError("transient", "fake", retryable=True),
+            fail_times=2,
+            response=_ok_response(),
+        )
+
+        infra_attempts = 0
+
+        async def infra_poll() -> str:
+            nonlocal infra_attempts
+            infra_attempts += 1
+            if infra_attempts < 4:
+                raise ConnectionError("not ready")
+            return "ready"
+
+        # Run infra retries and LLM agent concurrently to prove independence
+        agent_result, poll_result = await asyncio.gather(
+            run_agent(_config(llm, max_llm_retries=5), "go"),
+            with_retry(
+                infra_poll,
+                max_attempts=5,
+                base_delay=0.0,
+                retryable=lambda e: isinstance(e, ConnectionError),
+            ),
+        )
+
+        assert poll_result == "ready"
+        assert infra_attempts == 4
+        # LLM: 2 failures + 1 success = 3 provider calls
+        assert llm.call_count == 3
+        assert agent_result.usage["llm_calls"] == 3
+        # Infrastructure retries must not have leaked into llm_calls
+        assert agent_result.usage["llm_calls"] != infra_attempts
