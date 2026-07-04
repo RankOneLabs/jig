@@ -141,6 +141,7 @@ class BudgetTracker:
 
     def reset(self) -> None:
         self.spent_usd = 0.0
+        self._active_reserved_usd = 0.0
 
     # ------------------------------------------------------------------
     # Reservation API (concurrent-safe)

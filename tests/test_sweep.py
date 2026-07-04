@@ -419,6 +419,7 @@ class TestSweepWorkerErrorIsolation:
         errors = [r for r in result.runs if r.result.error is not None]
         assert len(successes) == 2
         assert len(errors) == 1
+        assert str(errors[0].result.error) == "RuntimeError: transient infra failure"
         assert errors[0].result.usage == {
             "total_input_tokens": 0,
             "total_output_tokens": 0,
@@ -426,6 +427,31 @@ class TestSweepWorkerErrorIsolation:
             "llm_calls": 0,
             "tool_calls": 0,
         }
+
+    async def test_infrastructure_error_with_empty_message_keeps_type(self):
+        class _EmptyError(Exception):
+            pass
+
+        class _BrokenLLM(LLMClient):
+            async def complete(self, params):
+                raise _EmptyError()
+
+        cfg = AgentConfig(
+            name="empty-error",
+            description="empty infra error",
+            system_prompt="x",
+            llm=_BrokenLLM(),
+            store=_FakeMem(), retriever=None,
+            feedback=_FakeFB(),
+            tracer=_FakeTracer(),
+            tools=ToolRegistry(),
+        )
+
+        result = await sweep(["c1"], [cfg], concurrency=1)
+
+        assert len(result.runs) == 1
+        assert result.runs[0].result.error is not None
+        assert str(result.runs[0].result.error) == "_EmptyError"
 
     async def test_successes_preserved_alongside_failures(self):
         """Successful results are not discarded when some cases fail."""

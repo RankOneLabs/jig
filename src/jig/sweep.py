@@ -255,7 +255,9 @@ def _budget_error_result(exc: JigBudgetError) -> AgentResult[Any]:
 
 
 def _infra_error_result(exc: Exception) -> AgentResult[Any]:
-    return _error_result(AgentError(str(exc)))
+    detail = str(exc)
+    message = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+    return _error_result(AgentError(message))
 
 
 async def compare[T](

@@ -47,6 +47,19 @@ class TestBudgetTracker:
         budget.reset()
         assert budget.spent_usd == 0.0
 
+    @pytest.mark.asyncio
+    async def test_reset_clears_active_reservations(self):
+        budget = BudgetTracker(limit_usd=1.0)
+        await budget.reserve(0.75)
+        budget.record(Usage(input_tokens=100, output_tokens=50, cost=0.2))
+
+        budget.reset()
+
+        assert budget.spent_usd == 0.0
+        assert budget._active_reserved_usd == 0.0
+        reservation = await budget.reserve(1.0)
+        await reservation.release()
+
     def test_invalid_limit_raises(self):
         with pytest.raises(ValueError):
             BudgetTracker(limit_usd=0)
