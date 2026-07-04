@@ -85,12 +85,23 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         validate_scores(scores)
         db = await self._get_db()
         now = datetime.now().isoformat()
-        for s in scores:
-            await db.execute(
-                "INSERT INTO scores (result_id, dimension, value, source, created_at) VALUES (?, ?, ?, ?, ?)",
-                (result_id, s.dimension, s.value, s.source.value, now),
-            )
-        await db.commit()
+        # Explicit BEGIN pins the transaction boundary before the first insert
+        # so no other coroutine sharing this connection can commit between our
+        # awaited inserts and inadvertently persist a partial batch. Without an
+        # explicit BEGIN, SQLite's implicit-transaction start is deferred to the
+        # first INSERT, leaving a window where a concurrent commit on the same
+        # connection could finalise rows we have not yet rolled back.
+        try:
+            await db.execute("BEGIN")
+            for s in scores:
+                await db.execute(
+                    "INSERT INTO scores (result_id, dimension, value, source, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (result_id, s.dimension, s.value, s.source.value, now),
+                )
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
 
     async def get_signals(
         self,
