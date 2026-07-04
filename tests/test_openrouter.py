@@ -6,7 +6,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from jig.core.types import CompletionParams, Message, Role
+from jig.core.errors import JigLLMError
+from jig.core.types import CompletionParams, Message, Role, ToolCall
 from jig.llm.openrouter import OpenRouterClient, _OPENROUTER_BASE_URL
 
 
@@ -329,3 +330,58 @@ class TestOpenRouterComplete:
             result = await client.complete(params)
             assert result.usage.input_tokens == 0
             assert result.usage.output_tokens == 0
+
+    async def test_request_preparation_error_is_wrapped(self, monkeypatch):
+        # json.dumps on assistant tool-call arguments can fail before the SDK
+        # call. That is still an adapter boundary and must be classified.
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-x")
+        with patch("jig.llm.openai.openai") as mock_openai:
+            instance = mock_openai.AsyncOpenAI.return_value
+            instance.chat.completions.create = AsyncMock()
+
+            client = OpenRouterClient(model="some/model")
+            params = CompletionParams(
+                messages=[
+                    Message(
+                        role=Role.ASSISTANT,
+                        content="",
+                        tool_calls=[
+                            ToolCall(
+                                id="tc",
+                                name="bad_args",
+                                arguments={"not_json": object()},
+                            )
+                        ],
+                    )
+                ]
+            )
+
+            with pytest.raises(JigLLMError) as exc:
+                await client.complete(params)
+
+            assert exc.value.provider == "openrouter"
+            assert "Request preparation failed" in str(exc.value)
+            instance.chat.completions.create.assert_not_called()
+
+    async def test_cost_stamping_error_is_wrapped(self, monkeypatch):
+        # Cost stamping is post-SDK adapter bookkeeping. It should not escape as
+        # a raw RuntimeError if pricing code regresses or receives bad data.
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-x")
+        with patch("jig.llm.openai.openai") as mock_openai:
+            instance = mock_openai.AsyncOpenAI.return_value
+            instance.chat.completions.create = AsyncMock(
+                return_value=_fake_response(cost=None)
+            )
+            mock_openai.RateLimitError = type("RateLimitError", (Exception,), {})
+
+            client = OpenRouterClient(model="some/model")
+            params = CompletionParams(
+                messages=[Message(role=Role.USER, content="hi")]
+            )
+            with patch("jig.llm.openai.stamp_cost", side_effect=RuntimeError("pricing exploded")):
+                with pytest.raises(JigLLMError) as exc:
+                    await client.complete(params)
+
+            assert exc.value.provider == "openrouter"
+            assert "Response parsing failed" in str(exc.value)
+            assert "pricing exploded" in str(exc.value)

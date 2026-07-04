@@ -1,9 +1,50 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
+import logging
 from typing import Any
 
-from jig.core.types import SpanKind, TracingLogger
+from jig.core.types import Span, SpanKind, TracingLogger, Usage
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SpanGuard:
+    """Handle yielded by :func:`span_guard`.
+
+    ``finish`` is the normal way to close the span with output/usage before
+    leaving the guarded block. If a caller does not finish explicitly, the
+    context manager closes the span on a successful exit with no output, or
+    with exception metadata on a failed exit.
+    """
+
+    tracer: TracingLogger
+    span: Span
+    _finished: bool = False
+
+    @property
+    def id(self) -> str:
+        return self.span.id
+
+    @property
+    def trace_id(self) -> str:
+        return self.span.trace_id
+
+    def finish(
+        self,
+        output: Any = None,
+        *,
+        error: str | None = None,
+        usage: Usage | None = None,
+    ) -> None:
+        self.tracer.end_span(self.span.id, output=output, error=error, usage=usage)
+        self._finished = True
+
+    @property
+    def finished(self) -> bool:
+        return self._finished or self.span.ended_at is not None
 
 
 @contextmanager
@@ -16,16 +57,24 @@ def span_guard(
     input: Any = None,
     metadata: dict[str, Any] | None = None,
 ):
-    """Start a span and close it with error details if an exception propagates.
+    """Start a span and close it on success or propagated exception.
 
-    On success the caller is responsible for calling tracer.end_span with the
-    output value.  On exception the guard calls end_span with an error string
-    of the form "{ExcType}: {exc}" and re-raises so no child span is left open
-    on pre-output failures.
+    Callers may use ``guard.finish(output=..., usage=...)`` to attach output
+    metadata before exiting the block. If they do not, the guard still closes
+    the span on the success path so opened spans cannot be left dangling by a
+    missing explicit ``end_span`` call.
     """
     span = tracer.start_span(parent_id, kind, name, input=input, metadata=metadata)
+    guard = SpanGuard(tracer=tracer, span=span)
     try:
-        yield span
+        yield guard
     except BaseException as exc:
-        tracer.end_span(span.id, error=f"{type(exc).__name__}: {exc}")
+        if not guard.finished:
+            try:
+                guard.finish(error=f"{type(exc).__name__}: {exc}")
+            except Exception:
+                logger.exception("tracer.end_span failed while closing failed span")
         raise
+    else:
+        if not guard.finished:
+            guard.finish()

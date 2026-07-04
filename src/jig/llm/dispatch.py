@@ -222,7 +222,15 @@ class DispatchClient(LLMClient):
         return payload
 
     async def complete(self, params: CompletionParams) -> LLMResponse:
-        payload = self._build_payload(params)
+        try:
+            payload = self._build_payload(params)
+        except JigLLMError:
+            raise
+        except Exception as e:
+            raise JigLLMError(
+                f"Request preparation failed: {type(e).__name__}: {e}",
+                "dispatch",
+            ) from e
         timer = start_timer()
         try:
             data = await _submit_and_poll(
@@ -253,22 +261,40 @@ class DispatchClient(LLMClient):
             ) from e
 
         latency_ms = timer()
-        result = data.get("result") or {}
-        _content = result.get("content")
-        content = "" if _content is None else _content
-        model = data.get("model") or self._model or "dispatch"
-        raw_usage = result.get("usage")
-        usage_data = raw_usage if isinstance(raw_usage, dict) else {}
-        tool_calls = _parse_tool_calls(result.get("tool_calls"))
+        try:
+            if not isinstance(data, dict):
+                raise TypeError(f"dispatch response must be a dict, got {type(data).__name__}")
+            result = data.get("result") or {}
+            if not isinstance(result, dict):
+                raise TypeError(
+                    f"dispatch result must be a dict, got {type(result).__name__}"
+                )
+            _content = result.get("content")
+            content = "" if _content is None else _content
+            if not isinstance(content, str):
+                raise TypeError(
+                    f"dispatch content must be a string or null, got {type(content).__name__}"
+                )
+            model = data.get("model") or self._model or "dispatch"
+            raw_usage = result.get("usage")
+            usage_data = raw_usage if isinstance(raw_usage, dict) else {}
+            tool_calls = _parse_tool_calls(result.get("tool_calls"))
 
-        return LLMResponse(
-            content=content,
-            tool_calls=tool_calls,
-            usage=Usage(
-                input_tokens=_safe_int(usage_data.get("input_tokens")),
-                output_tokens=_safe_int(usage_data.get("output_tokens")),
-                cost=_safe_cost(usage_data.get("cost")),
-            ),
-            latency_ms=latency_ms,
-            model=model,
-        )
+            return LLMResponse(
+                content=content,
+                tool_calls=tool_calls,
+                usage=Usage(
+                    input_tokens=_safe_int(usage_data.get("input_tokens")),
+                    output_tokens=_safe_int(usage_data.get("output_tokens")),
+                    cost=_safe_cost(usage_data.get("cost")),
+                ),
+                latency_ms=latency_ms,
+                model=model,
+            )
+        except JigLLMError:
+            raise
+        except Exception as e:
+            raise JigLLMError(
+                f"Response parsing failed: {type(e).__name__}: {e}",
+                "dispatch",
+            ) from e

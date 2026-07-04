@@ -181,34 +181,43 @@ class GeminiClient(LLMClient):
 
         latency_ms = timer()
 
-        text_parts: list[str] = []
-        tool_calls: list[ToolCall] = []
+        try:
+            text_parts: list[str] = []
+            tool_calls: list[ToolCall] = []
 
-        if response.candidates and response.candidates[0].content:
-            parts = response.candidates[0].content.parts or []
-            for part in parts:
-                if part.text:
-                    text_parts.append(part.text)
-                elif part.function_call:
-                    tool_calls.append(ToolCall(
-                        id=f"call_{uuid.uuid4().hex[:12]}",
-                        name=part.function_call.name,
-                        arguments=dict(part.function_call.args) if part.function_call.args else {},
-                    ))
+            if response.candidates and response.candidates[0].content:
+                parts = response.candidates[0].content.parts or []
+                for part in parts:
+                    if part.text:
+                        text_parts.append(part.text)
+                    elif part.function_call:
+                        tool_calls.append(ToolCall(
+                            id=f"call_{uuid.uuid4().hex[:12]}",
+                            name=part.function_call.name,
+                            arguments=dict(part.function_call.args) if part.function_call.args else {},
+                        ))
 
-        usage_meta = response.usage_metadata
-        input_tokens = (usage_meta.prompt_token_count if usage_meta else None) or 0
-        output_tokens = (usage_meta.candidates_token_count if usage_meta else None) or 0
+            usage_meta = response.usage_metadata
+            input_tokens = (usage_meta.prompt_token_count if usage_meta else None) or 0
+            output_tokens = (usage_meta.candidates_token_count if usage_meta else None) or 0
 
-        usage = Usage(input_tokens=input_tokens, output_tokens=output_tokens)
-        stamp_cost(usage, self._model)
-        return LLMResponse(
-            content="\n".join(text_parts),
-            tool_calls=tool_calls or None,
-            usage=usage,
-            latency_ms=latency_ms,
-            model=self._model,
-        )
+            usage = Usage(input_tokens=input_tokens, output_tokens=output_tokens)
+            stamp_cost(usage, self._model)
+            return LLMResponse(
+                content="\n".join(text_parts),
+                tool_calls=tool_calls or None,
+                usage=usage,
+                latency_ms=latency_ms,
+                model=self._model,
+            )
+        except JigLLMError:
+            raise
+        except Exception as e:
+            msg = str(e)
+            detail = msg if msg else "no detail"
+            raise JigLLMError(
+                f"Response parsing failed: {type(e).__name__}: {detail}", "google",
+            ) from e
 
 
 def _find_tool_name(messages: list[Message], tool_call_id: str | None) -> str:

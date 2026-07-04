@@ -103,15 +103,23 @@ class OpenAIClient(LLMClient):
         return openai_tool_payload(tools)
 
     async def complete(self, params: CompletionParams) -> LLMResponse:
-        messages = self._convert_messages(params)
-        kwargs: dict[str, Any] = {
-            "model": self._model,
-            "messages": messages,
-        }
-        if params.tools:
-            kwargs["tools"] = self._convert_tools(params.tools)
-        merge_completion_kwargs(kwargs, params)
-        self._apply_extra_kwargs(kwargs)
+        try:
+            messages = self._convert_messages(params)
+            kwargs: dict[str, Any] = {
+                "model": self._model,
+                "messages": messages,
+            }
+            if params.tools:
+                kwargs["tools"] = self._convert_tools(params.tools)
+            merge_completion_kwargs(kwargs, params)
+            self._apply_extra_kwargs(kwargs)
+        except JigLLMError:
+            raise
+        except Exception as e:
+            raise JigLLMError(
+                f"Request preparation failed: {type(e).__name__}: {e}",
+                self._provider_label,
+            ) from e
 
         timer = start_timer()
         logger.debug(
@@ -139,76 +147,84 @@ class OpenAIClient(LLMClient):
             raise err from e
 
         latency_ms = timer()
-        logger.debug(
-            "%s.complete response model=%s latency_ms=%.0f choices=%d",
-            self._provider_label, self._model, latency_ms,
-            len(response.choices or ()),
-        )
-
-        if not response.choices:
-            # Gateways (notably OpenRouter) sometimes return 200 OK with a
-            # null/empty ``choices`` array when the upstream provider
-            # errored after the request was accepted. Surface the response's
-            # ``error`` payload if present and mark retryable — these are
-            # typically transient and the agent loop should try again rather
-            # than crash with TypeError on ``choices[0]``.
-            #
-            # The OpenAI SDK's pydantic model for ChatCompletion doesn't
-            # declare an ``error`` field, so OpenRouter's payload lands in
-            # ``response.model_extra`` rather than as a real attribute —
-            # mirror the ``usage.cost`` handling in OpenRouterClient and
-            # check both locations.
-            err = getattr(response, "error", None)
-            if err is None:
-                extra = getattr(response, "model_extra", None) or {}
-                err = extra.get("error")
-            detail = ""
-            if err is not None:
-                err_msg = None
-                if isinstance(err, dict):
-                    err_msg = err.get("message")
-                else:
-                    err_msg = getattr(err, "message", None)
-                if err_msg:
-                    detail = f": {err_msg}"
-            raise JigLLMError(
-                f"upstream returned no choices{detail}",
-                self._provider_label,
-                retryable=True,
+        try:
+            logger.debug(
+                "%s.complete response model=%s latency_ms=%.0f choices=%d",
+                self._provider_label, self._model, latency_ms,
+                len(response.choices or ()),
             )
 
-        choice = response.choices[0].message
-
-        tool_calls: list[ToolCall] | None = None
-        if choice.tool_calls:
-            tool_calls = [
-                ToolCall(
-                    id=tc.id,
-                    name=tc.function.name,
-                    arguments=parse_tool_arguments(tc.function.arguments, self._provider_label),
+            if not response.choices:
+                # Gateways (notably OpenRouter) sometimes return 200 OK with a
+                # null/empty ``choices`` array when the upstream provider
+                # errored after the request was accepted. Surface the response's
+                # ``error`` payload if present and mark retryable — these are
+                # typically transient and the agent loop should try again rather
+                # than crash with TypeError on ``choices[0]``.
+                #
+                # The OpenAI SDK's pydantic model for ChatCompletion doesn't
+                # declare an ``error`` field, so OpenRouter's payload lands in
+                # ``response.model_extra`` rather than as a real attribute —
+                # mirror the ``usage.cost`` handling in OpenRouterClient and
+                # check both locations.
+                err = getattr(response, "error", None)
+                if err is None:
+                    extra = getattr(response, "model_extra", None) or {}
+                    err = extra.get("error")
+                detail = ""
+                if err is not None:
+                    err_msg = None
+                    if isinstance(err, dict):
+                        err_msg = err.get("message")
+                    else:
+                        err_msg = getattr(err, "message", None)
+                    if err_msg:
+                        detail = f": {err_msg}"
+                raise JigLLMError(
+                    f"upstream returned no choices{detail}",
+                    self._provider_label,
+                    retryable=True,
                 )
-                for tc in choice.tool_calls
-            ]
 
-        raw_usage = getattr(response, "usage", None)
-        if raw_usage is not None:
-            usage = Usage(
-                input_tokens=getattr(raw_usage, "prompt_tokens", None) or 0,
-                output_tokens=getattr(raw_usage, "completion_tokens", None) or 0,
+            choice = response.choices[0].message
+
+            tool_calls: list[ToolCall] | None = None
+            if choice.tool_calls:
+                tool_calls = [
+                    ToolCall(
+                        id=tc.id,
+                        name=tc.function.name,
+                        arguments=parse_tool_arguments(tc.function.arguments, self._provider_label),
+                    )
+                    for tc in choice.tool_calls
+                ]
+
+            raw_usage = getattr(response, "usage", None)
+            if raw_usage is not None:
+                usage = Usage(
+                    input_tokens=getattr(raw_usage, "prompt_tokens", None) or 0,
+                    output_tokens=getattr(raw_usage, "completion_tokens", None) or 0,
+                )
+            else:
+                usage = Usage(input_tokens=0, output_tokens=0)
+            inline_cost = self._inline_cost(response)
+            if inline_cost is not None:
+                usage.cost = inline_cost
+            stamp_cost(usage, response.model)
+            return LLMResponse(
+                content=choice.content or "",
+                tool_calls=tool_calls,
+                usage=usage,
+                latency_ms=latency_ms,
+                model=response.model,
             )
-        else:
-            usage = Usage(input_tokens=0, output_tokens=0)
-        inline_cost = self._inline_cost(response)
-        if inline_cost is not None:
-            usage.cost = inline_cost
-        stamp_cost(usage, response.model)
-        return LLMResponse(
-            content=choice.content or "",
-            tool_calls=tool_calls,
-            usage=usage,
-            latency_ms=latency_ms,
-            model=response.model,
-        )
+        except JigLLMError:
+            raise
+        except Exception as e:
+            raise JigLLMError(
+                f"Response parsing failed: {type(e).__name__}: {e}",
+                self._provider_label,
+            ) from e
 
     async def stream(self, params: CompletionParams) -> AsyncIterator[str]:
         messages = self._convert_messages(params)
