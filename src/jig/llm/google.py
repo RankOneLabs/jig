@@ -30,7 +30,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 GEMINI_ATTEMPT_ACCOUNTING_NOTE = (
-    "Runner llm_calls count GeminiClient.complete() invocations. The "
+    "Runner llm_calls counts GeminiClient.complete() invocations. The "
     "google-genai SDK does not expose a public retry-disable or real HTTP "
     "attempt-count hook, so SDK-internal retries are not included."
 )
