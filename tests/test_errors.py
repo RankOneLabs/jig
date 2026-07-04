@@ -599,6 +599,69 @@ class TestTerminatedRunSkipsBookkeeping:
         assert isinstance(result.error, AgentMaxLLMRetriesError)
         assert grade_calls == [], "grader.grade must not be called for terminated runs"
 
+    async def test_terminated_run_skips_session_append(self):
+        """Session history is not updated when the run terminates.
+
+        Sentinel text like '[agent terminated: ...]' must not appear in the
+        session assistant content so subsequent retrievals don't see garbage.
+        """
+        session_writes: list[tuple[str, str]] = []  # (session_id, role)
+
+        class TrackingMemory(FakeMemory):
+            async def add_to_session(self, session_id, message):
+                session_writes.append((session_id, message.role.value))
+
+        err = JigLLMError("down", "fake", retryable=True)
+        llm = FakeLLM([err, err])
+        result = await run_agent(
+            _config(
+                llm,
+                max_llm_retries=2,
+                store=TrackingMemory(),
+                session_id="test-session",
+            ),
+            "go",
+        )
+        assert isinstance(result.error, AgentMaxLLMRetriesError)
+        assert session_writes == [], (
+            "add_to_session must not be called for terminated runs; "
+            f"got {session_writes}"
+        )
+
+    async def test_terminated_run_skips_feedback_scoring(self):
+        """Feedback store_result/score are not called when the run terminates."""
+        store_calls: list[str] = []
+        score_calls: list[str] = []
+
+        class TrackingFeedback(FakeFeedback):
+            async def store_result(self, content, input_text, metadata=None):
+                store_calls.append(content)
+                return "r"
+
+            async def score(self, result_id, scores):
+                score_calls.append(result_id)
+
+        from jig.core.types import Grader, Score, ScoreSource
+
+        class FixedGrader(Grader):
+            async def grade(self, input, output, context=None):
+                return [Score(dimension="q", value=1.0, source=ScoreSource.HEURISTIC)]
+
+        err = JigLLMError("down", "fake", retryable=True)
+        llm = FakeLLM([err, err])
+        result = await run_agent(
+            _config(
+                llm,
+                max_llm_retries=2,
+                feedback=TrackingFeedback(),
+                grader=FixedGrader(),
+            ),
+            "go",
+        )
+        assert isinstance(result.error, AgentMaxLLMRetriesError)
+        assert store_calls == [], "feedback.store_result must not be called for terminated runs"
+        assert score_calls == [], "feedback.score must not be called for terminated runs"
+
 
 @pytest.mark.asyncio
 class TestPreOutputSpanLifecycle:
@@ -637,7 +700,12 @@ class TestPreOutputSpanLifecycle:
 
 @pytest.mark.asyncio
 class TestPostOutputFailSoft:
-    """Grading failures after a valid output must not erase the result."""
+    """Post-output bookkeeping failures must not erase a valid output.
+
+    Each secondary operation (memory store, session append, feedback store/score,
+    grader) is wrapped in its own try/except after the valid output is produced.
+    Failures are logged and the output is returned unchanged.
+    """
 
     async def test_grading_failure_does_not_erase_output(self):
         """If grader.grade raises, run_agent still returns the valid output."""
@@ -658,3 +726,251 @@ class TestPostOutputFailSoft:
         assert result.output == "the answer"
         assert result.error is None
         assert result.scores is None  # grading didn't complete
+
+    async def test_session_append_failure_does_not_erase_output(self):
+        """store.add_to_session failure after valid output is fail-soft."""
+
+        class FlakyMemory(FakeMemory):
+            async def add_to_session(self, session_id, message):
+                raise RuntimeError("session DB locked")
+
+        llm = FakeLLM([
+            LLMResponse(content="hello", tool_calls=None, usage=Usage(1, 1), latency_ms=1, model="fake"),
+        ])
+        result = await run_agent(
+            _config(llm, store=FlakyMemory(), session_id="s1"),
+            "hi",
+        )
+
+        assert result.output == "hello"
+        assert result.error is None
+
+    async def test_feedback_store_failure_does_not_erase_output(self):
+        """feedback.store_result failure during grading is fail-soft."""
+        from jig.core.types import Grader, Score, ScoreSource
+
+        class FixedGrader(Grader):
+            async def grade(self, input, output, context=None):
+                return [Score(dimension="q", value=1.0, source=ScoreSource.HEURISTIC)]
+
+        class BrokenFeedback(FakeFeedback):
+            async def store_result(self, content, input_text, metadata=None):
+                raise RuntimeError("feedback DB write failed")
+
+        llm = FakeLLM([
+            LLMResponse(content="result", tool_calls=None, usage=Usage(1, 1), latency_ms=1, model="fake"),
+        ])
+        result = await run_agent(
+            _config(llm, feedback=BrokenFeedback(), grader=FixedGrader()),
+            "hi",
+        )
+
+        assert result.output == "result"
+        assert result.error is None
+
+
+# ---------------------------------------------------------------------------
+# Adapter error boundary tests
+# ---------------------------------------------------------------------------
+
+
+class TestGeminiAdapterErrorBoundaries:
+    """GeminiClient error classification and nullable field handling.
+
+    These tests mock the google-genai SDK so they run without the optional
+    dependency installed. Each test targets a provider-specific edge case
+    called out by the lifecycle-hardening spec.
+    """
+
+    @pytest.mark.asyncio
+    async def test_none_usage_metadata_normalizes_to_zero(self, monkeypatch):
+        """usage_metadata=None from Gemini API yields 0 tokens, not AttributeError.
+
+        Gemini can omit usage metadata on certain request types (e.g., cached
+        content). The adapter must treat it as 0/0 so Usage.input_tokens and
+        output_tokens are always integers.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        # Stub out genai at the module level so GeminiClient skips the ImportError guard
+        genai_stub = MagicMock()
+        genai_types_stub = MagicMock()
+
+        # GenerateContentConfig must be constructable
+        genai_types_stub.GenerateContentConfig.return_value = MagicMock()
+        genai_types_stub.Content = MagicMock
+        genai_types_stub.Part = MagicMock
+
+        candidate = MagicMock()
+        candidate.content.parts = []  # no tool calls, no text
+        response = MagicMock()
+        response.candidates = [candidate]
+        response.usage_metadata = None  # the edge case
+
+        genai_stub.Client.return_value.aio.models.generate_content = AsyncMock(return_value=response)
+
+        with patch.dict("sys.modules", {
+            "google": MagicMock(),
+            "google.genai": genai_stub,
+            "google.genai.types": genai_types_stub,
+        }):
+            with patch("jig.llm.google.genai", genai_stub), \
+                 patch("jig.llm.google.genai_types", genai_types_stub):
+                from jig.llm.google import GeminiClient
+                client = GeminiClient.__new__(GeminiClient)
+                client._client = genai_stub.Client()
+                client._model = "gemini-test"
+
+                params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
+                result = await client.complete(params)
+
+        assert result.usage.input_tokens == 0
+        assert result.usage.output_tokens == 0
+
+    @pytest.mark.asyncio
+    async def test_none_token_counts_normalize_to_zero(self, monkeypatch):
+        """Individual token count fields that are None become 0.
+
+        prompt_token_count and candidates_token_count can both be None on
+        empty/cached responses. The adapter normalizes via `or 0`.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        genai_stub = MagicMock()
+        genai_types_stub = MagicMock()
+        genai_types_stub.GenerateContentConfig.return_value = MagicMock()
+        genai_types_stub.Content = MagicMock
+        genai_types_stub.Part = MagicMock
+
+        candidate = MagicMock()
+        candidate.content.parts = []
+        response = MagicMock()
+        response.candidates = [candidate]
+        # usage_metadata present but individual counts are None
+        response.usage_metadata = MagicMock()
+        response.usage_metadata.prompt_token_count = None
+        response.usage_metadata.candidates_token_count = None
+
+        genai_stub.Client.return_value.aio.models.generate_content = AsyncMock(return_value=response)
+
+        with patch("jig.llm.google.genai", genai_stub), \
+             patch("jig.llm.google.genai_types", genai_types_stub):
+            from jig.llm.google import GeminiClient
+            client = GeminiClient.__new__(GeminiClient)
+            client._client = genai_stub.Client()
+            client._model = "gemini-test"
+
+            params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
+            result = await client.complete(params)
+
+        assert result.usage.input_tokens == 0
+        assert result.usage.output_tokens == 0
+
+    @pytest.mark.asyncio
+    async def test_request_preparation_failure_raises_jig_llm_error(self):
+        """A failure in _convert_messages wraps in JigLLMError, not a raw exception.
+
+        Schema conversion or FunctionResponse validation can raise. The outer
+        try/except in GeminiClient.complete() must catch these and re-raise as
+        JigLLMError so the runner can classify the error correctly.
+        """
+        from unittest.mock import MagicMock, patch
+
+        genai_stub = MagicMock()
+        genai_types_stub = MagicMock()
+        # Make GenerateContentConfig raise to trigger the request-prep error boundary
+        genai_types_stub.GenerateContentConfig.side_effect = ValueError("nested schema unsupported")
+        genai_types_stub.Content = MagicMock
+        genai_types_stub.Part = MagicMock
+
+        with patch("jig.llm.google.genai", genai_stub), \
+             patch("jig.llm.google.genai_types", genai_types_stub):
+            from jig.llm.google import GeminiClient
+            client = GeminiClient.__new__(GeminiClient)
+            client._client = genai_stub.Client()
+            client._model = "gemini-test"
+
+            params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
+            with pytest.raises(JigLLMError) as exc_info:
+                await client.complete(params)
+
+        err = exc_info.value
+        assert err.provider == "google"
+        assert "Request preparation failed" in str(err) or "nested schema unsupported" in str(err)
+
+
+class TestOllamaAdapterErrorBoundaries:
+    """OllamaClient transport error classification.
+
+    Verifies that httpx transport errors are wrapped in JigLLMError
+    so the runner can classify and route them correctly.
+    """
+
+    @pytest.mark.asyncio
+    async def test_httpx_read_error_becomes_jig_llm_error_retryable(self):
+        """httpx.ReadError (transport-level) is classified as retryable JigLLMError.
+
+        ReadError is a subclass of TransportError — it occurs when the TCP
+        connection drops mid-response. The adapter wraps it as retryable so
+        the runner's consecutive-errors path handles transient Ollama restarts.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import httpx
+
+        ollama_stub = MagicMock()
+        ollama_stub.AsyncClient = MagicMock
+
+        with patch("jig.llm.ollama._ollama", ollama_stub), \
+             patch("jig.llm.ollama.OllamaAsyncClient", ollama_stub.AsyncClient):
+            from jig.llm.ollama import OllamaClient
+            client = OllamaClient.__new__(OllamaClient)
+            client._client = MagicMock()
+            client._model = "llama3.1"
+
+            # httpx.ReadError is a TransportError — simulates dropped connection
+            read_error = httpx.ReadError("connection reset", request=MagicMock())
+            client._client.chat = AsyncMock(side_effect=read_error)
+
+            params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
+            with pytest.raises(JigLLMError) as exc_info:
+                await client.complete(params)
+
+        err = exc_info.value
+        assert err.provider == "ollama"
+        assert err.retryable is True
+
+    @pytest.mark.asyncio
+    async def test_httpx_status_error_preserves_status_code(self):
+        """httpx.HTTPStatusError status code is preserved in JigLLMError.
+
+        When Ollama returns a non-2xx response, the status code must flow
+        through so the runner's permanent-error detection can act on 4xx.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import httpx
+
+        ollama_stub = MagicMock()
+
+        with patch("jig.llm.ollama._ollama", ollama_stub), \
+             patch("jig.llm.ollama.OllamaAsyncClient", ollama_stub.AsyncClient):
+            from jig.llm.ollama import OllamaClient
+            client = OllamaClient.__new__(OllamaClient)
+            client._client = MagicMock()
+            client._model = "llama3.1"
+
+            mock_response = MagicMock()
+            mock_response.status_code = 503
+            http_err = httpx.HTTPStatusError(
+                "503 service unavailable",
+                request=MagicMock(),
+                response=mock_response,
+            )
+            client._client.chat = AsyncMock(side_effect=http_err)
+
+            params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
+            with pytest.raises(JigLLMError) as exc_info:
+                await client.complete(params)
+
+        err = exc_info.value
+        assert err.provider == "ollama"
+        assert err.status_code == 503

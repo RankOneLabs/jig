@@ -40,6 +40,12 @@ class JigLLMError(JigError):
         super().__init__(message)
         self.provider = provider
         self.status_code = status_code
+        # Diagnostic metadata set by the adapter — indicates whether the
+        # provider considers the error transient. The runner does NOT use
+        # this flag to decide retry behavior; it routes via status_code
+        # (permanent on 400/401/403/404/422) and consecutive-error counts.
+        # Callers inspecting retryable are reading provider intent, not a
+        # runner retry contract.
         self.retryable = retryable
 
 
@@ -57,6 +63,9 @@ class JigMemoryError(JigError):
         super().__init__(message)
         self.source = source        # e.g. "local_memory", "honcho", "zep"
         self.operation = operation  # e.g. "query", "add", "get_session"
+        # Provider-local diagnostic hint — not a runner retry contract.
+        # The runner's fail-soft bookkeeping catches all exceptions after a
+        # valid output; callers must not rely on this flag to drive retries.
         self.retryable = retryable
 
 
