@@ -26,6 +26,6 @@ def span_guard(
     span = tracer.start_span(parent_id, kind, name, input=input, metadata=metadata)
     try:
         yield span
-    except Exception as exc:
+    except BaseException as exc:
         tracer.end_span(span.id, error=f"{type(exc).__name__}: {exc}")
         raise

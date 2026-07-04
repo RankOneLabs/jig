@@ -782,23 +782,6 @@ class TestGeminiAdapterErrorBoundaries:
     called out by the lifecycle-hardening spec.
     """
 
-    def _make_genai_mocks(self):
-        """Return minimal SimpleNamespace mocks for the genai module and types."""
-        import types as _types
-        genai_mock = _types.SimpleNamespace()
-        genai_types_mock = _types.SimpleNamespace()
-
-        # Types stubs used by GeminiClient.__init__ and complete()
-        genai_types_mock.Content = object
-        genai_types_mock.Part = object
-        genai_types_mock.FunctionCall = object
-        genai_types_mock.FunctionResponse = object
-        genai_types_mock.FunctionDeclaration = object
-        genai_types_mock.Tool = object
-        genai_types_mock.GenerateContentConfig = object
-
-        return genai_mock, genai_types_mock
-
     @pytest.mark.asyncio
     async def test_none_usage_metadata_normalizes_to_zero(self, monkeypatch):
         """usage_metadata=None from Gemini API yields 0 tokens, not AttributeError.
@@ -808,7 +791,6 @@ class TestGeminiAdapterErrorBoundaries:
         output_tokens are always integers.
         """
         from unittest.mock import AsyncMock, MagicMock, patch
-        import types as _types
 
         # Stub out genai at the module level so GeminiClient skips the ImportError guard
         genai_stub = MagicMock()
