@@ -7,7 +7,6 @@ import uuid
 from typing import Any
 
 from jig.core.errors import JigLLMError
-from jig.core.retry import with_retry
 from jig.core.types import (
     CompletionParams,
     LLMClient,
@@ -56,6 +55,12 @@ class GeminiClient(LLMClient):
             raise ImportError("Install google-genai: pip install 'jig[google]'")
         self._client = genai.Client(**client_kwargs)
         self._model = model
+        self._closed = False
+
+    async def aclose(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._client.close()
 
     def _convert_messages(self, params: CompletionParams) -> list[Any]:
         contents: list[genai_types.Content] = []
@@ -159,20 +164,12 @@ class GeminiClient(LLMClient):
 
         timer = start_timer()
 
-        async def _call() -> Any:
-            return await self._client.aio.models.generate_content(
+        try:
+            response = await self._client.aio.models.generate_content(
                 model=self._model,
                 contents=contents,
                 config=config,
             )
-
-        def _retryable(e: Exception) -> bool:
-            # Retry on 429 / resource exhausted
-            status = getattr(e, "status_code", None) or getattr(e, "code", None)
-            return status in (429, 503)
-
-        try:
-            response = await with_retry(_call, max_attempts=3, retryable=_retryable)
         except JigLLMError:
             raise
         except Exception as e:

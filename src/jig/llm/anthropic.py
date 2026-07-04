@@ -4,7 +4,6 @@ import logging
 from typing import Any, AsyncIterator
 
 from jig.core.errors import JigLLMError
-from jig.core.retry import with_retry
 from jig.core.types import (
     CompletionParams,
     LLMClient,
@@ -30,8 +29,16 @@ class AnthropicClient(LLMClient):
     def __init__(self, model: str = "claude-sonnet-4-20250514", **client_kwargs: Any):
         if anthropic is None:
             raise ImportError("Install anthropic: pip install 'jig[anthropic]'")
+        # Disable SDK-level retries — runner owns the retry policy.
+        client_kwargs.setdefault("max_retries", 0)
         self._client = anthropic.AsyncAnthropic(**client_kwargs)
         self._model = model
+        self._closed = False
+
+    async def aclose(self) -> None:
+        if not self._closed:
+            self._closed = True
+            await self._client.close()
 
     def _convert_messages(self, params: CompletionParams) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
@@ -112,16 +119,8 @@ class AnthropicClient(LLMClient):
 
         timer = start_timer()
 
-        async def _call() -> Any:
-            return await self._client.messages.create(**kwargs)
-
-        def _retryable(e: Exception) -> bool:
-            if anthropic is None:
-                return False
-            return isinstance(e, anthropic.RateLimitError)
-
         try:
-            response = await with_retry(_call, max_attempts=3, retryable=_retryable)
+            response = await self._client.messages.create(**kwargs)
         except Exception as e:
             raise wrap_llm_error(e, "anthropic") from e
 
