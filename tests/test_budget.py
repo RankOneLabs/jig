@@ -1,11 +1,12 @@
 """Tests for BudgetTracker and BudgetedLLMClient."""
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
 
-from jig import BudgetedLLMClient, BudgetTracker, JigBudgetError
+from jig import BudgetedLLMClient, BudgetTracker, JigBudgetError, JigBudgetUnpricedError
 from jig.core.types import CompletionParams, LLMResponse, Message, Role, Usage
 
 
@@ -24,10 +25,25 @@ class TestBudgetTracker:
         assert exc_info.value.spent_usd == pytest.approx(0.13)
         assert exc_info.value.limit_usd == 0.10
 
-    def test_none_cost_ignored(self):
+    def test_default_policy_raises_on_none_cost(self):
         budget = BudgetTracker(limit_usd=1.0)
+        with pytest.raises(JigBudgetUnpricedError):
+            budget.record(Usage(input_tokens=100, output_tokens=50, cost=None))
+        assert budget.spent_usd == 0.0
+
+    def test_free_local_policy_allows_none_cost(self):
+        budget = BudgetTracker(limit_usd=1.0, unpriced_policy="free-local")
         budget.record(Usage(input_tokens=100, output_tokens=50, cost=None))
         assert budget.spent_usd == 0.0
+
+    def test_unknown_unpriced_policy_rejected(self):
+        with pytest.raises(ValueError, match="unpriced_policy"):
+            BudgetTracker(limit_usd=1.0, unpriced_policy="estimate")
+
+    def test_unpriced_error_carries_stop_reason(self):
+        err = JigBudgetUnpricedError(spent_usd=0.0, limit_usd=1.0)
+        assert err.reason == "budget_unpriced_usage"
+        assert "usage.cost=None" in str(err)
 
     def test_zero_cost_recorded_but_harmless(self):
         # Ollama usages carry cost=0.0; budget should tally without raising
@@ -106,6 +122,11 @@ class TestBudgetTracker:
 
 @pytest.mark.asyncio
 class TestBudgetTrackerReservations:
+    async def test_completion_lock_uses_budget_mutation_lock(self):
+        budget = BudgetTracker(limit_usd=1.0)
+
+        assert budget.completion_lock is budget._lock
+
     async def test_reserve_claims_budget_before_call(self):
         budget = BudgetTracker(limit_usd=0.10)
         reservation = await budget.reserve(0.06)
@@ -191,7 +212,7 @@ class TestBudgetTrackerReservations:
 
 @pytest.mark.asyncio
 class TestBudgetedLLMClient:
-    def _make_inner(self, cost: float = 0.02) -> AsyncMock:
+    def _make_inner(self, cost: float | None = 0.02) -> AsyncMock:
         inner = AsyncMock()
         inner.complete = AsyncMock(
             return_value=LLMResponse(
@@ -236,17 +257,62 @@ class TestBudgetedLLMClient:
             await client.complete(params)
         inner.complete.assert_not_called()
 
-    async def test_no_estimate_raises_before_call(self):
-        """No estimate_cost_usd → JigBudgetError before provider call."""
+    async def test_no_estimate_serializes_shared_tracker_completions(self):
+        """No estimate_cost_usd falls back to serialized post-call accounting."""
+        class FakeClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def complete(self, params: CompletionParams) -> LLMResponse:
+                self.calls += 1
+                await asyncio.sleep(0)
+                return LLMResponse(
+                    content="ok",
+                    tool_calls=None,
+                    usage=Usage(input_tokens=1, output_tokens=1, cost=0.02),
+                    latency_ms=1.0,
+                    model="fake",
+                )
+
+        budget = BudgetTracker(limit_usd=0.01)
+        first_inner = FakeClient()
+        second_inner = FakeClient()
+        params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
+
+        results = await asyncio.gather(
+            BudgetedLLMClient(first_inner, budget).complete(params),
+            BudgetedLLMClient(second_inner, budget).complete(params),
+            return_exceptions=True,
+        )
+
+        assert all(isinstance(result, JigBudgetError) for result in results)
+        assert first_inner.calls + second_inner.calls == 1
+
+    async def test_no_estimate_preflight_counts_active_reservations(self):
         inner = AsyncMock()
         inner.complete = AsyncMock()
+        budget = BudgetTracker(limit_usd=0.10)
+        reservation = await budget.reserve(0.10)
+        client = BudgetedLLMClient(inner=inner, budget=budget)
+        params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
+
+        try:
+            with pytest.raises(JigBudgetError, match="committed"):
+                await client.complete(params)
+        finally:
+            await reservation.release()
+
+        inner.complete.assert_not_called()
+
+    async def test_no_estimate_raises_on_unpriced_usage(self):
+        inner = self._make_inner(cost=None)
         budget = BudgetTracker(limit_usd=1.0)
         client = BudgetedLLMClient(inner=inner, budget=budget)
 
         params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
-        with pytest.raises(JigBudgetError, match="estimate_cost_usd"):
+        with pytest.raises(JigBudgetUnpricedError):
             await client.complete(params)
-        inner.complete.assert_not_called()
+        inner.complete.assert_called_once()
 
     async def test_reservation_released_on_provider_failure(self):
         """If the provider call raises, the reservation is freed."""

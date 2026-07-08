@@ -18,6 +18,15 @@ The wrapped client uses a reservation model: ``estimate_cost_usd`` is
 reserved before each provider call and reconciled with the actual cost
 afterwards, so concurrent calls cannot all pass a pre-flight check and
 then jointly overshoot the cap.
+
+Unpriced usage policy
+---------------------
+When ``unpriced_policy="fail-closed"`` (the default) and ``usage.cost`` is
+None, the tracker raises :class:`JigBudgetUnpricedError` — unpriced remote
+usage cannot be proven inside the cap so it must stop new work.
+
+Pass ``unpriced_policy="free-local"`` for ``ollama/`` or allowlisted local
+dispatch models where zero cost is a correct accounting of actual spend.
 """
 from __future__ import annotations
 
@@ -30,6 +39,26 @@ from jig.core.errors import JigBudgetError
 from jig.core.types import CompletionParams, LLMClient, LLMResponse, Usage
 
 logger = logging.getLogger(__name__)
+
+_UNPRICED_POLICY_FAIL_CLOSED = "fail-closed"
+_UNPRICED_POLICY_FREE_LOCAL = "free-local"
+
+
+class JigBudgetUnpricedError(JigBudgetError):
+    """Raised when usage.cost=None is observed under a configured budget."""
+
+    reason: str = "budget_unpriced_usage"
+
+    def __init__(self, spent_usd: float, limit_usd: float) -> None:
+        super().__init__(
+            "budget_unpriced_usage: usage.cost=None received under a configured "
+            f"budget (limit=${limit_usd:.2f}, spent=${spent_usd:.4f}). "
+            "Unpriced remote usage cannot be proven inside the cap. "
+            "Pass unpriced_policy='free-local' to BudgetTracker for models where "
+            "None cost correctly means zero spend (e.g. ollama/ or local dispatch).",
+            spent_usd=spent_usd,
+            limit_usd=limit_usd,
+        )
 
 
 class _BudgetReservation:
@@ -90,15 +119,34 @@ class BudgetTracker:
     the reservation API for concurrent callers.
     """
 
-    def __init__(self, limit_usd: float) -> None:
+    def __init__(
+        self,
+        limit_usd: float,
+        *,
+        unpriced_policy: str = _UNPRICED_POLICY_FAIL_CLOSED,
+    ) -> None:
         if not math.isfinite(limit_usd) or limit_usd <= 0:
             raise ValueError(
                 f"limit_usd must be a positive finite number, got {limit_usd!r}"
+            )
+        if unpriced_policy not in (
+            _UNPRICED_POLICY_FAIL_CLOSED,
+            _UNPRICED_POLICY_FREE_LOCAL,
+        ):
+            raise ValueError(
+                "unpriced_policy must be 'fail-closed' or 'free-local', "
+                f"got {unpriced_policy!r}"
             )
         self.limit_usd = limit_usd
         self.spent_usd = 0.0
         self._active_reserved_usd = 0.0
         self._lock = asyncio.Lock()
+        self._unpriced_policy = unpriced_policy
+
+    @property
+    def completion_lock(self) -> asyncio.Lock:
+        """Serialize completions that share this tracker."""
+        return self._lock
 
     # ------------------------------------------------------------------
     # Simple (single-threaded / non-concurrent) API
@@ -106,6 +154,11 @@ class BudgetTracker:
 
     def record(self, usage: Usage) -> None:
         if usage.cost is None:
+            if self._unpriced_policy == _UNPRICED_POLICY_FAIL_CLOSED:
+                raise JigBudgetUnpricedError(
+                    spent_usd=self.spent_usd,
+                    limit_usd=self.limit_usd,
+                )
             return
         if not math.isfinite(usage.cost):
             raise ValueError(
@@ -131,6 +184,22 @@ class BudgetTracker:
         if self.spent_usd > self.limit_usd:
             raise JigBudgetError(
                 f"Budget exceeded: ${self.spent_usd:.4f} > ${self.limit_usd:.2f}",
+                spent_usd=self.spent_usd,
+                limit_usd=self.limit_usd,
+            )
+
+    def _check_no_estimate_admission_unlocked(self) -> None:
+        """Admission check for serialized calls without an estimate.
+
+        Without an estimate, the only defensible preflight check is whether
+        already-spent plus currently-reserved budget leaves any headroom.
+        """
+        committed = self.spent_usd + self._active_reserved_usd
+        if committed >= self.limit_usd:
+            raise JigBudgetError(
+                f"Budget admission refused: committed ${committed:.4f} >= "
+                f"${self.limit_usd:.2f} (spent=${self.spent_usd:.4f}, "
+                f"reserved=${self._active_reserved_usd:.4f})",
                 spent_usd=self.spent_usd,
                 limit_usd=self.limit_usd,
             )
@@ -178,8 +247,8 @@ class BudgetedLLMClient(LLMClient):
     """Wrap any ``LLMClient`` so every completion tallies against a budget.
 
     ``estimate_cost_usd`` is a conservative per-call cost estimate used to
-    reserve budget before each provider call. It is required: without an
-    estimate the tracker cannot admit the call safely under concurrency.
+    reserve budget before each provider call. Without an estimate, calls
+    sharing the same tracker are serialized and charged after completion.
 
     On success the reservation is reconciled with the actual ``Usage.cost``
     (or the estimate if the actual cost is unknown). On failure the
@@ -200,13 +269,11 @@ class BudgetedLLMClient(LLMClient):
     async def complete(self, params: CompletionParams) -> LLMResponse:
         estimate = self._estimate_cost_usd
         if estimate is None:
-            raise JigBudgetError(
-                "BudgetedLLMClient requires estimate_cost_usd to enforce the "
-                "hard budget cap under concurrency. Provide a conservative "
-                "per-call cost estimate at construction time.",
-                spent_usd=self._budget.spent_usd,
-                limit_usd=self._budget.limit_usd,
-            )
+            async with self._budget.completion_lock:
+                self._budget._check_no_estimate_admission_unlocked()
+                response = await self._inner.complete(params)
+                self._budget.record(response.usage)
+                return response
         reservation = await self._budget.reserve(estimate)
         try:
             response = await self._inner.complete(params)

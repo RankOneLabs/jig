@@ -561,6 +561,26 @@ Set to `False` to skip injecting quality signals. Useful early on when the feedb
 
 Hard limit on tool executions per run. Prevents infinite loops. When hit, the agent receives "Max tool calls reached. Provide final answer." and must respond without further tool use.
 
+## Budgeting
+
+Wrap an LLM with `BudgetedLLMClient` to enforce a shared USD cap:
+
+```python
+from jig import BudgetedLLMClient, BudgetTracker, from_model
+
+budget = BudgetTracker(limit_usd=5.0)
+base_llm = from_model("openrouter/anthropic/claude-sonnet-4")
+llm = BudgetedLLMClient(inner=base_llm, budget=budget, estimate_cost_usd=0.01)
+```
+
+`estimate_cost_usd` reserves budget before each provider call so concurrent
+agents cannot jointly overshoot the cap. If you omit it, completions sharing
+the same tracker are serialized and charged after each response.
+
+By default, `usage.cost=None` raises `JigBudgetUnpricedError`. Pass
+`unpriced_policy="free-local"` only when `None` correctly means zero spend,
+such as local Ollama or trusted local dispatch models.
+
 ## Writing tools
 
 A tool is anything that implements `Tool`. The `definition` property provides the JSON Schema sent to the LLM. The `execute` method does the work.
