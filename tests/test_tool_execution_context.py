@@ -36,7 +36,7 @@ class _FakeTracer(TracingLogger):
     ) -> Span:
         self._counter += 1
         span = Span(
-            id=f"trace-{self._counter}",
+            id=f"root-{self._counter}",
             trace_id=f"trace-{self._counter}",
             kind=kind,
             name=name,
@@ -206,6 +206,33 @@ class _DispatchTool(Tool):
         return "unused"
 
 
+class _ReorderedDispatchTool(_DispatchTool):
+    def dispatch_payload_extra(
+        self,
+        arguments: dict[str, Any] | None = None,
+        context: ToolExecutionContext | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "hook": "reordered",
+            "trace_id": context.trace_id if context else None,
+            "argument_count": len(arguments or {}),
+        }
+
+
+class _KeywordOnlyDispatchTool(_DispatchTool):
+    def dispatch_payload_extra(
+        self,
+        *,
+        arguments: dict[str, Any] | None = None,
+        context: ToolExecutionContext | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "hook": "keyword-only",
+            "trace_id": context.trace_id if context else None,
+            "argument_count": len(arguments or {}),
+        }
+
+
 class _FakeLLM:
     def __init__(self) -> None:
         self.calls = 0
@@ -301,7 +328,10 @@ async def test_run_agent_sets_and_resets_current_tool_context() -> None:
     assert seen.trace_id == result.trace_id
     assert seen.tool_call_id == "tool-call-1"
     assert seen.span_id.startswith("span-")
-    assert seen.parent_span_id == result.trace_id
+    spans = await tracer.get_trace(result.trace_id)
+    agent_span = next(span for span in spans if span.kind == SpanKind.AGENT_RUN)
+    assert agent_span.id != result.trace_id
+    assert seen.parent_span_id == agent_span.id
     assert current_tool_context.get() is None
 
 
@@ -353,3 +383,52 @@ async def test_dispatch_payload_uses_current_tool_context(monkeypatch: pytest.Mo
         "parent_span_id": "span-3",
     }
     assert captured["context"] == context
+
+
+@pytest.mark.asyncio
+async def test_dispatch_payload_extra_matches_context_and_arguments_by_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_payloads: list[dict[str, Any] | None] = []
+
+    async def fake_dispatch_run(
+        fn_ref: str,
+        payload: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> str:
+        captured_payloads.append(payload)
+        return "dispatch-ok"
+
+    monkeypatch.setattr("jig.dispatch.run", fake_dispatch_run)
+    context = ToolExecutionContext(
+        trace_id="trace-4",
+        span_id="span-4",
+        parent_span_id="root-span",
+        tool_call_id="call-4",
+    )
+
+    token = current_tool_context.set(context)
+    try:
+        for tool in (_ReorderedDispatchTool(), _KeywordOnlyDispatchTool()):
+            registry = ToolRegistry([tool])
+            result = await registry.execute(
+                ToolCall(id="call-4", name="dispatch_tool", arguments={"x": 1})
+            )
+            assert result.output == "dispatch-ok"
+    finally:
+        current_tool_context.reset(token)
+
+    assert captured_payloads == [
+        {
+            "x": 1,
+            "hook": "reordered",
+            "trace_id": "trace-4",
+            "argument_count": 1,
+        },
+        {
+            "x": 1,
+            "hook": "keyword-only",
+            "trace_id": "trace-4",
+            "argument_count": 1,
+        },
+    ]

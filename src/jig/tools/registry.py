@@ -200,38 +200,42 @@ class ToolRegistry:
             return {}
 
         sig = inspect.signature(dispatch_payload_extra)
-        params = list(sig.parameters.values())
+        params = sig.parameters
         has_var_kwargs = any(
-            param.kind == inspect.Parameter.VAR_KEYWORD for param in params
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
         )
 
-        if not params:
-            extra = dispatch_payload_extra()
-        elif has_var_kwargs:
-            kwargs: dict[str, object] = {"arguments": call.arguments}
-            first = params[0]
-            if first.kind != inspect.Parameter.VAR_KEYWORD:
-                kwargs[first.name] = tool_context
-            else:
-                kwargs["context"] = tool_context
-            extra = dispatch_payload_extra(**kwargs)
-        elif params[0].kind == inspect.Parameter.KEYWORD_ONLY:
-            kwargs = {params[0].name: tool_context}
-            if len(params) >= 2:
-                kwargs[params[1].name] = call.arguments
-            extra = dispatch_payload_extra(**kwargs)
-        elif len(params) >= 2:
-            second = params[1]
-            if second.kind in (
-                inspect.Parameter.KEYWORD_ONLY,
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        positional: list[object] = []
+        kwargs: dict[str, object] = {}
+        for name, param in params.items():
+            if param.kind in (
+                inspect.Parameter.VAR_KEYWORD,
+                inspect.Parameter.VAR_POSITIONAL,
             ):
-                extra = dispatch_payload_extra(
-                    tool_context, **{second.name: call.arguments}
-                )
+                continue
+
+            if name in ("context", "tool_context", "ctx"):
+                value: object = tool_context
+            elif name in ("arguments", "args"):
+                value = call.arguments
             else:
-                extra = dispatch_payload_extra(tool_context, call.arguments)
+                continue
+
+            if param.kind == inspect.Parameter.POSITIONAL_ONLY:
+                positional.append(value)
+            else:
+                kwargs[name] = value
+
+        if has_var_kwargs:
+            kwargs.setdefault("context", tool_context)
+            kwargs.setdefault("arguments", call.arguments)
+
+        if positional or kwargs:
+            extra = dispatch_payload_extra(*positional, **kwargs)
+        elif not params:
+            extra = dispatch_payload_extra()
         else:
+            # Unrecognized single-param signature; assume it wants context.
             extra = dispatch_payload_extra(tool_context)
 
         if not isinstance(extra, dict):
