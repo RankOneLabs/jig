@@ -1,4 +1,4 @@
-from jig.budget import BudgetedLLMClient, BudgetTracker
+from jig.budget import BudgetedLLMClient, BudgetTracker, JigBudgetUnpricedError
 from jig.core import (
     AgentAmbiguousTurnError,
     AgentBudgetError,
@@ -135,6 +135,7 @@ __all__ = [
     "AgentSchemaValidationError",
     "GradeParseError",
     "JigBudgetError",
+    "JigBudgetUnpricedError",
     "JigError",
     "JigLLMError",
     "JigMemoryError",
