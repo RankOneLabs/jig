@@ -566,10 +566,11 @@ Hard limit on tool executions per run. Prevents infinite loops. When hit, the ag
 Wrap an LLM with `BudgetedLLMClient` to enforce a shared USD cap:
 
 ```python
-from jig import BudgetedLLMClient, BudgetTracker
+from jig import BudgetedLLMClient, BudgetTracker, from_model
 
 budget = BudgetTracker(limit_usd=5.0)
-llm = BudgetedLLMClient(inner=llm, budget=budget, estimate_cost_usd=0.01)
+base_llm = from_model("openrouter/anthropic/claude-sonnet-4")
+llm = BudgetedLLMClient(inner=base_llm, budget=budget, estimate_cost_usd=0.01)
 ```
 
 `estimate_cost_usd` reserves budget before each provider call so concurrent

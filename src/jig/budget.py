@@ -141,13 +141,12 @@ class BudgetTracker:
         self.spent_usd = 0.0
         self._active_reserved_usd = 0.0
         self._lock = asyncio.Lock()
-        self._completion_lock = asyncio.Lock()
         self._unpriced_policy = unpriced_policy
 
     @property
     def completion_lock(self) -> asyncio.Lock:
         """Serialize completions that share this tracker."""
-        return self._completion_lock
+        return self._lock
 
     # ------------------------------------------------------------------
     # Simple (single-threaded / non-concurrent) API
@@ -185,6 +184,22 @@ class BudgetTracker:
         if self.spent_usd > self.limit_usd:
             raise JigBudgetError(
                 f"Budget exceeded: ${self.spent_usd:.4f} > ${self.limit_usd:.2f}",
+                spent_usd=self.spent_usd,
+                limit_usd=self.limit_usd,
+            )
+
+    def _check_no_estimate_admission_unlocked(self) -> None:
+        """Admission check for serialized calls without an estimate.
+
+        Without an estimate, the only defensible preflight check is whether
+        already-spent plus currently-reserved budget leaves any headroom.
+        """
+        committed = self.spent_usd + self._active_reserved_usd
+        if committed >= self.limit_usd:
+            raise JigBudgetError(
+                f"Budget admission refused: committed ${committed:.4f} >= "
+                f"${self.limit_usd:.2f} (spent=${self.spent_usd:.4f}, "
+                f"reserved=${self._active_reserved_usd:.4f})",
                 spent_usd=self.spent_usd,
                 limit_usd=self.limit_usd,
             )
@@ -255,7 +270,7 @@ class BudgetedLLMClient(LLMClient):
         estimate = self._estimate_cost_usd
         if estimate is None:
             async with self._budget.completion_lock:
-                self._budget.check()
+                self._budget._check_no_estimate_admission_unlocked()
                 response = await self._inner.complete(params)
                 self._budget.record(response.usage)
                 return response

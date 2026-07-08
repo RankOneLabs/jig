@@ -122,6 +122,11 @@ class TestBudgetTracker:
 
 @pytest.mark.asyncio
 class TestBudgetTrackerReservations:
+    async def test_completion_lock_uses_budget_mutation_lock(self):
+        budget = BudgetTracker(limit_usd=1.0)
+
+        assert budget.completion_lock is budget._lock
+
     async def test_reserve_claims_budget_before_call(self):
         budget = BudgetTracker(limit_usd=0.10)
         reservation = await budget.reserve(0.06)
@@ -207,7 +212,7 @@ class TestBudgetTrackerReservations:
 
 @pytest.mark.asyncio
 class TestBudgetedLLMClient:
-    def _make_inner(self, cost: float = 0.02) -> AsyncMock:
+    def _make_inner(self, cost: float | None = 0.02) -> AsyncMock:
         inner = AsyncMock()
         inner.complete = AsyncMock(
             return_value=LLMResponse(
@@ -282,6 +287,22 @@ class TestBudgetedLLMClient:
 
         assert all(isinstance(result, JigBudgetError) for result in results)
         assert first_inner.calls + second_inner.calls == 1
+
+    async def test_no_estimate_preflight_counts_active_reservations(self):
+        inner = AsyncMock()
+        inner.complete = AsyncMock()
+        budget = BudgetTracker(limit_usd=0.10)
+        reservation = await budget.reserve(0.10)
+        client = BudgetedLLMClient(inner=inner, budget=budget)
+        params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
+
+        try:
+            with pytest.raises(JigBudgetError, match="committed"):
+                await client.complete(params)
+        finally:
+            await reservation.release()
+
+        inner.complete.assert_not_called()
 
     async def test_no_estimate_raises_on_unpriced_usage(self):
         inner = self._make_inner(cost=None)
