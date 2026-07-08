@@ -104,8 +104,11 @@ class StdoutTracer(TracingLogger):
         if span.usage:
             print(
                 f"{indent}  tokens: {span.usage.input_tokens}→{span.usage.output_tokens}"
-                + (f" ${span.usage.cost:.4f}" if span.usage.cost else "")
+                + (f" ${span.usage.cost:.4f}" if span.usage.cost is not None else "")
             )
+
+        self._spans.pop(span_id, None)
+        self._depth.pop(span_id, None)
 
     async def get_trace(self, trace_id: str) -> list[Span]:
         raise NotImplementedError("StdoutTracer does not support get_trace")

@@ -86,4 +86,10 @@ resolution. The span's attributes include the chosen path
 (`callback` or `poll`), the job id, and (on failure) the terminal
 status. Poll ticks do not produce child spans.
 
+When an agent executes a `Tool(dispatch=True)`, `ToolRegistry` forwards
+the active tool execution context to the dispatch client as
+`trace_context`, with the local tool-call span as the worker parent.
+Tools can also add payload fields by overriding
+`dispatch_payload_extra(context, arguments)`.
+
 [smithers]: https://github.com/rankonelabs/smithers

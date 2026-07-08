@@ -239,6 +239,15 @@ class TestNonProviderRetriesExcluded:
     each other's counters.
     """
 
+    async def test_with_retry_rejects_non_positive_attempts(self):
+        from jig.core.retry import with_retry
+
+        async def operation() -> str:
+            return "unused"
+
+        with pytest.raises(ValueError, match="max_attempts must be > 0"):
+            await with_retry(operation, max_attempts=0)
+
     async def test_with_retry_for_non_llm_op_does_not_touch_provider(self):
         """with_retry wrapping a non-LLM function is architecturally separate from
         provider generation.

@@ -1,10 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
+import math
+from typing import Any
 
-from jig.core.types import Tool, ToolCall, ToolDefinition, ToolResult
+from jig.core.types import (
+    Tool,
+    ToolCall,
+    ToolDefinition,
+    ToolExecutionContext,
+    ToolResult,
+    current_tool_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,34 +64,52 @@ class ToolRegistry:
             logger.debug("tool.execute unknown name=%s", call.name)
             return ToolResult(call_id=call.id, output="", error=f"Unknown tool: {call.name}")
 
-        if getattr(tool, "dispatch", False):
-            logger.debug("tool.execute dispatched name=%s", call.name)
-            return await self._execute_dispatched(tool, call)
-
-        logger.debug("tool.execute start name=%s timeout=%s", call.name, self._execute_timeout)
+        tool_context = current_tool_context.get()
+        token = current_tool_context.set(tool_context)
         try:
-            if self._execute_timeout is not None:
-                output = await asyncio.wait_for(
-                    tool.execute(call.arguments), timeout=self._execute_timeout
-                )
-            else:
-                output = await tool.execute(call.arguments)
-            logger.debug("tool.execute done name=%s", call.name)
-            return ToolResult(call_id=call.id, output=output)
-        except asyncio.TimeoutError:
-            logger.warning("tool.execute timeout name=%s after=%ss", call.name, self._execute_timeout)
-            return ToolResult(
-                call_id=call.id,
-                output="",
-                error=f"TimeoutError: Tool {call.name} timed out after {self._execute_timeout}s",
-            )
-        except Exception as e:
-            msg = str(e)
-            error = f"{type(e).__name__}: {msg}" if msg else f"{type(e).__name__}: tool raised without message"
-            logger.warning("tool.execute error name=%s err=%s", call.name, error, exc_info=True)
-            return ToolResult(call_id=call.id, output="", error=error)
+            if getattr(tool, "dispatch", False):
+                logger.debug("tool.execute dispatched name=%s", call.name)
+                return await self._execute_dispatched(tool, call, tool_context)
 
-    async def _execute_dispatched(self, tool: Tool, call: ToolCall) -> ToolResult:
+            logger.debug("tool.execute start name=%s timeout=%s", call.name, self._execute_timeout)
+            try:
+                execute_with_context = getattr(tool, "execute_with_context", None)
+                if callable(execute_with_context):
+                    execute_fn = execute_with_context
+                    args: tuple[object, ...] = (call.arguments, tool_context)
+                else:
+                    execute_fn = tool.execute
+                    args = (call.arguments,)
+
+                if self._execute_timeout is not None:
+                    output = await asyncio.wait_for(
+                        execute_fn(*args), timeout=self._execute_timeout
+                    )
+                else:
+                    output = await execute_fn(*args)
+                logger.debug("tool.execute done name=%s", call.name)
+                return ToolResult(call_id=call.id, output=output)
+            except asyncio.TimeoutError:
+                logger.warning("tool.execute timeout name=%s after=%ss", call.name, self._execute_timeout)
+                return ToolResult(
+                    call_id=call.id,
+                    output="",
+                    error=f"TimeoutError: Tool {call.name} timed out after {self._execute_timeout}s",
+                )
+            except Exception as e:
+                msg = str(e)
+                error = f"{type(e).__name__}: {msg}" if msg else f"{type(e).__name__}: tool raised without message"
+                logger.warning("tool.execute error name=%s err=%s", call.name, error, exc_info=True)
+                return ToolResult(call_id=call.id, output="", error=error)
+        finally:
+            current_tool_context.reset(token)
+
+    async def _execute_dispatched(
+        self,
+        tool: Tool,
+        call: ToolCall,
+        tool_context: ToolExecutionContext | None,
+    ) -> ToolResult:
         """Route a dispatch=True tool through :func:`jig.dispatch.run`.
 
         Dispatch failures surface as ``ToolResult.error`` so the agent
@@ -102,14 +130,22 @@ class ToolRegistry:
         # kept as a belt-and-suspenders guard — if the worker hangs on
         # a non-poll branch, we still exit on time.
         if self._execute_timeout is not None:
-            kwargs["timeout_seconds"] = max(1, int(self._execute_timeout))
+            kwargs["timeout_seconds"] = max(1, math.ceil(self._execute_timeout))
+        if tool_context is not None:
+            kwargs["trace_context"] = {
+                "trace_id": tool_context.trace_id,
+                "parent_span_id": tool_context.span_id,
+            }
 
         try:
+            payload = dict(call.arguments)
+            payload.update(self._dispatch_payload_extra(tool, call, tool_context))
+
             if self._execute_timeout is not None:
                 result = await asyncio.wait_for(
                     dispatch_run(
                         tool.dispatch_fn_ref,  # type: ignore[arg-type]
-                        call.arguments,
+                        payload,
                         **kwargs,
                     ),
                     timeout=self._execute_timeout,
@@ -117,7 +153,7 @@ class ToolRegistry:
             else:
                 result = await dispatch_run(
                     tool.dispatch_fn_ref,  # type: ignore[arg-type]
-                    call.arguments,
+                    payload,
                     **kwargs,
                 )
         except asyncio.TimeoutError:
@@ -152,3 +188,52 @@ class ToolRegistry:
             except (TypeError, ValueError):
                 output = str(result)
         return ToolResult(call_id=call.id, output=output)
+
+    def _dispatch_payload_extra(
+        self,
+        tool: Tool,
+        call: ToolCall,
+        tool_context: ToolExecutionContext | None,
+    ) -> dict[str, Any]:
+        dispatch_payload_extra = getattr(tool, "dispatch_payload_extra", None)
+        if not callable(dispatch_payload_extra):
+            return {}
+
+        sig = inspect.signature(dispatch_payload_extra)
+        params = list(sig.parameters.values())
+        has_var_kwargs = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in params
+        )
+
+        if not params:
+            extra = dispatch_payload_extra()
+        elif has_var_kwargs:
+            kwargs: dict[str, object] = {"arguments": call.arguments}
+            first = params[0]
+            if first.kind != inspect.Parameter.VAR_KEYWORD:
+                kwargs[first.name] = tool_context
+            else:
+                kwargs["context"] = tool_context
+            extra = dispatch_payload_extra(**kwargs)
+        elif params[0].kind == inspect.Parameter.KEYWORD_ONLY:
+            kwargs = {params[0].name: tool_context}
+            if len(params) >= 2:
+                kwargs[params[1].name] = call.arguments
+            extra = dispatch_payload_extra(**kwargs)
+        elif len(params) >= 2:
+            second = params[1]
+            if second.kind in (
+                inspect.Parameter.KEYWORD_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            ):
+                extra = dispatch_payload_extra(
+                    tool_context, **{second.name: call.arguments}
+                )
+            else:
+                extra = dispatch_payload_extra(tool_context, call.arguments)
+        else:
+            extra = dispatch_payload_extra(tool_context)
+
+        if not isinstance(extra, dict):
+            return {}
+        return {key: value for key, value in extra.items() if value is not None}

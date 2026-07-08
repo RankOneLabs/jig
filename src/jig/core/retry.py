@@ -13,6 +13,9 @@ async def with_retry(
     base_delay: float = 1.0,
     retryable: Callable[[Exception], bool] = lambda _: False,
 ) -> T:
+    if max_attempts <= 0:
+        raise ValueError(f"max_attempts must be > 0, got {max_attempts}")
+
     last_exc: Exception | None = None
     for attempt in range(max_attempts):
         try:
