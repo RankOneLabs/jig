@@ -36,9 +36,11 @@ from jig.core.types import (
     Tool,
     ToolCall,
     ToolDefinition,
+    ToolExecutionContext,
     ToolResult,
     TracingLogger,
     Usage,
+    current_tool_context,
 )
 
 __all__ = [
@@ -80,7 +82,9 @@ __all__ = [
     "Tool",
     "ToolCall",
     "ToolDefinition",
+    "ToolExecutionContext",
     "ToolResult",
     "TracingLogger",
     "Usage",
+    "current_tool_context",
 ]

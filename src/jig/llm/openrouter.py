@@ -66,7 +66,10 @@ class OpenRouterClient(OpenAIClient):
         # (e.g. ``models`` for fallback routing, ``provider`` preferences,
         # ``transforms``) survive. We only inject ``usage.include=True``,
         # and we honor an explicit caller override if they pass it.
-        extra_body = kwargs.setdefault("extra_body", {})
+        extra_body = kwargs.get("extra_body")
+        if not isinstance(extra_body, dict):
+            extra_body = {}
+            kwargs["extra_body"] = extra_body
         usage = extra_body.setdefault("usage", {})
         usage.setdefault("include", True)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -207,6 +208,23 @@ class TraceContext:
         return cls(trace_id=tid, parent_span_id=pid)
 
 
+@dataclass(frozen=True, slots=True)
+class ToolExecutionContext:
+    """Context available while Jig is executing a tool call."""
+
+    trace_id: str
+    span_id: str
+    parent_span_id: str | None
+    tool_call_id: str
+    metadata: dict[str, Any] | None = None
+
+
+current_tool_context: ContextVar[ToolExecutionContext | None] = ContextVar(
+    "current_tool_context",
+    default=None,
+)
+
+
 # --- Abstract interfaces ---
 
 
@@ -409,9 +427,30 @@ class Tool(ABC):
         """
         return None
 
+    def dispatch_payload_extra(
+        self,
+        context: ToolExecutionContext | None = None,
+        arguments: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Extra payload fields to send to dispatched workers."""
+        return {}
+
     @property
     @abstractmethod
     def definition(self) -> ToolDefinition: ...
 
     @abstractmethod
     async def execute(self, args: dict[str, Any]) -> str: ...
+
+    async def execute_with_context(
+        self,
+        args: dict[str, Any],
+        context: ToolExecutionContext | None = None,
+    ) -> str:
+        """Execute with optional Jig context.
+
+        Subclasses can override this when they need span or tool-call
+        metadata. The default preserves the original ``execute(args)``
+        contract for existing tools.
+        """
+        return await self.execute(args)

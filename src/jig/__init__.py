@@ -38,9 +38,11 @@ from jig.core import (
     Tool,
     ToolCall,
     ToolDefinition,
+    ToolExecutionContext,
     ToolResult,
     TracingLogger,
     Usage,
+    current_tool_context,
 )
 from jig.core.pipeline import map_pipeline, run_pipeline
 from jig.core.runner import AgentConfig, AgentResult, run_agent
@@ -117,9 +119,11 @@ __all__ = [
     "Tool",
     "ToolCall",
     "ToolDefinition",
+    "ToolExecutionContext",
     "ToolResult",
     "TracingLogger",
     "Usage",
+    "current_tool_context",
     # Errors
     "AgentAmbiguousTurnError",
     "AgentBudgetError",

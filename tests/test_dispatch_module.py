@@ -502,8 +502,8 @@ class TestRegistryTimeoutPlumbed:
         await reg.execute(ToolCall(
             id="c1", name="backtest", arguments={},
         ))
-        # int-coerced, matching dispatch_run's signature
-        assert captured["timeout_seconds"] == 42
+        # Rounded up so fractional registry timeouts are not shortened.
+        assert captured["timeout_seconds"] == 43
 
     async def test_no_timeout_omits_kwarg(self, monkeypatch):
         captured: dict[str, Any] = {}

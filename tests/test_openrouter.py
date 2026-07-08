@@ -85,6 +85,14 @@ class TestOpenRouterInit:
 
 
 class TestOpenRouterComplete:
+    def test_none_extra_body_is_normalized_before_usage_injection(self):
+        client = OpenRouterClient.__new__(OpenRouterClient)
+        kwargs = {"extra_body": None}
+
+        client._apply_extra_kwargs(kwargs)
+
+        assert kwargs["extra_body"] == {"usage": {"include": True}}
+
     async def test_complete_requests_inline_cost(self, monkeypatch):
         monkeypatch.setenv("OPENROUTER_API_KEY", "sk-x")
         with patch("jig.llm.openai.openai") as mock_openai:

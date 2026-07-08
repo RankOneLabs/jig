@@ -33,8 +33,10 @@ from jig.core.types import (
     ScoredResult,
     SpanKind,
     ToolCall,
+    ToolExecutionContext,
     ToolDefinition,
     TracingLogger,
+    current_tool_context,
 )
 from jig.tools.registry import ToolRegistry
 from jig.tracing.spans import span_guard
@@ -636,7 +638,18 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                 tool_span = config.tracer.start_span(
                     trace.id, SpanKind.TOOL_CALL, call.name, call.arguments
                 )
-                result = await config.tools.execute(call)
+                tool_context = ToolExecutionContext(
+                    trace_id=trace.trace_id,
+                    span_id=tool_span.id,
+                    parent_span_id=tool_span.parent_id,
+                    tool_call_id=call.id,
+                    metadata={"tool_name": call.name},
+                )
+                token = current_tool_context.set(tool_context)
+                try:
+                    result = await config.tools.execute(call)
+                finally:
+                    current_tool_context.reset(token)
                 # Full tool output is persisted (no truncation). Phase 11
                 # replay substitutes recorded tool outputs into a rerun of
                 # the agent loop — truncation would silently corrupt that

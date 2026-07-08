@@ -594,6 +594,17 @@ Tools return strings. If your tool produces structured data, serialize it — th
 
 Tools catch their own errors. If `execute()` raises, jig wraps the exception into a `ToolResult` with the error field set and passes it back to the LLM so it can recover.
 
+Tools that need trace or tool-call metadata can override
+`execute_with_context(args, context)` or read `current_tool_context.get()`
+inside `execute()`. The context carries `trace_id`, the active tool-call
+`span_id`, `parent_span_id`, `tool_call_id`, and optional metadata.
+
+For `Tool(dispatch=True)`, override
+`dispatch_payload_extra(context, arguments)` to add JSON-serializable
+fields to the dispatched payload. jig also forwards a `trace_context` to
+the dispatch client so worker-side spans can attach under the local
+tool-call span.
+
 ## Working with results
 
 ### `AgentResult`
