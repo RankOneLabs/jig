@@ -53,6 +53,7 @@ from jig.dispatch import run as dispatch_run
 from jig.dispatch import stop as dispatch_stop
 from jig.feedback import (
     CommitteeJudge,
+    NullFeedbackLoop,
     PairwiseLLMJudge,
     TrajectoryAssertion,
     TrajectoryGrader,
@@ -196,4 +197,6 @@ __all__ = [
     # Calibrated judges
     "CommitteeJudge",
     "PairwiseLLMJudge",
+    # Feedback loop implementations
+    "NullFeedbackLoop",
 ]
