@@ -581,3 +581,125 @@ async def test_map_pipeline_closes_parent_on_exception():
         assert "RuntimeError" in batch_root.error
         assert "item failed" in batch_root.error
         await tracer.close()
+
+
+# ---------------------------------------------------------------------------
+# Fail-soft grading: a grading failure must not abort the pipeline / batch,
+# and a feedback-persistence failure after a successful grade must not
+# discard the scores already computed.
+# ---------------------------------------------------------------------------
+
+
+class BrokenGrader(Grader):
+    async def grade(
+        self, input: Any, output: Any, context: dict[str, Any] | None = None
+    ) -> list[Score]:
+        raise RuntimeError("grader exploded")
+
+
+class BrokenStoreFeedback(FakeFeedback):
+    async def store_result(self, content: str, input_text: str, metadata: dict | None = None) -> str:
+        raise RuntimeError("feedback store exploded")
+
+
+async def test_per_step_grading_failure_does_not_stop_later_steps():
+    tracer = FakeTracer()
+    result = await run_pipeline(
+        PipelineConfig(
+            name="p",
+            steps=[
+                Step(name="add_one", fn=add_one, grader=BrokenGrader()),
+                Step(name="double", fn=double),
+                Step(name="to_string", fn=to_string),
+            ],
+            tracer=tracer,
+        ),
+        input=1,
+    )
+    assert result.step_outputs == {"add_one": 2, "double": 4, "to_string": "4"}
+    assert "add_one" not in result.step_scores
+    assert not result.short_circuited
+    assert result.error_step is None
+
+
+async def test_per_step_grading_failure_records_grading_error_on_span():
+    tracer = FakeTracer()
+    await run_pipeline(
+        PipelineConfig(
+            name="p",
+            steps=[Step(name="add_one", fn=add_one, grader=BrokenGrader())],
+            tracer=tracer,
+        ),
+        input=1,
+    )
+    grade_span = next(s for s in tracer.spans if s.name == "grade_add_one")
+    assert grade_span.error is not None
+    assert "RuntimeError" in grade_span.error
+    assert grade_span.output["scores"] == []
+    assert grade_span.output["grading_error"]["type"] == "RuntimeError"
+    assert "grader exploded" in grade_span.output["grading_error"]["message"]
+
+
+async def test_pipeline_level_grading_failure_does_not_fail_run_pipeline():
+    tracer = FakeTracer()
+    result = await run_pipeline(
+        PipelineConfig(
+            name="p",
+            steps=[Step(name="add_one", fn=add_one)],
+            tracer=tracer,
+            grader=BrokenGrader(),
+        ),
+        input=1,
+    )
+    assert result.output == 2
+    assert result.scores is None
+
+
+async def test_batch_grading_failure_does_not_discard_item_results():
+    tracer = FakeTracer()
+    result = await map_pipeline(
+        PipelineConfig(name="p", steps=[Step(name="add_one", fn=add_one)], tracer=tracer),
+        items=[1, 2, 3],
+        batch_grader=BrokenGrader(),
+    )
+    assert [r.output for r in result.results] == [2, 3, 4]
+    assert result.scores is None
+
+
+async def test_feedback_persistence_failure_after_grading_retains_scores():
+    tracer = FakeTracer()
+    feedback = BrokenStoreFeedback()
+    result = await run_pipeline(
+        PipelineConfig(
+            name="p",
+            steps=[Step(name="add_one", fn=add_one)],
+            tracer=tracer,
+            grader=FixedGrader(value=0.9),
+            feedback=feedback,
+        ),
+        input=1,
+    )
+    assert result.scores is not None
+    assert result.scores[0].value == 0.9
+
+    grade_span = next(s for s in tracer.spans if s.name == "pipeline_grade")
+    assert grade_span.error is None, "feedback persistence failure must not mark the span as errored"
+    assert "feedback_result_id" not in grade_span.output
+    assert grade_span.output["feedback_error"]["type"] == "RuntimeError"
+
+
+async def test_successful_grading_still_stores_and_scores_feedback():
+    tracer = FakeTracer()
+    feedback = FakeFeedback()
+    result = await run_pipeline(
+        PipelineConfig(
+            name="p",
+            steps=[Step(name="add_one", fn=add_one, grader=FixedGrader(value=0.5))],
+            tracer=tracer,
+            feedback=feedback,
+        ),
+        input=1,
+    )
+    assert result.step_scores["add_one"][0].value == 0.5
+    assert len(feedback.stored) == 1
+    assert len(feedback.scored) == 1

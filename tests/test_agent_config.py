@@ -271,3 +271,39 @@ class TestFeedbackSignalQueryConfig:
         assert kwargs["limit"] == 3
         assert kwargs["min_score"] == 0.7
         assert kwargs["source"] is None
+
+
+class _BrokenGrader(Grader):
+    async def grade(self, input, output, context=None):
+        raise RuntimeError("grader exploded")
+
+
+class TestFailSoftAutoGrade:
+    """A grading (or feedback-persistence) failure must not erase a
+    successful run_agent output."""
+
+    async def test_grader_exception_leaves_output_intact_and_scores_absent(self):
+        feedback = AsyncMock()
+        config = _base(llm=_FixedLLM(), feedback=feedback, grader=_BrokenGrader())
+        result = await run_agent(config, "hello")
+
+        assert result.output == "done"
+        assert result.error is None
+        assert result.scores is None
+        feedback.store_result.assert_not_awaited()
+
+    async def test_feedback_persistence_failure_retains_scores(self):
+        feedback = AsyncMock()
+        feedback.store_result = AsyncMock(side_effect=RuntimeError("store exploded"))
+
+        class _FixedGrader(Grader):
+            async def grade(self, input, output, context=None):
+                return [Score(dimension="q", value=0.8, source=_ScoreSource.HEURISTIC)]
+
+        config = _base(llm=_FixedLLM(), feedback=feedback, grader=_FixedGrader())
+        result = await run_agent(config, "hello")
+
+        assert result.output == "done"
+        assert result.error is None
+        assert result.scores is not None
+        assert result.scores[0].value == 0.8

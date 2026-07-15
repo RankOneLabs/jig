@@ -18,6 +18,7 @@ from jig.core.errors import (
     AgentSchemaValidationError,
     JigLLMError,
 )
+from jig.core.grading import grade_and_record
 from jig.core.prompt import build_system_message
 from jig.core.types import (
     CompletionParams,
@@ -733,51 +734,38 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
             # join against. Memory IDs and trace IDs are separate namespaces and
             # must not be used as the feedback result ID.
             if config.grader:
-                try:
-                    # Flush so trajectory graders can read pre-grade spans via
-                    # get_trace. SQLiteTracer retains unended spans (notably the
-                    # root) so _finalize_trace's end_span still works.
-                    await config.tracer.flush()
-                    with span_guard(
-                        config.tracer, trace.id, SpanKind.GRADING, "auto_grade",
-                        input={"input": input},
-                    ) as grade_span:
-                        grade_output: Any = parsed if parsed is not None else final_output
-                        scores = await config.grader.grade(
-                            input,
-                            grade_output,
-                            context={
-                                "raw_output": final_output,
-                                "trace_id": trace.trace_id,
-                            },
-                        )
-                        feedback_result_id: str | None = None
-                        if scores:
-                            fb_meta: dict[str, Any] = {
-                                "kind": "agent_result",
-                                "agent_name": config.name,
-                                "source": "run_agent",
-                                "trace_id": trace.trace_id,
-                            }
-                            model_id = _resolve_model_id(config.llm)
-                            if model_id is not None:
-                                fb_meta["model"] = model_id
-                            if config.session_id is not None:
-                                fb_meta["session_id"] = config.session_id
-                            if memory_id is not None:
-                                fb_meta["memory_id"] = memory_id
-                            feedback_result_id = await config.feedback.store_result(
-                                final_output, input, fb_meta
-                            )
-                            await config.feedback.score(feedback_result_id, scores)
-                        span_output: dict[str, Any] = {
-                            "scores": [{"dimension": s.dimension, "value": s.value} for s in scores],
-                        }
-                        if feedback_result_id is not None:
-                            span_output["feedback_result_id"] = feedback_result_id
-                        grade_span.finish(span_output)
-                except Exception:
-                    logger.exception("auto-grading failed after successful run (non-fatal)")
+                # Flush so trajectory graders can read pre-grade spans via
+                # get_trace. SQLiteTracer retains unended spans (notably the
+                # root) so _finalize_trace's end_span still works.
+                await config.tracer.flush()
+                grade_output: Any = parsed if parsed is not None else final_output
+                fb_meta: dict[str, Any] = {
+                    "kind": "agent_result",
+                    "agent_name": config.name,
+                    "source": "run_agent",
+                    "trace_id": trace.trace_id,
+                }
+                model_id = _resolve_model_id(config.llm)
+                if model_id is not None:
+                    fb_meta["model"] = model_id
+                if config.session_id is not None:
+                    fb_meta["session_id"] = config.session_id
+                if memory_id is not None:
+                    fb_meta["memory_id"] = memory_id
+                outcome = await grade_and_record(
+                    tracer=config.tracer,
+                    parent_span_id=trace.id,
+                    span_name="auto_grade",
+                    grader=config.grader,
+                    grade_input=input,
+                    grade_output=grade_output,
+                    grade_context={"raw_output": final_output, "trace_id": trace.trace_id},
+                    feedback=config.feedback,
+                    feedback_content=final_output,
+                    feedback_input_text=input,
+                    feedback_metadata=fb_meta,
+                )
+                scores = outcome.scores
     finally:
         # Always close the root span + flush the tracer, even if an
         # exception propagates mid-run. Buffered tracers (SQLiteTracer)
