@@ -176,11 +176,17 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         ``agent_name``, ``model``, and ``tags`` filter on fields the
         caller set via :meth:`store_result`'s metadata.
         """
-        db = await self._get_db()
+        # Compute the query embedding before taking the database lock —
+        # it can call out to an external embedding service and must not
+        # block writers/other readers while it does.
+        query_emb: np.ndarray | None = None
+        query_norm = 0.0
+        if q.similar_to is not None:
+            query_emb = await self._embed(q.similar_to)
+            query_norm = float(np.linalg.norm(query_emb))
+            if query_norm == 0:
+                return []
 
-        # Push max_age into SQL; JSON metadata filters stay in Python
-        # since SQLite JSON support is uneven across builds and the
-        # filter shapes are simple enough to be fast in-memory.
         base_sql = (
             "SELECT id, content, input, metadata, embedding, created_at "
             "FROM results"
@@ -191,77 +197,83 @@ class SQLiteFeedbackLoop(FeedbackLoop):
             base_sql += " WHERE created_at >= ?"
             params.append(cutoff_iso)
         base_sql += " ORDER BY created_at DESC"
-        rows = await (await db.execute(base_sql, params)).fetchall()
 
-        # Optional similarity ranking
-        query_emb: np.ndarray | None = None
-        query_norm = 0.0
-        if q.similar_to is not None:
-            query_emb = await self._embed(q.similar_to)
-            query_norm = float(np.linalg.norm(query_emb))
-            if query_norm == 0:
-                return []
+        async with self._get_db_lock():
+            db = await self._get_db()
+            await self._ensure_scores_metadata_column(db)
+            try:
+                await db.execute("BEGIN")
+                rows = await (await db.execute(base_sql, params)).fetchall()
 
-        # (similarity, rid, content, meta, created_at) — similarity=0 when not ranking
-        candidates: list[tuple[float, str, str, dict[str, Any], datetime]] = []
-        for rid, content, _inp, meta_json, emb_bytes, created_str in rows:
-            created = datetime.fromisoformat(created_str)
-            meta = json_loads(meta_json) if meta_json else {}
-            if q.agent_name is not None and meta.get("agent_name") != q.agent_name:
-                continue
-            if q.model is not None and meta.get("model") != q.model:
-                continue
-            if q.tags:
-                row_tags = meta.get("tags") or []
-                if not set(q.tags).intersection(row_tags):
-                    continue
+                # (similarity, rid, content, meta, created_at) — similarity=0 when not ranking
+                candidates: list[tuple[float, str, str, dict[str, Any], datetime]] = []
+                for rid, content, _inp, meta_json, emb_bytes, created_str in rows:
+                    created = datetime.fromisoformat(created_str)
+                    meta = json_loads(meta_json) if meta_json else {}
+                    if q.agent_name is not None and meta.get("agent_name") != q.agent_name:
+                        continue
+                    if q.model is not None and meta.get("model") != q.model:
+                        continue
+                    if q.tags:
+                        row_tags = meta.get("tags") or []
+                        if not set(q.tags).intersection(row_tags):
+                            continue
 
-            similarity = 0.0
-            if query_emb is not None:
-                if not emb_bytes:
-                    continue
-                row_emb = np.frombuffer(emb_bytes, dtype=np.float32)
-                row_norm = float(np.linalg.norm(row_emb))
-                if row_norm == 0:
-                    continue
-                similarity = float(np.dot(query_emb, row_emb) / (query_norm * row_norm))
-            candidates.append((similarity, rid, content, meta, created))
+                    similarity = 0.0
+                    if query_emb is not None:
+                        if not emb_bytes:
+                            continue
+                        row_emb = np.frombuffer(emb_bytes, dtype=np.float32)
+                        row_norm = float(np.linalg.norm(row_emb))
+                        if row_norm == 0:
+                            continue
+                        similarity = float(np.dot(query_emb, row_emb) / (query_norm * row_norm))
+                    candidates.append((similarity, rid, content, meta, created))
 
-        if query_emb is not None:
-            candidates.sort(key=lambda x: x[0], reverse=True)
-        # Without similarity, the initial ORDER BY created_at DESC already
-        # gave us recency order.
+                if query_emb is not None:
+                    candidates.sort(key=lambda x: x[0], reverse=True)
+                # Without similarity, the initial ORDER BY created_at DESC already
+                # gave us recency order.
+
+                score_rows: list[tuple[str, str, float, str, str | None]] = []
+                if candidates:
+                    # Pre-slice candidates before the batch fetch. Two reasons:
+                    #  1. SQLite has a bound-parameter limit (commonly 999); a
+                    #     very large corpus would exceed it.
+                    #  2. Most of ``candidates`` past the q.limit-th will get
+                    #     dropped by the min_score filter anyway, so fetching
+                    #     their scores is wasted work.
+                    # The factor-of-10 cushion covers min_score rejections; if
+                    # the filter is aggressive enough that we undershoot
+                    # q.limit, that's acceptable for v1 — properly chunking
+                    # with early exit is a follow-up when corpora grow past
+                    # ~100 results.
+                    window = min(len(candidates), max(q.limit * 10, 50), 900)
+                    candidates = candidates[:window]
+
+                    # Batch-fetch scores for every surviving candidate with a
+                    # single IN-list SELECT. Eliminates the per-row N+1 that
+                    # would grow linearly with corpus size.
+                    rids = [rid for _, rid, _, _, _ in candidates]
+                    placeholders = ",".join(["?"] * len(rids))
+                    score_rows = await (await db.execute(
+                        f"SELECT result_id, dimension, value, source, metadata FROM scores "
+                        f"WHERE result_id IN ({placeholders}) ORDER BY rowid ASC",
+                        rids,
+                    )).fetchall()
+                await db.commit()
+            except BaseException:
+                await _rollback_safely(db)
+                raise
 
         if not candidates:
             return []
 
-        # Pre-slice candidates before the batch fetch. Two reasons:
-        #  1. SQLite has a bound-parameter limit (commonly 999); a very
-        #     large corpus would exceed it.
-        #  2. Most of ``candidates`` past the q.limit-th will get dropped
-        #     by the min_score filter anyway, so fetching their scores
-        #     is wasted work.
-        # The factor-of-10 cushion covers min_score rejections; if the
-        # filter is aggressive enough that we undershoot q.limit, that's
-        # acceptable for v1 — properly chunking with early exit is a
-        # follow-up when corpora grow past ~100 results.
-        window = min(len(candidates), max(q.limit * 10, 50), 900)
-        candidates = candidates[:window]
-
-        # Batch-fetch scores for every surviving candidate with a single
-        # IN-list SELECT. Eliminates the per-row N+1 that would grow
-        # linearly with corpus size.
-        rids = [rid for _, rid, _, _, _ in candidates]
-        placeholders = ",".join(["?"] * len(rids))
-        score_rows = await (await db.execute(
-            f"SELECT result_id, dimension, value, source FROM scores "
-            f"WHERE result_id IN ({placeholders})",
-            rids,
-        )).fetchall()
         scores_by_rid: dict[str, list[Score]] = {}
-        for rid, dim, val, src in score_rows:
+        for rid, dim, val, src, score_meta_json in score_rows:
+            score_meta = json_loads(score_meta_json) if score_meta_json else None
             scores_by_rid.setdefault(rid, []).append(
-                Score(dimension=dim, value=val, source=ScoreSource(src))
+                Score(dimension=dim, value=val, source=ScoreSource(src), metadata=score_meta)
             )
 
         results: list[ScoredResult] = []
@@ -313,43 +325,73 @@ class SQLiteFeedbackLoop(FeedbackLoop):
                 f"min_score ({min_score}) must not exceed max_score ({max_score})"
             )
 
-        db = await self._get_db()
-        sql = "SELECT id, content, input, metadata, created_at FROM results"
+        # Single LEFT JOIN ordered by result creation then score rowid,
+        # replacing the former per-result N+1 score SELECT. Rows are
+        # materialized inside one locked read transaction so a concurrent
+        # score() batch can't produce a mixed before/after view.
+        sql = (
+            "SELECT r.id, r.content, r.input, r.metadata, r.created_at, "
+            "s.dimension, s.value, s.source, s.metadata, s.rowid "
+            "FROM results r LEFT JOIN scores s ON s.result_id = r.id"
+        )
         params: list[Any] = []
         if since:
-            sql += " WHERE created_at >= ?"
+            sql += " WHERE r.created_at >= ?"
             params.append(since.isoformat())
-        sql += " ORDER BY created_at DESC"
+        sql += " ORDER BY r.created_at DESC, s.rowid ASC"
 
-        # Full result set is materialized before filtering; acceptable for current corpus
-        # sizes. A windowed/streaming approach (like query()'s factor-of-10 window) is a
-        # known follow-up for large DBs.
-        rows = await (await db.execute(sql, params)).fetchall()
+        async with self._get_db_lock():
+            db = await self._get_db()
+            await self._ensure_scores_metadata_column(db)
+            try:
+                await db.execute("BEGIN")
+                rows = await (await db.execute(sql, params)).fetchall()
+                await db.commit()
+            except BaseException:
+                await _rollback_safely(db)
+                raise
+
+        # Group joined rows by result, preserving SQL order (result creation
+        # desc, then score rowid asc within each result).
+        order: list[str] = []
+        grouped: dict[str, dict[str, Any]] = {}
+        for rid, content, inp, meta_json, _created_at, dim, val, src, score_meta_json, _score_rowid in rows:
+            if rid not in grouped:
+                grouped[rid] = {"content": content, "input": inp, "meta_json": meta_json, "scores": []}
+                order.append(rid)
+            if dim is not None:
+                grouped[rid]["scores"].append((dim, val, src, score_meta_json))
 
         cases: list[EvalCase] = []
-        for rid, content, inp, meta_json, _ in rows:
-            score_rows = await (await db.execute(
-                "SELECT dimension, value, source FROM scores WHERE result_id = ?",
-                (rid,),
-            )).fetchall()
-
-            if not score_rows:
+        for rid in order:
+            entry = grouped[rid]
+            score_rows_for_result = entry["scores"]
+            if not score_rows_for_result:
                 # Unscored rows don't qualify when any score filter is active;
                 # also skip them unconditionally (consistent with query()).
                 continue
 
-            avg = sum(v for _, v, _ in score_rows) / len(score_rows)
+            avg = sum(val for _, val, _, _ in score_rows_for_result) / len(score_rows_for_result)
             if min_score is not None and avg < min_score:
                 continue
             if max_score is not None and avg > max_score:
                 continue
 
-            meta = json_loads(meta_json) if meta_json else {}
+            meta = json_loads(entry["meta_json"]) if entry["meta_json"] else {}
             meta["avg_score"] = avg
+            meta["scores"] = [
+                {
+                    "dimension": dim,
+                    "value": val,
+                    "source": src,
+                    "metadata": json_loads(score_meta_json) if score_meta_json else None,
+                }
+                for dim, val, src, score_meta_json in score_rows_for_result
+            ]
             cases.append(
                 EvalCase(
-                    input=inp,
-                    expected=content,
+                    input=entry["input"],
+                    expected=entry["content"],
                     metadata=meta,
                 )
             )

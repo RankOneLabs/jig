@@ -230,6 +230,35 @@ class TestExportEvalSet:
         result = await feedback_db.export_eval_set(min_score=0.5, limit=None)
         assert len(result) == 5
 
+    async def test_metadata_scores_summary_present_in_export(self, feedback_db):
+        rid = await feedback_db.store_result("content", "input", {})
+        await feedback_db.score(rid, [
+            Score("dim1", 0.8, ScoreSource.HEURISTIC, metadata={"offending_claim": "c1"}),
+            Score("dim2", 0.6, ScoreSource.LLM_JUDGE),
+        ])
+
+        result = await feedback_db.export_eval_set()
+        assert len(result) == 1
+        summary = result[0].metadata["scores"]
+        assert summary == [
+            {"dimension": "dim1", "value": 0.8, "source": "heuristic",
+             "metadata": {"offending_claim": "c1"}},
+            {"dimension": "dim2", "value": 0.6, "source": "llm_judge", "metadata": None},
+        ]
+        assert result[0].metadata["avg_score"] == pytest.approx(0.7)
+
+    async def test_metadata_scores_preserve_insertion_order(self, feedback_db):
+        rid = await feedback_db.store_result("content", "input", {})
+        await feedback_db.score(rid, [
+            Score("first", 0.1, ScoreSource.HEURISTIC),
+            Score("second", 0.2, ScoreSource.HEURISTIC),
+            Score("third", 0.3, ScoreSource.HEURISTIC),
+        ])
+
+        result = await feedback_db.export_eval_set()
+        dims = [s["dimension"] for s in result[0].metadata["scores"]]
+        assert dims == ["first", "second", "third"]
+
     async def test_since_filter_still_works(self, feedback_db):
         """Ensure the since filter composes with score filters correctly."""
         rid = await feedback_db.store_result("before", "i", {})
@@ -372,6 +401,60 @@ class TestScoreBatchAtomicity:
                 task.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+class TestAtomicReadSnapshot:
+    """query() and export_eval_set() must never observe a partial score batch."""
+
+    async def test_export_eval_set_never_sees_partial_score_batch(
+        self, feedback_db: SQLiteFeedbackLoop
+    ) -> None:
+        rid = await feedback_db.store_result("content", "input", {})
+        db = await feedback_db._get_db()
+
+        score_insert_started = asyncio.Event()
+        allow_score_insert = asyncio.Event()
+        original_execute = db.execute
+
+        async def blocking_execute(sql: str, params: Any = ()) -> Any:
+            if "INSERT INTO scores" in sql and "dim2" in str(params):
+                score_insert_started.set()
+                await allow_score_insert.wait()
+            return await original_execute(sql, params)
+
+        db.execute = blocking_execute  # type: ignore[method-assign]
+        score_task = asyncio.create_task(
+            feedback_db.score(
+                rid,
+                [
+                    Score("dim1", 0.5, ScoreSource.HEURISTIC),
+                    Score("dim2", 0.5, ScoreSource.HEURISTIC),
+                ],
+            )
+        )
+        try:
+            await asyncio.wait_for(score_insert_started.wait(), timeout=1)
+
+            read_task = asyncio.create_task(feedback_db.export_eval_set())
+            await asyncio.sleep(0)
+            assert not read_task.done(), (
+                "export_eval_set must block behind the in-flight score batch, "
+                "not interleave with it"
+            )
+
+            allow_score_insert.set()
+            await score_task
+            result = await read_task
+
+            assert len(result) == 1
+            assert len(result[0].metadata["scores"]) == 2
+        finally:
+            allow_score_insert.set()
+            db.execute = original_execute  # type: ignore[method-assign]
+            if not score_task.done():
+                score_task.cancel()
+                await asyncio.gather(score_task, return_exceptions=True)
 
 
 class TestFeedbackWriteLockLifecycle:
