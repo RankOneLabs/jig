@@ -4,11 +4,12 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 from datetime import datetime
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from pydantic import BaseModel
 
-from jig import AgentConfig, LLMResponse, Message, Score, ScoreSource
+from jig import AgentConfig, LLMResponse, Message, Score, ScoreSource, Usage, run_agent
 from jig.core.types import (
     MemoryStore,
     Retriever,
@@ -166,6 +167,33 @@ class TestValidation:
         with pytest.raises(ValueError, match="max_parse_retries"):
             _base(max_parse_retries=-1)
 
+    def test_feedback_limit_defaults_to_three(self):
+        assert _base().feedback_limit == 3
+
+    def test_feedback_min_score_defaults_to_point_seven(self):
+        assert _base().feedback_min_score == 0.7
+
+    def test_feedback_source_defaults_to_none(self):
+        assert _base().feedback_source is None
+
+    def test_rejects_non_positive_feedback_limit(self):
+        with pytest.raises(ValueError, match="feedback_limit"):
+            _base(feedback_limit=0)
+        with pytest.raises(ValueError, match="feedback_limit"):
+            _base(feedback_limit=-1)
+
+    def test_rejects_bool_feedback_limit(self):
+        with pytest.raises(ValueError, match="feedback_limit"):
+            _base(feedback_limit=True)
+
+    def test_rejects_non_integer_feedback_limit(self):
+        with pytest.raises(ValueError, match="feedback_limit"):
+            _base(feedback_limit=1.5)
+
+    def test_accepts_explicit_feedback_source(self):
+        config = _base(feedback_source=_ScoreSource.HUMAN)
+        assert config.feedback_source == _ScoreSource.HUMAN
+
 
 class TestKeywordOnly:
     def test_positional_args_rejected(self):
@@ -201,3 +229,45 @@ class TestTypedGraderVariant:
         variant = base.with_(max_tool_calls=5)
         assert isinstance(variant.grader, MyGrader)
         assert variant.output_schema is Out
+
+
+class _FixedLLM(LLMClient):
+    async def complete(self, params: CompletionParams) -> LLMResponse:
+        return LLMResponse(
+            content="done", tool_calls=None, usage=Usage(1, 1, cost=0.0),
+            latency_ms=1, model="fixed",
+        )
+
+
+class TestFeedbackSignalQueryConfig:
+    """run_agent forwards feedback_limit/feedback_min_score/feedback_source verbatim."""
+
+    async def test_get_signals_called_with_configured_params(self):
+        feedback = AsyncMock()
+        feedback.get_signals = AsyncMock(return_value=[])
+        config = _base(
+            llm=_FixedLLM(),
+            feedback=feedback,
+            include_feedback_in_prompt=True,
+            feedback_limit=7,
+            feedback_min_score=0.42,
+            feedback_source=_ScoreSource.HUMAN,
+        )
+        await run_agent(config, "hello")
+
+        feedback.get_signals.assert_awaited_once()
+        _, kwargs = feedback.get_signals.call_args
+        assert kwargs["limit"] == 7
+        assert kwargs["min_score"] == 0.42
+        assert kwargs["source"] == _ScoreSource.HUMAN
+
+    async def test_get_signals_uses_defaults_when_unset(self):
+        feedback = AsyncMock()
+        feedback.get_signals = AsyncMock(return_value=[])
+        config = _base(llm=_FixedLLM(), feedback=feedback, include_feedback_in_prompt=True)
+        await run_agent(config, "hello")
+
+        _, kwargs = feedback.get_signals.call_args
+        assert kwargs["limit"] == 3
+        assert kwargs["min_score"] == 0.7
+        assert kwargs["source"] is None

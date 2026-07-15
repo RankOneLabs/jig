@@ -24,6 +24,7 @@ from jig.core.types import (
     LLMClient,
     MemoryStore,
     Retriever,
+    ScoreSource,
     TracingLogger,
 )
 from jig.replay.errors import ReplaySchemaMismatchError
@@ -198,6 +199,13 @@ def reconstruct_config(
         include_feedback_in_prompt=snapshot.get("include_feedback_in_prompt", True),
         session_id=snapshot.get("session_id"),
         output_schema=output_schema,
+        feedback_limit=snapshot.get("feedback_limit", 3),
+        feedback_min_score=snapshot.get("feedback_min_score", 0.7),
+        feedback_source=(
+            ScoreSource(snapshot["feedback_source"])
+            if snapshot.get("feedback_source") is not None
+            else None
+        ),
     )
 
     if override_dict:

@@ -30,6 +30,7 @@ from jig.core.types import (
     Retriever,
     Role,
     Score,
+    ScoreSource,
     ScoredResult,
     SpanKind,
     ToolCall,
@@ -96,6 +97,15 @@ class AgentConfig[T]:
     include_feedback_in_prompt: bool = True
     session_id: str | None = None
 
+    # --- Feedback signal query ---
+    # Parameters for the ``feedback.get_signals`` call made when
+    # ``include_feedback_in_prompt`` is set. Explicit fields make the
+    # previously-hardcoded run_agent query parameters configurable per
+    # config rather than fixed at limit=3, min_score=0.7.
+    feedback_limit: int = 3
+    feedback_min_score: float = 0.7
+    feedback_source: ScoreSource | None = None
+
     # --- Structured output ---
     # Pydantic model the agent should produce. When set, the runner injects a
     # ``submit_output`` tool with the model's JSON schema; the loop ends when
@@ -123,6 +133,14 @@ class AgentConfig[T]:
         if self.max_parse_retries < 0:
             raise ValueError(
                 f"max_parse_retries must be non-negative, got {self.max_parse_retries}."
+            )
+        if (
+            isinstance(self.feedback_limit, bool)
+            or not isinstance(self.feedback_limit, int)
+            or self.feedback_limit < 1
+        ):
+            raise ValueError(
+                f"feedback_limit must be a positive int, got {self.feedback_limit!r}."
             )
 
     def with_(self, **overrides: Any) -> AgentConfig[T]:
@@ -223,6 +241,9 @@ def _serialize_config_snapshot(config: AgentConfig[Any]) -> dict[str, Any]:
         "include_feedback_in_prompt": config.include_feedback_in_prompt,
         "session_id": config.session_id,
         "output_schema": schema_fqn,
+        "feedback_limit": config.feedback_limit,
+        "feedback_min_score": config.feedback_min_score,
+        "feedback_source": config.feedback_source.value if config.feedback_source else None,
         # The LLMClient itself isn't JSON-serializable (live object,
         # gets dropped to ``null`` by _safe_json), so stamp the model
         # slug alongside it. Every shipped adapter sets ``self._model``;
@@ -350,8 +371,16 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                 config.tracer, trace.id, SpanKind.MEMORY_QUERY, "query_feedback",
                 input={"query": input},
             ) as fb_span:
-                logger.debug("feedback.get_signals start (limit=3, min_score=0.7)")
-                feedback_signals = await config.feedback.get_signals(input, limit=3, min_score=0.7)
+                logger.debug(
+                    "feedback.get_signals start (limit=%d, min_score=%s, source=%s)",
+                    config.feedback_limit, config.feedback_min_score, config.feedback_source,
+                )
+                feedback_signals = await config.feedback.get_signals(
+                    input,
+                    limit=config.feedback_limit,
+                    min_score=config.feedback_min_score,
+                    source=config.feedback_source,
+                )
                 logger.debug("feedback.get_signals done (signals=%d)", len(feedback_signals))
                 fb_span.finish([s.content[:100] for s in feedback_signals])
 
