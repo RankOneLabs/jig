@@ -36,3 +36,23 @@ Back up production feedback databases before deleting rows. If orphan scores
 carry information you need to preserve, export them first and decide whether to
 re-ingest them by creating explicit feedback results with the right content,
 input, and metadata.
+
+## Score metadata column
+
+`scores` now has a nullable `metadata` JSON column for per-dimension causal
+detail (e.g. an offending claim, a missing piece of context). It's added
+automatically — `SQLiteFeedbackLoop` checks for it via `PRAGMA table_info`
+on first use and runs `ALTER TABLE scores ADD COLUMN metadata JSON` once if
+absent. No manual migration step is required, and every historical score
+row is left with `metadata = NULL`, which `Score.metadata` reads back as
+`None` (distinct from an explicitly-stored empty object).
+
+## Timestamps
+
+New `results.created_at` and `scores.created_at` values are written as
+aware UTC (`datetime.now(UTC).isoformat()`, e.g. `...+00:00`). Rows written
+by older versions have naive timestamps with no offset; these are not
+rewritten, but `query()` and any span reads interpret them as UTC when
+constructing `datetime` objects — a database is never read back as a mix of
+naive and aware values from the same call. `export_eval_set(since=...)`
+requires an aware `datetime` and raises `ValueError` on a naive one.

@@ -375,12 +375,26 @@ Stores quality scores against past outputs. Serves two purposes:
 | Adapter | Backend | Notes |
 |---------|---------|-------|
 | `SQLiteFeedbackLoop` | SQLite + Ollama embeddings | Uses cosine similarity to find relevant past results. |
+| `NullFeedbackLoop` | none (no I/O) | `store_result`/`score` are no-ops; `get_signals`/`query`/`export_eval_set` return `[]`. Satisfies `AgentConfig.feedback` without creating a SQLite file — useful for hermetic tests and scripted sweeps. |
 
 ```python
-from jig.feedback import SQLiteFeedbackLoop
+from jig import SQLiteFeedbackLoop, NullFeedbackLoop
 
 feedback = SQLiteFeedbackLoop(db_path="./data/feedback.db")
+# or, when persistence isn't needed:
+feedback = NullFeedbackLoop()
 ```
+
+`Score` carries an optional `metadata: dict | None` field for per-dimension
+causal detail (e.g. which claim was unsupported, what context was missing).
+It round-trips through `SQLiteFeedbackLoop.query()` and is included in
+`export_eval_set()`'s per-case `metadata["scores"]` list.
+
+Grading is fail-soft: if a `Grader` raises or returns invalid scores, the
+run's output is unaffected — the result's score field is simply left absent
+(`None`, or no entry) rather than the whole run failing. A feedback-store
+failure *after* a successful grade doesn't discard the scores either; only
+persistence (and `feedback_result_id`) is affected.
 
 #### `tracer: TracingLogger`
 
@@ -554,6 +568,21 @@ Set to `False` to skip the memory query step. Useful for agents where past conte
 **Default: `True`**
 
 Set to `False` to skip injecting quality signals. Useful early on when the feedback database is empty, or for agents where past scores aren't informative.
+
+#### `feedback_limit: int`, `feedback_min_score: float`, `feedback_source: ScoreSource | None`
+
+**Defaults: `3`, `0.7`, `None`**
+
+Parameters for the `feedback.get_signals()` call `run_agent` makes when `include_feedback_in_prompt` is set — how many past results to pull in, the minimum average score to consider, and (optionally) restrict to scores from one `ScoreSource`. Replayed runs preserve the original values via the config snapshot.
+
+```python
+config = AgentConfig(
+    feedback_limit=5,
+    feedback_min_score=0.5,
+    feedback_source=ScoreSource.HUMAN,
+    # ...
+)
+```
 
 #### `max_tool_calls: int`
 
