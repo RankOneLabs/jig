@@ -201,9 +201,15 @@ class SQLiteTracer(TracingLogger):
         limit: int = 50,
         name: str | None = None,
     ) -> list[Span]:
+        """List trace roots: top-level AGENT_RUN or PIPELINE_RUN spans.
+
+        Only spans with ``parent_id IS NULL`` qualify — a nested
+        ``PIPELINE_RUN`` (e.g. each item run by ``map_pipeline``) has a
+        parent span and is not itself a trace root, so it's excluded.
+        """
         db = await self._get_db()
-        query = "SELECT * FROM spans WHERE kind = ?"
-        params: list[Any] = [SpanKind.AGENT_RUN.value]
+        query = "SELECT * FROM spans WHERE parent_id IS NULL AND kind IN (?, ?)"
+        params: list[Any] = [SpanKind.AGENT_RUN.value, SpanKind.PIPELINE_RUN.value]
         if since:
             query += " AND started_at >= ?"
             params.append(since.isoformat())

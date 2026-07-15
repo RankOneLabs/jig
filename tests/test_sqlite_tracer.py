@@ -28,7 +28,8 @@ async def test_flush_writes_spans(tracer: SQLiteTracer) -> None:
     await tracer.flush()
 
     traces = await tracer.list_traces()
-    assert len(traces) == 0  # list_traces filters by AGENT_RUN
+    assert len(traces) == 1  # list_traces includes root PIPELINE_RUN spans
+    assert traces[0].name == "test-pipeline"
 
     spans = await tracer.get_trace(span.trace_id)
     assert len(spans) == 1
@@ -163,6 +164,49 @@ async def test_pipeline_with_sqlite_tracer(tracer: SQLiteTracer) -> None:
     assert kinds.count(SpanKind.PIPELINE_RUN) == 1
     assert kinds.count(SpanKind.PIPELINE_STEP) == 2
     await tracer.close()
+
+
+@pytest.mark.asyncio
+async def test_list_traces_includes_agent_run_and_pipeline_run_roots(
+    tracer: SQLiteTracer,
+) -> None:
+    agent_span = tracer.start_trace("agent", kind=SpanKind.AGENT_RUN)
+    tracer.end_span(agent_span.id)
+    pipeline_span = tracer.start_trace("pipeline", kind=SpanKind.PIPELINE_RUN)
+    tracer.end_span(pipeline_span.id)
+    await tracer.flush()
+
+    traces = await tracer.list_traces()
+    names = {t.name for t in traces}
+    assert names == {"agent", "pipeline"}
+
+
+@pytest.mark.asyncio
+async def test_list_traces_excludes_nested_pipeline_run(tracer: SQLiteTracer) -> None:
+    """A map_pipeline item's PIPELINE_RUN has a parent_id and isn't a root."""
+    parent = tracer.start_trace("batch", kind=SpanKind.PIPELINE_RUN)
+    nested = tracer.start_span(parent.id, SpanKind.PIPELINE_RUN, "item-0")
+    tracer.end_span(nested.id)
+    tracer.end_span(parent.id)
+    await tracer.flush()
+
+    traces = await tracer.list_traces()
+    names = [t.name for t in traces]
+    assert names == ["batch"]
+
+
+@pytest.mark.asyncio
+async def test_list_traces_excludes_pipeline_step_and_other_kinds(
+    tracer: SQLiteTracer,
+) -> None:
+    root = tracer.start_trace("agent", kind=SpanKind.AGENT_RUN)
+    step = tracer.start_span(root.id, SpanKind.PIPELINE_STEP, "step-0")
+    tracer.end_span(step.id)
+    tracer.end_span(root.id)
+    await tracer.flush()
+
+    traces = await tracer.list_traces()
+    assert [t.name for t in traces] == ["agent"]
 
 
 @pytest.mark.asyncio
