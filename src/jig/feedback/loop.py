@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import aiosqlite
 import numpy as np
 
 from jig._embed import ollama_embed
-from jig._sqlite import LazyConnection, json_dumps, json_loads
+from jig._sqlite import LazyConnection, json_dumps, json_loads, parse_aware_utc
 from jig.feedback.validation import validate_scores
 from jig.core.types import (
     EvalCase,
@@ -111,7 +111,7 @@ class SQLiteFeedbackLoop(FeedbackLoop):
                         input_text,
                         json_dumps(metadata or {}),
                         embedding.tobytes(),
-                        datetime.now().isoformat(),
+                        datetime.now(UTC).isoformat(),
                     ),
                 )
                 await db.commit()
@@ -137,7 +137,7 @@ class SQLiteFeedbackLoop(FeedbackLoop):
                     f"Score.metadata for dimension {s.dimension!r} is not "
                     f"JSON-serializable: {exc}"
                 ) from exc
-        now = datetime.now().isoformat()
+        now = datetime.now(UTC).isoformat()
         async with self._get_db_lock():
             db = await self._get_db()
             await self._ensure_scores_metadata_column(db)
@@ -193,7 +193,7 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         )
         params: list[Any] = []
         if q.max_age is not None:
-            cutoff_iso = (datetime.now() - q.max_age).isoformat()
+            cutoff_iso = (datetime.now(UTC) - q.max_age).isoformat()
             base_sql += " WHERE created_at >= ?"
             params.append(cutoff_iso)
         base_sql += " ORDER BY created_at DESC"
@@ -208,7 +208,7 @@ class SQLiteFeedbackLoop(FeedbackLoop):
                 # (similarity, rid, content, meta, created_at) — similarity=0 when not ranking
                 candidates: list[tuple[float, str, str, dict[str, Any], datetime]] = []
                 for rid, content, _inp, meta_json, emb_bytes, created_str in rows:
-                    created = datetime.fromisoformat(created_str)
+                    created = parse_aware_utc(created_str)
                     meta = json_loads(meta_json) if meta_json else {}
                     if q.agent_name is not None and meta.get("agent_name") != q.agent_name:
                         continue
@@ -324,6 +324,10 @@ class SQLiteFeedbackLoop(FeedbackLoop):
             raise ValueError(
                 f"min_score ({min_score}) must not exceed max_score ({max_score})"
             )
+        if since is not None and since.tzinfo is None:
+            raise ValueError(
+                "export_eval_set since must be an aware datetime, got a naive one"
+            )
 
         # Single LEFT JOIN ordered by result creation then score rowid,
         # replacing the former per-result N+1 score SELECT. Rows are
@@ -337,7 +341,7 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         params: list[Any] = []
         if since:
             sql += " WHERE r.created_at >= ?"
-            params.append(since.isoformat())
+            params.append(since.astimezone(UTC).isoformat())
         sql += " ORDER BY r.created_at DESC, s.rowid ASC"
 
         async with self._get_db_lock():

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import aiosqlite
@@ -264,13 +264,17 @@ class TestExportEvalSet:
         rid = await feedback_db.store_result("before", "i", {})
         await feedback_db.score(rid, [Score("q", 0.9, ScoreSource.HEURISTIC)])
 
-        cutoff = datetime.now()
+        cutoff = datetime.now(UTC)
 
         rid2 = await feedback_db.store_result("after", "i", {})
         await feedback_db.score(rid2, [Score("q", 0.9, ScoreSource.HEURISTIC)])
 
         result = await feedback_db.export_eval_set(since=cutoff, min_score=0.5)
         assert [c.expected for c in result] == ["after"]
+
+    async def test_since_naive_datetime_rejected(self, feedback_db):
+        with pytest.raises(ValueError, match="aware datetime"):
+            await feedback_db.export_eval_set(since=datetime.now())
 
 
 # ---------------------------------------------------------------------------

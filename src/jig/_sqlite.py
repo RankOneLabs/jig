@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from typing import Any
 
 import aiosqlite
@@ -68,3 +69,17 @@ def json_dumps(obj: Any) -> str:
 
 def json_loads(s: str) -> Any:
     return json.loads(s)
+
+
+def parse_aware_utc(s: str) -> datetime:
+    """Parse an ISO timestamp, treating a legacy naive string as UTC.
+
+    New rows are always written with ``datetime.now(UTC).isoformat()``
+    (a ``+00:00`` offset). Rows written before this existed have no
+    offset — their original timezone can't be reconstructed, so they're
+    interpreted as UTC on read without rewriting the stored value.
+    """
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)

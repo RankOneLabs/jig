@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from jig.core.types import Span, SpanKind, TracingLogger, Usage
@@ -45,7 +45,7 @@ class StdoutTracer(TracingLogger):
             trace_id=trace_id,
             kind=kind,
             name=name,
-            started_at=datetime.now(),
+            started_at=datetime.now(UTC),
             metadata=metadata,
         )
         self._spans[span_id] = span
@@ -70,7 +70,7 @@ class StdoutTracer(TracingLogger):
             trace_id=trace_id,
             kind=kind,
             name=name,
-            started_at=datetime.now(),
+            started_at=datetime.now(UTC),
             parent_id=parent_id,
             input=input,
             metadata=metadata,
@@ -85,7 +85,7 @@ class StdoutTracer(TracingLogger):
         span = self._spans.get(span_id)
         if not span:
             return
-        span.ended_at = datetime.now()
+        span.ended_at = datetime.now(UTC)
         span.duration_ms = (span.ended_at - span.started_at).total_seconds() * 1000
         span.output = output
         span.error = error
