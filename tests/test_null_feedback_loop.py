@@ -1,10 +1,12 @@
 """Tests for the no-I/O NullFeedbackLoop."""
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 from jig import NullFeedbackLoop
-from jig.core.types import FeedbackQuery, Score, ScoreSource
+from jig.core.types import FeedbackLoop, FeedbackQuery, Score, ScoreSource
 from jig.feedback.null import NullFeedbackLoop as NullFeedbackLoopDirect
 
 
@@ -43,3 +45,13 @@ class TestNullFeedbackLoop:
 
     async def test_top_level_and_submodule_exports_are_the_same_class(self):
         assert NullFeedbackLoop is NullFeedbackLoopDirect
+
+
+def test_store_result_metadata_annotation_matches_protocol():
+    """The override's metadata param must not narrow FeedbackLoop's
+    dict[str, Any] | None — dict is invariant, so a narrower type
+    (e.g. dict[str, object]) breaks callers passing concretely-typed
+    dicts under static analysis."""
+    base_param = inspect.signature(FeedbackLoop.store_result).parameters["metadata"]
+    override_param = inspect.signature(NullFeedbackLoop.store_result).parameters["metadata"]
+    assert override_param.annotation == base_param.annotation

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import aiosqlite
@@ -180,6 +180,27 @@ async def test_list_traces_includes_agent_run_and_pipeline_run_roots(
     traces = await tracer.list_traces()
     names = {t.name for t in traces}
     assert names == {"agent", "pipeline"}
+
+
+@pytest.mark.asyncio
+async def test_list_traces_since_normalizes_non_utc_offset(tracer: SQLiteTracer) -> None:
+    """A since filter with a non-UTC offset must compare correctly against
+    UTC-stored timestamps, not be compared as raw mismatched-offset text."""
+    span = tracer.start_trace("agent", kind=SpanKind.AGENT_RUN)
+    tracer.end_span(span.id)
+    await tracer.flush()
+
+    stored_utc = span.started_at.astimezone(UTC)
+    # Same instant, expressed in a +05:00 offset — well before the actual
+    # UTC-stored timestamp) once correctly normalized.
+    since_plus5 = (stored_utc - timedelta(minutes=1)).astimezone(timezone(timedelta(hours=5)))
+
+    traces = await tracer.list_traces(since=since_plus5)
+    assert [t.name for t in traces] == ["agent"]
+
+    since_after = (stored_utc + timedelta(minutes=1)).astimezone(timezone(timedelta(hours=5)))
+    traces_after = await tracer.list_traces(since=since_after)
+    assert traces_after == []
 
 
 @pytest.mark.asyncio

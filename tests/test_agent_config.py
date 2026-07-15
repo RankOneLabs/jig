@@ -307,3 +307,21 @@ class TestFailSoftAutoGrade:
         assert result.error is None
         assert result.scores is not None
         assert result.scores[0].value == 0.8
+
+    async def test_grader_returning_non_list_leaves_output_intact_and_scores_absent(self):
+        """A misbehaving grader returning None/non-list must not crash
+        run_agent while building the grade span output — it's treated as a
+        grading failure like any other, not a silent success with garbage."""
+        feedback = AsyncMock()
+
+        class _NoneReturningGrader(Grader):
+            async def grade(self, input, output, context=None):
+                return None  # type: ignore[return-value]
+
+        config = _base(llm=_FixedLLM(), feedback=feedback, grader=_NoneReturningGrader())
+        result = await run_agent(config, "hello")
+
+        assert result.output == "done"
+        assert result.error is None
+        assert result.scores is None
+        feedback.store_result.assert_not_awaited()

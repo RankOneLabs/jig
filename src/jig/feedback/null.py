@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Any
 
 from jig.core.types import EvalCase, FeedbackLoop, FeedbackQuery, Score, ScoreSource, ScoredResult
 
@@ -20,7 +21,7 @@ class NullFeedbackLoop(FeedbackLoop):
         self,
         content: str,
         input_text: str,
-        metadata: dict[str, object] | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> str:
         return str(uuid.uuid4())
 

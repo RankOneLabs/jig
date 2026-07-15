@@ -69,6 +69,10 @@ async def grade_and_record(
 
     try:
         scores = await grader.grade(grade_input, grade_output, grade_context)
+        if not isinstance(scores, list):
+            raise TypeError(
+                f"grader returned {type(scores).__name__}, expected list[Score]"
+            )
         if scores:
             validate_scores(scores)
     except Exception as exc:

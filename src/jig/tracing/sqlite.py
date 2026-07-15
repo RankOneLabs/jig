@@ -211,8 +211,14 @@ class SQLiteTracer(TracingLogger):
         query = "SELECT * FROM spans WHERE parent_id IS NULL AND kind IN (?, ?)"
         params: list[Any] = [SpanKind.AGENT_RUN.value, SpanKind.PIPELINE_RUN.value]
         if since:
+            # Normalize to UTC before comparing against stored UTC strings —
+            # a non-UTC-offset aware datetime would otherwise compare
+            # incorrectly against lexicographically-sorted TEXT timestamps.
+            # A naive input is treated as UTC, matching parse_aware_utc's
+            # read-side interpretation of legacy naive rows.
+            since_utc = since if since.tzinfo is not None else since.replace(tzinfo=UTC)
             query += " AND started_at >= ?"
-            params.append(since.isoformat())
+            params.append(since_utc.astimezone(UTC).isoformat())
         if name:
             query += " AND name = ?"
             params.append(name)
