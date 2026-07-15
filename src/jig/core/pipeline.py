@@ -7,8 +7,8 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Awaitable
 
+from jig.core.grading import grade_and_record
 from jig.core.types import FeedbackLoop, Grader, Score, SpanKind, TracingLogger
-from jig.tracing.spans import span_guard
 
 logger = logging.getLogger(__name__)
 
@@ -148,95 +148,70 @@ async def run_pipeline(
 
             config.tracer.end_span(step_span.id, output=result)
 
-            # Per-step grading
+            # Per-step grading — fail-soft: a grading failure does not stop
+            # later pipeline steps.
             if step.grader:
                 # Flush so trajectory graders see spans for this and
                 # prior steps via get_trace. The pipeline root stays
                 # in _spans (still unended) for the close at step 5.
                 await config.tracer.flush()
-                grade_span = config.tracer.start_span(
-                    root.id, SpanKind.GRADING, f"grade_{step.name}"
+                step_meta: dict[str, Any] = {
+                    "kind": "pipeline_step_result",
+                    "pipeline_name": config.name,
+                    "step_name": step.name,
+                    "trace_id": trace_id,
+                }
+                if config.metadata:
+                    for _k in ("source", "tags", "model"):
+                        if _k in config.metadata:
+                            step_meta[_k] = config.metadata[_k]
+                step_outcome = await grade_and_record(
+                    tracer=config.tracer,
+                    parent_span_id=root.id,
+                    span_name=f"grade_{step.name}",
+                    grader=step.grader,
+                    grade_input=input,
+                    grade_output=result,
+                    grade_context=ctx,
+                    feedback=config.feedback,
+                    feedback_content=_serialize_for_feedback(result, config.feedback_serializer),
+                    feedback_input_text=_serialize_for_feedback(input, config.feedback_serializer),
+                    feedback_metadata=step_meta,
                 )
-                try:
-                    scores = await step.grader.grade(input, result, ctx)
-                    step_scores[step.name] = scores
+                if step_outcome.scores is not None:
+                    step_scores[step.name] = step_outcome.scores
 
-                    step_feedback_id: str | None = None
-                    if config.feedback and scores:
-                        step_meta: dict[str, Any] = {
-                            "kind": "pipeline_step_result",
-                            "pipeline_name": config.name,
-                            "step_name": step.name,
-                            "trace_id": trace_id,
-                        }
-                        if config.metadata:
-                            for _k in ("source", "tags", "model"):
-                                if _k in config.metadata:
-                                    step_meta[_k] = config.metadata[_k]
-                        step_feedback_id = await config.feedback.store_result(
-                            _serialize_for_feedback(result, config.feedback_serializer),
-                            _serialize_for_feedback(input, config.feedback_serializer),
-                            step_meta,
-                        )
-                        await config.feedback.score(step_feedback_id, scores)
-
-                    step_span_out: dict[str, Any] = {
-                        "scores": [{"dimension": s.dimension, "value": s.value} for s in scores]
-                    }
-                    if step_feedback_id is not None:
-                        step_span_out["feedback_result_id"] = step_feedback_id
-                    config.tracer.end_span(grade_span.id, output=step_span_out)
-                except Exception as exc:
-                    config.tracer.end_span(grade_span.id, error=str(exc))
-                    raise
-
-        # 4. Pipeline-level grading
+        # 4. Pipeline-level grading — fail-soft: a grading failure does not
+        # fail run_pipeline.
         pipeline_scores: list[Score] | None = None
         if config.grader and not short_circuited:
             # Flush so trajectory graders see all step spans via
             # get_trace. End-step spans are already terminal; the
             # pipeline root remains in _spans for the close in step 5.
             await config.tracer.flush()
-            grade_span = config.tracer.start_span(
-                root.id, SpanKind.GRADING, "pipeline_grade"
+            pl_meta: dict[str, Any] = {
+                "kind": "pipeline_result",
+                "pipeline_name": config.name,
+                "trace_id": trace_id,
+            }
+            if config.metadata:
+                for _k in ("source", "tags", "model"):
+                    if _k in config.metadata:
+                        pl_meta[_k] = config.metadata[_k]
+            pipeline_outcome = await grade_and_record(
+                tracer=config.tracer,
+                parent_span_id=root.id,
+                span_name="pipeline_grade",
+                grader=config.grader,
+                grade_input=input,
+                grade_output=last_output,
+                grade_context={"raw_output": last_output, "trace_id": trace_id},
+                feedback=config.feedback,
+                feedback_content=_serialize_for_feedback(last_output, config.feedback_serializer),
+                feedback_input_text=_serialize_for_feedback(input, config.feedback_serializer),
+                feedback_metadata=pl_meta,
             )
-            try:
-                pipeline_scores = await config.grader.grade(
-                    input,
-                    last_output,
-                    context={
-                        "raw_output": last_output,
-                        "trace_id": trace_id,
-                    },
-                )
-
-                pipeline_feedback_id: str | None = None
-                if config.feedback and pipeline_scores:
-                    pl_meta: dict[str, Any] = {
-                        "kind": "pipeline_result",
-                        "pipeline_name": config.name,
-                        "trace_id": trace_id,
-                    }
-                    if config.metadata:
-                        for _k in ("source", "tags", "model"):
-                            if _k in config.metadata:
-                                pl_meta[_k] = config.metadata[_k]
-                    pipeline_feedback_id = await config.feedback.store_result(
-                        _serialize_for_feedback(last_output, config.feedback_serializer),
-                        _serialize_for_feedback(input, config.feedback_serializer),
-                        pl_meta,
-                    )
-                    await config.feedback.score(pipeline_feedback_id, pipeline_scores)
-
-                pl_span_out: dict[str, Any] = {
-                    "scores": [{"dimension": s.dimension, "value": s.value} for s in pipeline_scores]
-                }
-                if pipeline_feedback_id is not None:
-                    pl_span_out["feedback_result_id"] = pipeline_feedback_id
-                config.tracer.end_span(grade_span.id, output=pl_span_out)
-            except Exception as exc:
-                config.tracer.end_span(grade_span.id, error=str(exc))
-                raise
+            pipeline_scores = pipeline_outcome.scores
 
     except Exception as exc:
         config.tracer.end_span(root.id, error=f"{type(exc).__name__}: {exc}")
@@ -293,23 +268,22 @@ async def map_pipeline(
             )
             results.append(result)
 
-        # Batch grading
+        # Batch grading — fail-soft: a batch grading failure does not
+        # discard completed item results.
         batch_scores: list[Score] | None = None
         if batch_grader:
             await config.tracer.flush()
-            with span_guard(config.tracer, parent.id, SpanKind.GRADING, "batch_grade") as grade_span:
-                all_outputs = [r.output for r in results]
-                batch_scores = await batch_grader.grade(
-                    items,
-                    all_outputs,
-                    context={
-                        "raw_output": all_outputs,
-                        "trace_id": parent.trace_id,
-                    },
-                )
-                grade_span.finish(
-                    output={"scores": [{"dimension": s.dimension, "value": s.value} for s in batch_scores]},
-                )
+            all_outputs = [r.output for r in results]
+            batch_outcome = await grade_and_record(
+                tracer=config.tracer,
+                parent_span_id=parent.id,
+                span_name="batch_grade",
+                grader=batch_grader,
+                grade_input=items,
+                grade_output=all_outputs,
+                grade_context={"raw_output": all_outputs, "trace_id": parent.trace_id},
+            )
+            batch_scores = batch_outcome.scores
 
         duration = (time.time() - start) * 1000
         config.tracer.end_span(parent.id, output={"item_count": len(results)})

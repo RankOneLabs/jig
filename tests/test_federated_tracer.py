@@ -91,6 +91,20 @@ async def test_rollup_client_parses_worker_rows_into_spans():
     assert span.kind == SpanKind.TOOL_CALL
 
 
+async def test_rollup_client_normalizes_legacy_naive_worker_timestamps():
+    """Worker rows from before aware timestamps existed still round-trip."""
+    transport = _rollup_transport({
+        "t-1": [_worker_span("w-1", trace_id="t-1", parent_id="local-root")],
+    })
+    async with httpx.AsyncClient(transport=transport) as http:
+        client = RollupClient(base_url="http://willie:8902", http=http)
+        spans = await client.get_trace("t-1")
+    span = spans[0]
+    assert span.started_at.tzinfo is not None
+    assert span.started_at.utcoffset().total_seconds() == 0
+    assert span.ended_at.tzinfo is not None
+
+
 async def test_rollup_client_raises_unreachable_on_connect_error():
     transport = _rollup_transport(raise_connect_error=True)
     async with httpx.AsyncClient(transport=transport) as http:

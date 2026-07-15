@@ -4,12 +4,12 @@ import dataclasses
 import json
 import logging
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import aiosqlite
 
-from jig._sqlite import LazyConnection, json_loads
+from jig._sqlite import LazyConnection, json_loads, parse_aware_utc
 from jig.core.types import Span, SpanKind, TracingLogger, Usage
 
 logger = logging.getLogger(__name__)
@@ -81,7 +81,7 @@ class SQLiteTracer(TracingLogger):
             trace_id=trace_id,
             kind=kind,
             name=name,
-            started_at=datetime.now(),
+            started_at=datetime.now(UTC),
             metadata=metadata,
         )
         self._spans[span_id] = span
@@ -103,7 +103,7 @@ class SQLiteTracer(TracingLogger):
             trace_id=trace_id,
             kind=kind,
             name=name,
-            started_at=datetime.now(),
+            started_at=datetime.now(UTC),
             parent_id=parent_id,
             input=input,
             metadata=metadata,
@@ -115,7 +115,7 @@ class SQLiteTracer(TracingLogger):
         span = self._spans.get(span_id)
         if not span:
             return
-        span.ended_at = datetime.now()
+        span.ended_at = datetime.now(UTC)
         span.duration_ms = (span.ended_at - span.started_at).total_seconds() * 1000
         span.output = output
         span.error = error
@@ -201,12 +201,24 @@ class SQLiteTracer(TracingLogger):
         limit: int = 50,
         name: str | None = None,
     ) -> list[Span]:
+        """List trace roots: top-level AGENT_RUN or PIPELINE_RUN spans.
+
+        Only spans with ``parent_id IS NULL`` qualify — a nested
+        ``PIPELINE_RUN`` (e.g. each item run by ``map_pipeline``) has a
+        parent span and is not itself a trace root, so it's excluded.
+        """
         db = await self._get_db()
-        query = "SELECT * FROM spans WHERE kind = ?"
-        params: list[Any] = [SpanKind.AGENT_RUN.value]
+        query = "SELECT * FROM spans WHERE parent_id IS NULL AND kind IN (?, ?)"
+        params: list[Any] = [SpanKind.AGENT_RUN.value, SpanKind.PIPELINE_RUN.value]
         if since:
+            # Normalize to UTC before comparing against stored UTC strings —
+            # a non-UTC-offset aware datetime would otherwise compare
+            # incorrectly against lexicographically-sorted TEXT timestamps.
+            # A naive input is treated as UTC, matching parse_aware_utc's
+            # read-side interpretation of legacy naive rows.
+            since_utc = since if since.tzinfo is not None else since.replace(tzinfo=UTC)
             query += " AND started_at >= ?"
-            params.append(since.isoformat())
+            params.append(since_utc.astimezone(UTC).isoformat())
         if name:
             query += " AND name = ?"
             params.append(name)
@@ -231,11 +243,11 @@ class SQLiteTracer(TracingLogger):
             trace_id=trace_id,
             kind=SpanKind(kind),
             name=name,
-            started_at=datetime.fromisoformat(started),
+            started_at=parse_aware_utc(started),
             parent_id=parent_id,
             input=json_loads(inp) if isinstance(inp, str) else inp,
             output=json_loads(out) if isinstance(out, str) else out,
-            ended_at=datetime.fromisoformat(ended) if ended else None,
+            ended_at=parse_aware_utc(ended) if ended else None,
             duration_ms=duration,
             metadata=json_loads(meta) if isinstance(meta, str) else meta,
             error=error,

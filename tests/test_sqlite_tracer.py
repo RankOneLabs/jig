@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
+import aiosqlite
 import pytest
 
 from jig import PipelineConfig, Step, run_pipeline
@@ -28,7 +29,8 @@ async def test_flush_writes_spans(tracer: SQLiteTracer) -> None:
     await tracer.flush()
 
     traces = await tracer.list_traces()
-    assert len(traces) == 0  # list_traces filters by AGENT_RUN
+    assert len(traces) == 1  # list_traces includes root PIPELINE_RUN spans
+    assert traces[0].name == "test-pipeline"
 
     spans = await tracer.get_trace(span.trace_id)
     assert len(spans) == 1
@@ -163,6 +165,125 @@ async def test_pipeline_with_sqlite_tracer(tracer: SQLiteTracer) -> None:
     assert kinds.count(SpanKind.PIPELINE_RUN) == 1
     assert kinds.count(SpanKind.PIPELINE_STEP) == 2
     await tracer.close()
+
+
+@pytest.mark.asyncio
+async def test_list_traces_includes_agent_run_and_pipeline_run_roots(
+    tracer: SQLiteTracer,
+) -> None:
+    agent_span = tracer.start_trace("agent", kind=SpanKind.AGENT_RUN)
+    tracer.end_span(agent_span.id)
+    pipeline_span = tracer.start_trace("pipeline", kind=SpanKind.PIPELINE_RUN)
+    tracer.end_span(pipeline_span.id)
+    await tracer.flush()
+
+    traces = await tracer.list_traces()
+    names = {t.name for t in traces}
+    assert names == {"agent", "pipeline"}
+
+
+@pytest.mark.asyncio
+async def test_list_traces_since_normalizes_non_utc_offset(tracer: SQLiteTracer) -> None:
+    """A since filter with a non-UTC offset must compare correctly against
+    UTC-stored timestamps, not be compared as raw mismatched-offset text."""
+    span = tracer.start_trace("agent", kind=SpanKind.AGENT_RUN)
+    tracer.end_span(span.id)
+    await tracer.flush()
+
+    stored_utc = span.started_at.astimezone(UTC)
+    # Same instant, expressed in a +05:00 offset — well before the actual
+    # UTC-stored timestamp) once correctly normalized.
+    since_plus5 = (stored_utc - timedelta(minutes=1)).astimezone(timezone(timedelta(hours=5)))
+
+    traces = await tracer.list_traces(since=since_plus5)
+    assert [t.name for t in traces] == ["agent"]
+
+    since_after = (stored_utc + timedelta(minutes=1)).astimezone(timezone(timedelta(hours=5)))
+    traces_after = await tracer.list_traces(since=since_after)
+    assert traces_after == []
+
+
+@pytest.mark.asyncio
+async def test_list_traces_excludes_nested_pipeline_run(tracer: SQLiteTracer) -> None:
+    """A map_pipeline item's PIPELINE_RUN has a parent_id and isn't a root."""
+    parent = tracer.start_trace("batch", kind=SpanKind.PIPELINE_RUN)
+    nested = tracer.start_span(parent.id, SpanKind.PIPELINE_RUN, "item-0")
+    tracer.end_span(nested.id)
+    tracer.end_span(parent.id)
+    await tracer.flush()
+
+    traces = await tracer.list_traces()
+    names = [t.name for t in traces]
+    assert names == ["batch"]
+
+
+@pytest.mark.asyncio
+async def test_list_traces_excludes_pipeline_step_and_other_kinds(
+    tracer: SQLiteTracer,
+) -> None:
+    root = tracer.start_trace("agent", kind=SpanKind.AGENT_RUN)
+    step = tracer.start_span(root.id, SpanKind.PIPELINE_STEP, "step-0")
+    tracer.end_span(step.id)
+    tracer.end_span(root.id)
+    await tracer.flush()
+
+    traces = await tracer.list_traces()
+    assert [t.name for t in traces] == ["agent"]
+
+
+@pytest.mark.asyncio
+async def test_new_spans_get_aware_utc_timestamps(tracer: SQLiteTracer) -> None:
+    span = tracer.start_trace("root", kind=SpanKind.AGENT_RUN)
+    assert span.started_at.tzinfo is not None
+    assert span.started_at.utcoffset() == timedelta(0)
+
+    tracer.end_span(span.id)
+    ended = tracer._spans[span.id].ended_at
+    assert ended is not None
+    assert ended.tzinfo is not None
+    assert ended.utcoffset() == timedelta(0)
+
+
+@pytest.mark.asyncio
+async def test_round_tripped_span_timestamps_are_aware(tracer: SQLiteTracer) -> None:
+    span = tracer.start_trace("root", kind=SpanKind.AGENT_RUN)
+    tracer.end_span(span.id)
+    await tracer.flush()
+
+    spans = await tracer.get_trace(span.trace_id)
+    assert spans[0].started_at.tzinfo is not None
+    assert spans[0].ended_at.tzinfo is not None
+
+
+@pytest.mark.asyncio
+async def test_legacy_naive_span_timestamps_read_as_aware_utc(tmp_path: Any) -> None:
+    """Rows written before aware timestamps existed must still round-trip."""
+    from jig.tracing.sqlite import _SCHEMA
+
+    db_path = str(tmp_path / "test_traces.db")
+    conn = await aiosqlite.connect(db_path)
+    try:
+        await conn.executescript(_SCHEMA)
+        await conn.execute(
+            """INSERT INTO spans
+               (id, trace_id, parent_id, kind, name, started_at, ended_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ("legacy-1", "trace-legacy", None, "agent_run", "legacy",
+             "2024-01-01T10:00:00", "2024-01-01T10:00:01"),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    legacy_tracer = SQLiteTracer(db_path=db_path)
+    try:
+        spans = await legacy_tracer.get_trace("trace-legacy")
+        assert len(spans) == 1
+        assert spans[0].started_at.tzinfo is not None
+        assert spans[0].started_at == datetime(2024, 1, 1, 10, 0, 0, tzinfo=UTC)
+        assert spans[0].ended_at == datetime(2024, 1, 1, 10, 0, 1, tzinfo=UTC)
+    finally:
+        await legacy_tracer.close()
 
 
 @pytest.mark.asyncio

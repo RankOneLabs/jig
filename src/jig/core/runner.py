@@ -18,6 +18,7 @@ from jig.core.errors import (
     AgentSchemaValidationError,
     JigLLMError,
 )
+from jig.core.grading import grade_and_record
 from jig.core.prompt import build_system_message
 from jig.core.types import (
     CompletionParams,
@@ -30,6 +31,7 @@ from jig.core.types import (
     Retriever,
     Role,
     Score,
+    ScoreSource,
     ScoredResult,
     SpanKind,
     ToolCall,
@@ -96,6 +98,15 @@ class AgentConfig[T]:
     include_feedback_in_prompt: bool = True
     session_id: str | None = None
 
+    # --- Feedback signal query ---
+    # Parameters for the ``feedback.get_signals`` call made when
+    # ``include_feedback_in_prompt`` is set. Explicit fields make the
+    # previously-hardcoded run_agent query parameters configurable per
+    # config rather than fixed at limit=3, min_score=0.7.
+    feedback_limit: int = 3
+    feedback_min_score: float = 0.7
+    feedback_source: ScoreSource | None = None
+
     # --- Structured output ---
     # Pydantic model the agent should produce. When set, the runner injects a
     # ``submit_output`` tool with the model's JSON schema; the loop ends when
@@ -123,6 +134,14 @@ class AgentConfig[T]:
         if self.max_parse_retries < 0:
             raise ValueError(
                 f"max_parse_retries must be non-negative, got {self.max_parse_retries}."
+            )
+        if (
+            isinstance(self.feedback_limit, bool)
+            or not isinstance(self.feedback_limit, int)
+            or self.feedback_limit < 1
+        ):
+            raise ValueError(
+                f"feedback_limit must be a positive int, got {self.feedback_limit!r}."
             )
 
     def with_(self, **overrides: Any) -> AgentConfig[T]:
@@ -223,6 +242,9 @@ def _serialize_config_snapshot(config: AgentConfig[Any]) -> dict[str, Any]:
         "include_feedback_in_prompt": config.include_feedback_in_prompt,
         "session_id": config.session_id,
         "output_schema": schema_fqn,
+        "feedback_limit": config.feedback_limit,
+        "feedback_min_score": config.feedback_min_score,
+        "feedback_source": config.feedback_source.value if config.feedback_source else None,
         # The LLMClient itself isn't JSON-serializable (live object,
         # gets dropped to ``null`` by _safe_json), so stamp the model
         # slug alongside it. Every shipped adapter sets ``self._model``;
@@ -350,8 +372,16 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                 config.tracer, trace.id, SpanKind.MEMORY_QUERY, "query_feedback",
                 input={"query": input},
             ) as fb_span:
-                logger.debug("feedback.get_signals start (limit=3, min_score=0.7)")
-                feedback_signals = await config.feedback.get_signals(input, limit=3, min_score=0.7)
+                logger.debug(
+                    "feedback.get_signals start (limit=%d, min_score=%s, source=%s)",
+                    config.feedback_limit, config.feedback_min_score, config.feedback_source,
+                )
+                feedback_signals = await config.feedback.get_signals(
+                    input,
+                    limit=config.feedback_limit,
+                    min_score=config.feedback_min_score,
+                    source=config.feedback_source,
+                )
                 logger.debug("feedback.get_signals done (signals=%d)", len(feedback_signals))
                 fb_span.finish([s.content[:100] for s in feedback_signals])
 
@@ -704,51 +734,38 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
             # join against. Memory IDs and trace IDs are separate namespaces and
             # must not be used as the feedback result ID.
             if config.grader:
-                try:
-                    # Flush so trajectory graders can read pre-grade spans via
-                    # get_trace. SQLiteTracer retains unended spans (notably the
-                    # root) so _finalize_trace's end_span still works.
-                    await config.tracer.flush()
-                    with span_guard(
-                        config.tracer, trace.id, SpanKind.GRADING, "auto_grade",
-                        input={"input": input},
-                    ) as grade_span:
-                        grade_output: Any = parsed if parsed is not None else final_output
-                        scores = await config.grader.grade(
-                            input,
-                            grade_output,
-                            context={
-                                "raw_output": final_output,
-                                "trace_id": trace.trace_id,
-                            },
-                        )
-                        feedback_result_id: str | None = None
-                        if scores:
-                            fb_meta: dict[str, Any] = {
-                                "kind": "agent_result",
-                                "agent_name": config.name,
-                                "source": "run_agent",
-                                "trace_id": trace.trace_id,
-                            }
-                            model_id = _resolve_model_id(config.llm)
-                            if model_id is not None:
-                                fb_meta["model"] = model_id
-                            if config.session_id is not None:
-                                fb_meta["session_id"] = config.session_id
-                            if memory_id is not None:
-                                fb_meta["memory_id"] = memory_id
-                            feedback_result_id = await config.feedback.store_result(
-                                final_output, input, fb_meta
-                            )
-                            await config.feedback.score(feedback_result_id, scores)
-                        span_output: dict[str, Any] = {
-                            "scores": [{"dimension": s.dimension, "value": s.value} for s in scores],
-                        }
-                        if feedback_result_id is not None:
-                            span_output["feedback_result_id"] = feedback_result_id
-                        grade_span.finish(span_output)
-                except Exception:
-                    logger.exception("auto-grading failed after successful run (non-fatal)")
+                # Flush so trajectory graders can read pre-grade spans via
+                # get_trace. SQLiteTracer retains unended spans (notably the
+                # root) so _finalize_trace's end_span still works.
+                await config.tracer.flush()
+                grade_output: Any = parsed if parsed is not None else final_output
+                fb_meta: dict[str, Any] = {
+                    "kind": "agent_result",
+                    "agent_name": config.name,
+                    "source": "run_agent",
+                    "trace_id": trace.trace_id,
+                }
+                model_id = _resolve_model_id(config.llm)
+                if model_id is not None:
+                    fb_meta["model"] = model_id
+                if config.session_id is not None:
+                    fb_meta["session_id"] = config.session_id
+                if memory_id is not None:
+                    fb_meta["memory_id"] = memory_id
+                outcome = await grade_and_record(
+                    tracer=config.tracer,
+                    parent_span_id=trace.id,
+                    span_name="auto_grade",
+                    grader=config.grader,
+                    grade_input=input,
+                    grade_output=grade_output,
+                    grade_context={"raw_output": final_output, "trace_id": trace.trace_id},
+                    feedback=config.feedback,
+                    feedback_content=final_output,
+                    feedback_input_text=input,
+                    feedback_metadata=fb_meta,
+                )
+                scores = outcome.scores
     finally:
         # Always close the root span + flush the tracer, even if an
         # exception propagates mid-run. Buffered tracers (SQLiteTracer)

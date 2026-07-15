@@ -345,6 +345,46 @@ class TestSourceFilteringParity:
         assert {r.content for r in via_query} == {"want"}
 
 
+@pytest.mark.asyncio
+class TestScoreMetadataRoundTrip:
+    async def test_query_returns_score_metadata(self, feedback_db):
+        rid = await feedback_db.store_result("A", "query text", {})
+        await feedback_db.score(rid, [
+            Score("q", 0.9, ScoreSource.HEURISTIC, metadata={"offending_claim": "x"}),
+        ])
+
+        out = await feedback_db.query(FeedbackQuery())
+        assert len(out) == 1
+        assert out[0].scores[0].metadata == {"offending_claim": "x"}
+
+    async def test_query_returns_none_metadata_for_scores_without_it(self, feedback_db):
+        rid = await feedback_db.store_result("A", "query text", {})
+        await feedback_db.score(rid, [Score("q", 0.9, ScoreSource.HEURISTIC)])
+
+        out = await feedback_db.query(FeedbackQuery())
+        assert out[0].scores[0].metadata is None
+
+    async def test_query_preserves_score_insertion_order(self, feedback_db):
+        rid = await feedback_db.store_result("A", "query text", {})
+        await feedback_db.score(rid, [
+            Score("first", 0.1, ScoreSource.HEURISTIC),
+            Score("second", 0.2, ScoreSource.HEURISTIC),
+            Score("third", 0.3, ScoreSource.HEURISTIC),
+        ])
+
+        out = await feedback_db.query(FeedbackQuery())
+        assert [s.dimension for s in out[0].scores] == ["first", "second", "third"]
+
+    async def test_get_signals_also_round_trips_metadata(self, feedback_db):
+        rid = await feedback_db.store_result("A", "signal text", {})
+        await feedback_db.score(rid, [
+            Score("q", 0.9, ScoreSource.HEURISTIC, metadata={"note": "y"}),
+        ])
+
+        out = await feedback_db.get_signals("signal text")
+        assert out[0].scores[0].metadata == {"note": "y"}
+
+
 class TestFeedbackQueryValidation:
     def test_rejects_non_positive_limit(self):
         with pytest.raises(ValueError, match="positive int"):

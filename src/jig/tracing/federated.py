@@ -25,6 +25,7 @@ from typing import Any
 
 import httpx
 
+from jig._sqlite import parse_aware_utc
 from jig.core.types import Span, SpanKind, TracingLogger, Usage
 from jig.tracing.sqlite import SQLiteTracer
 
@@ -54,7 +55,7 @@ def _span_from_row(row: dict[str, Any]) -> Span | None:
         trace_id = row["trace_id"]
         kind_value = row["kind"]
         name = row["name"]
-        started_at = datetime.fromisoformat(row["started_at"])
+        started_at = parse_aware_utc(row["started_at"])
     except (KeyError, TypeError, ValueError) as e:
         logger.warning("federated: skipping malformed worker span row: %s", e)
         return None
@@ -81,7 +82,7 @@ def _span_from_row(row: dict[str, Any]) -> Span | None:
     raw_ended = row.get("ended_at")
     if raw_ended:
         try:
-            ended_at = datetime.fromisoformat(raw_ended)
+            ended_at = parse_aware_utc(raw_ended)
         except (TypeError, ValueError) as e:
             logger.warning(
                 "federated: invalid ended_at on worker span %s (%r); "

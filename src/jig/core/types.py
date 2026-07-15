@@ -91,6 +91,7 @@ class Score:
     dimension: str
     value: float
     source: ScoreSource
+    metadata: dict[str, Any] | None = None
 
 
 @dataclass
