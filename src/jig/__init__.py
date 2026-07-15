@@ -45,7 +45,7 @@ from jig.core import (
     current_tool_context,
 )
 from jig.core.pipeline import map_pipeline, run_pipeline
-from jig.core.runner import AgentConfig, AgentResult, run_agent
+from jig.core.runner import SUBMIT_OUTPUT_TOOL, AgentConfig, AgentResult, run_agent
 from jig.core.types import TraceContext
 from jig.dispatch import DispatchError, JobTimeoutError
 from jig.dispatch import listen as dispatch_listen
@@ -55,6 +55,7 @@ from jig.feedback import (
     CommitteeJudge,
     NullFeedbackLoop,
     PairwiseLLMJudge,
+    SQLiteFeedbackLoop,
     TrajectoryAssertion,
     TrajectoryGrader,
     step_budget,
@@ -93,6 +94,13 @@ from jig.sweep_stats import (
     win_rate,
 )
 from jig.tools import PastResults, ToolRegistry
+from jig.tracing import (
+    FederatedTracer,
+    RollupClient,
+    RollupUnreachableError,
+    SQLiteTracer,
+    StdoutTracer,
+)
 
 __all__ = [
     # Core types
@@ -144,6 +152,7 @@ __all__ = [
     # Runner
     "AgentConfig",
     "AgentResult",
+    "SUBMIT_OUTPUT_TOOL",
     "run_agent",
     # Pipeline
     "run_pipeline",
@@ -199,4 +208,11 @@ __all__ = [
     "PairwiseLLMJudge",
     # Feedback loop implementations
     "NullFeedbackLoop",
+    "SQLiteFeedbackLoop",
+    # Tracer implementations
+    "FederatedTracer",
+    "RollupClient",
+    "RollupUnreachableError",
+    "SQLiteTracer",
+    "StdoutTracer",
 ]
