@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS scores (
     dimension TEXT NOT NULL,
     value REAL NOT NULL,
     source TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    metadata JSON
 );
 
 CREATE INDEX IF NOT EXISTS idx_scores_result ON scores(result_id);
@@ -61,15 +62,32 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         self._embed_model = embed_model
         self._ollama_host = ollama_host
         self._conn = LazyConnection(db_path, _SCHEMA)
-        self._write_lock: asyncio.Lock | None = None
+        self._db_lock: asyncio.Lock | None = None
+        self._scores_metadata_migrated = False
 
     async def _get_db(self) -> aiosqlite.Connection:
         return await self._conn.get()
 
-    def _get_write_lock(self) -> asyncio.Lock:
-        if self._write_lock is None:
-            self._write_lock = asyncio.Lock()
-        return self._write_lock
+    def _get_db_lock(self) -> asyncio.Lock:
+        if self._db_lock is None:
+            self._db_lock = asyncio.Lock()
+        return self._db_lock
+
+    async def _ensure_scores_metadata_column(self, db: aiosqlite.Connection) -> None:
+        """Idempotently add the ``scores.metadata`` column to older databases.
+
+        Caller must already hold ``self._db_lock``. Fresh databases get the
+        column from ``_SCHEMA`` directly; this covers databases created
+        before the column existed, leaving every historical row NULL.
+        """
+        if self._scores_metadata_migrated:
+            return
+        cursor = await db.execute("PRAGMA table_info(scores)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "metadata" not in columns:
+            await db.execute("ALTER TABLE scores ADD COLUMN metadata JSON")
+            await db.commit()
+        self._scores_metadata_migrated = True
 
     async def _embed(self, text: str) -> np.ndarray:
         return await ollama_embed(text, self._embed_model, self._ollama_host)
@@ -82,7 +100,7 @@ class SQLiteFeedbackLoop(FeedbackLoop):
     ) -> str:
         result_id = str(uuid.uuid4())
         embedding = await self._embed(input_text)
-        async with self._get_write_lock():
+        async with self._get_db_lock():
             db = await self._get_db()
             try:
                 await db.execute(
@@ -104,18 +122,36 @@ class SQLiteFeedbackLoop(FeedbackLoop):
 
     async def score(self, result_id: str, scores: list[Score]) -> None:
         validate_scores(scores)
+        # Serialize metadata before opening the batch transaction: a
+        # non-JSON-serializable value must reject the whole call without
+        # inserting any score, not fail partway through the batch.
+        serialized_metadata: list[str | None] = []
+        for s in scores:
+            if s.metadata is None:
+                serialized_metadata.append(None)
+                continue
+            try:
+                serialized_metadata.append(json_dumps(s.metadata))
+            except TypeError as exc:
+                raise ValueError(
+                    f"Score.metadata for dimension {s.dimension!r} is not "
+                    f"JSON-serializable: {exc}"
+                ) from exc
         now = datetime.now().isoformat()
-        async with self._get_write_lock():
+        async with self._get_db_lock():
             db = await self._get_db()
+            await self._ensure_scores_metadata_column(db)
             # Explicit BEGIN pins the batch boundary before the first insert.
-            # The write lock keeps other feedback writes from committing or
-            # rolling back this shared connection until the batch is complete.
+            # The database lock keeps other feedback operations from
+            # committing, rolling back, or reading this shared connection
+            # until the batch is complete.
             try:
                 await db.execute("BEGIN")
-                for s in scores:
+                for s, meta_json in zip(scores, serialized_metadata):
                     await db.execute(
-                        "INSERT INTO scores (result_id, dimension, value, source, created_at) VALUES (?, ?, ?, ?, ?)",
-                        (result_id, s.dimension, s.value, s.source.value, now),
+                        "INSERT INTO scores (result_id, dimension, value, source, created_at, metadata) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (result_id, s.dimension, s.value, s.source.value, now, meta_json),
                     )
                 await db.commit()
             except BaseException:

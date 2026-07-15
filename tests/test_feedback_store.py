@@ -377,4 +377,140 @@ class TestScoreBatchAtomicity:
 class TestFeedbackWriteLockLifecycle:
     def test_write_lock_is_created_lazily(self, tmp_path) -> None:
         loop = SQLiteFeedbackLoop(db_path=str(tmp_path / "lazy-lock.db"))
-        assert loop._write_lock is None
+        assert loop._db_lock is None
+
+
+# ---------------------------------------------------------------------------
+# Score metadata: legacy-schema migration + serialization contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestScoreMetadataMigration:
+    async def _make_legacy_db(self, path: str) -> None:
+        """Build a pre-metadata-column database, matching a real old deploy."""
+        conn = await aiosqlite.connect(path)
+        try:
+            await conn.executescript(
+                """
+                CREATE TABLE results (
+                    id TEXT PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    input TEXT NOT NULL,
+                    metadata JSON,
+                    embedding BLOB,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE scores (
+                    result_id TEXT NOT NULL REFERENCES results(id),
+                    dimension TEXT NOT NULL,
+                    value REAL NOT NULL,
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX idx_scores_result ON scores(result_id);
+                """
+            )
+            await conn.commit()
+        finally:
+            await conn.close()
+
+    async def test_opening_legacy_db_migrates_scores_metadata_column(self, tmp_path):
+        db_path = str(tmp_path / "legacy.db")
+        await self._make_legacy_db(db_path)
+
+        loop = SQLiteFeedbackLoop(db_path=db_path)
+        loop._embed = _fake_embed  # type: ignore[method-assign]
+        try:
+            rid = await loop.store_result("content", "input", {})
+            await loop.score(rid, [Score("q", 0.9, ScoreSource.HEURISTIC, metadata={"k": "v"})])
+
+            db = await loop._get_db()
+            cursor = await db.execute("PRAGMA table_info(scores)")
+            columns = {row[1] for row in await cursor.fetchall()}
+            assert "metadata" in columns
+
+            row = await (
+                await db.execute(
+                    "SELECT metadata FROM scores WHERE result_id = ?", (rid,)
+                )
+            ).fetchone()
+            assert row[0] == '{"k": "v"}'
+        finally:
+            await loop.close()
+
+    async def test_legacy_rows_stay_null_after_migration(self, tmp_path):
+        """Historical rows inserted before the migration keep metadata=NULL."""
+        db_path = str(tmp_path / "legacy2.db")
+        await self._make_legacy_db(db_path)
+
+        conn = await aiosqlite.connect(db_path)
+        try:
+            await conn.execute(
+                "INSERT INTO results (id, content, input, metadata, embedding, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("legacy-1", "c", "i", "{}", b"", datetime.now().isoformat()),
+            )
+            await conn.execute(
+                "INSERT INTO scores (result_id, dimension, value, source, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("legacy-1", "q", 0.5, "heuristic", datetime.now().isoformat()),
+            )
+            await conn.commit()
+        finally:
+            await conn.close()
+
+        loop = SQLiteFeedbackLoop(db_path=db_path)
+        loop._embed = _fake_embed  # type: ignore[method-assign]
+        try:
+            db = await loop._get_db()
+            await loop._ensure_scores_metadata_column(db)
+            row = await (
+                await db.execute(
+                    "SELECT metadata FROM scores WHERE result_id = ?", ("legacy-1",)
+                )
+            ).fetchone()
+            assert row[0] is None
+        finally:
+            await loop.close()
+
+    async def test_none_metadata_stored_as_null_not_empty_object(self, feedback_db):
+        rid = await feedback_db.store_result("c", "i", {})
+        await feedback_db.score(rid, [Score("q", 0.9, ScoreSource.HEURISTIC)])
+        db = await feedback_db._get_db()
+        row = await (
+            await db.execute(
+                "SELECT metadata FROM scores WHERE result_id = ?", (rid,)
+            )
+        ).fetchone()
+        assert row[0] is None
+
+    async def test_non_serializable_metadata_rejected_without_inserting(self, feedback_db):
+        rid = await feedback_db.store_result("c", "i", {})
+        bad_score = Score("q", 0.9, ScoreSource.HEURISTIC, metadata={"bad": object()})
+        with pytest.raises(ValueError, match="JSON-serializable"):
+            await feedback_db.score(rid, [bad_score])
+
+        db = await feedback_db._get_db()
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM scores WHERE result_id = ?", (rid,)
+        )
+        row = await cursor.fetchone()
+        assert row[0] == 0
+
+    async def test_non_serializable_metadata_in_batch_inserts_nothing(self, feedback_db):
+        """One bad score in a multi-score batch must reject the entire call."""
+        rid = await feedback_db.store_result("c", "i", {})
+        scores = [
+            Score("good", 0.5, ScoreSource.HEURISTIC),
+            Score("bad", 0.9, ScoreSource.HEURISTIC, metadata={"x": object()}),
+        ]
+        with pytest.raises(ValueError, match="JSON-serializable"):
+            await feedback_db.score(rid, scores)
+
+        db = await feedback_db._get_db()
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM scores WHERE result_id = ?", (rid,)
+        )
+        row = await cursor.fetchone()
+        assert row[0] == 0
