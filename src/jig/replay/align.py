@@ -13,11 +13,20 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 IdentityKey = tuple[str, tuple[tuple[str, Any], ...]]
+
+
+@dataclass
+class ToolEvent:
+    name: str
+    args: Any
+    output: str | None
+    error: str | None
 
 _VALID_LEAF_TYPES = (str, int, float, bool)
 

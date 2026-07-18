@@ -12,19 +12,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from itertools import zip_longest
-from typing import Any, Literal
+from typing import Literal
 
 from jig.core.runner import SUBMIT_OUTPUT_TOOL as _SUBMIT_OUTPUT_TOOL
 from jig.core.types import Span, SpanKind, TracingLogger
-
-
-@dataclass
-class ToolEvent:
-    name: str
-    args: Any
-    output: str | None
-    error: str | None
-
+from jig.replay.align import ToolEvent
 
 ToolDivergenceKind = Literal[
     "name", "args", "output", "error", "only_a", "only_b",
