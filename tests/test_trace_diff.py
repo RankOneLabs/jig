@@ -953,3 +953,121 @@ async def test_a_centric_report_order_interleaves_only_a():
     d3 = diff.tool_divergence[3]
     assert (d3.index, d3.divergence, d3.tier, d3.index_a, d3.index_b) == (3, "only_b", "ordinal", None, 2)
     assert d3.b.name == "notify"
+
+
+@pytest.mark.asyncio
+async def test_submit_output_excluded_under_identity_alignment():
+    """The existing submit_output-exclusion contract must hold with
+    identity alignment enabled too — excluded spans must not leak into
+    identities, anchors, source indices, or divergences."""
+    tracer = _StubTracer({
+        "a": [
+            _root("a"),
+            _tool("a", 0, "write", {"id": 1}, "wrote"),
+            Span(
+                id="a-so", trace_id="a", kind=SpanKind.TOOL_CALL, name="submit_output",
+                started_at=datetime.now(), input={"result": "x"}, output="{}",
+            ),
+        ],
+        "b": [
+            _root("b"),
+            _tool("b", 0, "write", {"id": 1}, "wrote"),
+            Span(
+                id="b-so", trace_id="b", kind=SpanKind.TOOL_CALL, name="submit_output",
+                started_at=datetime.now(), input={"result": "y"}, output="{}",
+            ),
+        ],
+    })
+
+    diff = await trace_diff("a", "b", tracer=tracer, identity_fields={"write": ["id"]})
+
+    assert diff.tool_divergence == []
+    assert diff.identical is True
+
+
+# --- identity_fields validation ---
+
+
+class _ExplodingTracer(TracingLogger):
+    """Tracer that records/fails on access, to prove validation runs
+    before any tracer read."""
+
+    def __init__(self) -> None:
+        self.get_trace_calls = 0
+
+    def start_trace(self, name, metadata=None, kind=SpanKind.AGENT_RUN):  # pragma: no cover
+        raise NotImplementedError
+
+    def start_span(self, parent_id, kind, name, input=None, metadata=None):  # noqa: A002  # pragma: no cover
+        raise NotImplementedError
+
+    def end_span(self, span_id, output=None, error=None, usage=None):  # pragma: no cover
+        raise NotImplementedError
+
+    async def get_trace(self, trace_id: str) -> list[Span]:
+        self.get_trace_calls += 1
+        raise AssertionError("get_trace must not be called when identity_fields is invalid")
+
+    async def list_traces(self, since=None, limit=50, name=None):  # pragma: no cover
+        return []
+
+    async def flush(self) -> None:  # pragma: no cover
+        pass
+
+
+_INVALID_IDENTITY_FIELDS: list[tuple[str, Any]] = [
+    ("not_a_dict", ["write", "id"]),
+    ("non_string_tool_name", {123: ["id"]}),
+    ("non_list_declaration", {"write": "id"}),
+    ("empty_list", {"write": []}),
+    ("non_string_path", {"write": [123]}),
+    ("empty_path", {"write": [""]}),
+    ("empty_dot_segment", {"write": ["a."]}),
+    ("duplicate_path", {"write": ["id", "id"]}),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "name,bad_fields", _INVALID_IDENTITY_FIELDS, ids=[n for n, _ in _INVALID_IDENTITY_FIELDS]
+)
+async def test_invalid_identity_fields_raises_before_any_tracer_read(name, bad_fields):
+    tracer = _ExplodingTracer()
+
+    with pytest.raises(ValueError, match="identity_fields"):
+        await trace_diff("a", "b", tracer=tracer, identity_fields=bad_fields)
+
+    assert tracer.get_trace_calls == 0
+
+
+# --- Full legacy-equivalence harness ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name,build", _LEGACY_FIXTURES, ids=[n for n, _ in _LEGACY_FIXTURES])
+async def test_legacy_equivalence_none_vs_empty_identity_fields(name, build):
+    """identity_fields=None and identity_fields={} must produce
+    field-for-field identical behavior across every pre-existing
+    trace-diff fixture shape — serialized byte equality is impossible
+    after the ToolDiff schema extension, so this pins every
+    legacy-observable field plus the new ordinal metadata and correct
+    source indices."""
+    tracer, id_a, id_b = build()
+
+    diff_none = await trace_diff(id_a, id_b, tracer=tracer, identity_fields=None)
+    diff_empty = await trace_diff(id_a, id_b, tracer=tracer, identity_fields={})
+
+    assert _legacy_fields(diff_none) == _legacy_fields(diff_empty)
+
+    for d in diff_none.tool_divergence:
+        assert d.tier == "ordinal"
+        if d.divergence == "only_a":
+            assert isinstance(d.index_a, int)
+            assert d.index_b is None
+        elif d.divergence == "only_b":
+            assert d.index_a is None
+            assert isinstance(d.index_b, int)
+        else:
+            assert isinstance(d.index_a, int)
+            assert isinstance(d.index_b, int)
+            assert d.index_a == d.index_b
