@@ -55,6 +55,18 @@ def test_identity_fields_rejects_non_string_entry():
         _make_tool(["customer_id", 123])  # type: ignore[list-item]
 
 
+def test_identity_fields_rejects_bare_string_instead_of_list():
+    # A bare str is iterable character-by-character, which would otherwise
+    # silently resolve as a list of single-character identity fields.
+    with pytest.raises(ValueError, match="identity_fields"):
+        _make_tool("customer_id")  # type: ignore[arg-type]
+
+
+def test_identity_fields_rejects_tuple_instead_of_list():
+    with pytest.raises(ValueError, match="identity_fields"):
+        _make_tool(("customer_id",))  # type: ignore[arg-type]
+
+
 def test_identity_fields_rejects_empty_string_entry():
     with pytest.raises(ValueError, match="identity_fields"):
         _make_tool([""])

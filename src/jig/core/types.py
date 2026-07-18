@@ -67,6 +67,11 @@ class ToolDefinition:
     def __post_init__(self) -> None:
         if self.identity_fields is None:
             return
+        if not isinstance(self.identity_fields, list):
+            raise ValueError(
+                f"ToolDefinition.identity_fields must be a list[str] or "
+                f"None, got {self.identity_fields!r}"
+            )
         if len(self.identity_fields) == 0:
             raise ValueError(
                 "ToolDefinition.identity_fields must not be an empty list "
