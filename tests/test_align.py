@@ -17,6 +17,7 @@ from jig.replay.align import (
     OrdinalAligner,
     UnmatchedEvent,
     ToolEvent,
+    _tier1_identity,
     resolve_identity,
 )
 
@@ -476,3 +477,107 @@ def test_ordinal_aligner_matches_legacy_zip_longest_pairing():
         assert all(u.tier == "ordinal" for u in alignment.only_a)
         assert [u.index for u in alignment.only_b] == expected_only_b
         assert all(u.tier == "ordinal" for u in alignment.only_b)
+
+
+# --- _tier1_identity ---
+
+
+def test_tier1_equal_key_pairing():
+    a = [_ev("lookup", {"id": "abc"})]
+    b = [_ev("lookup", {"id": "abc"})]
+    pairs, only_a, only_b, rem_a, rem_b = _tier1_identity(a, b, {"lookup": ["id"]})
+    assert pairs == [AlignedPair(0, 0, "identity")]
+    assert only_a == []
+    assert only_b == []
+    assert rem_a == []
+    assert rem_b == []
+
+
+def test_tier1_a_only_keyed_call_is_unmatched():
+    a = [_ev("lookup", {"id": "abc"})]
+    b = [_ev("lookup", {"id": "xyz"})]
+    pairs, only_a, only_b, rem_a, rem_b = _tier1_identity(a, b, {"lookup": ["id"]})
+    assert pairs == []
+    assert only_a == [UnmatchedEvent(0, "identity")]
+    assert only_b == [UnmatchedEvent(0, "identity")]
+    assert rem_a == []
+    assert rem_b == []
+
+
+def test_tier1_b_only_keyed_call_is_unmatched():
+    a: list[ToolEvent] = []
+    b = [_ev("lookup", {"id": "abc"})]
+    pairs, only_a, only_b, rem_a, rem_b = _tier1_identity(a, b, {"lookup": ["id"]})
+    assert pairs == []
+    assert only_a == []
+    assert only_b == [UnmatchedEvent(0, "identity")]
+    assert rem_b == []
+
+
+def test_tier1_duplicate_group_a_surplus():
+    a = [_ev("lookup", {"id": "abc"}), _ev("lookup", {"id": "abc"}), _ev("lookup", {"id": "abc"})]
+    b = [_ev("lookup", {"id": "abc"})]
+    pairs, only_a, only_b, rem_a, rem_b = _tier1_identity(a, b, {"lookup": ["id"]})
+    assert pairs == [AlignedPair(0, 0, "identity")]
+    assert only_a == [UnmatchedEvent(1, "identity"), UnmatchedEvent(2, "identity")]
+    assert only_b == []
+
+
+def test_tier1_duplicate_group_b_surplus():
+    a = [_ev("lookup", {"id": "abc"})]
+    b = [_ev("lookup", {"id": "abc"}), _ev("lookup", {"id": "abc"}), _ev("lookup", {"id": "abc"})]
+    pairs, only_a, only_b, rem_a, rem_b = _tier1_identity(a, b, {"lookup": ["id"]})
+    assert pairs == [AlignedPair(0, 0, "identity")]
+    assert only_a == []
+    assert only_b == [UnmatchedEvent(1, "identity"), UnmatchedEvent(2, "identity")]
+
+
+def test_tier1_duplicate_groups_both_surplus_types_in_one_call():
+    # key "x": a has 2, b has 1 -> a surplus. key "y": a has 1, b has 2 -> b surplus.
+    a = [
+        _ev("lookup", {"id": "x"}),
+        _ev("lookup", {"id": "x"}),
+        _ev("lookup", {"id": "y"}),
+    ]
+    b = [
+        _ev("lookup", {"id": "x"}),
+        _ev("lookup", {"id": "y"}),
+        _ev("lookup", {"id": "y"}),
+    ]
+    pairs, only_a, only_b, rem_a, rem_b = _tier1_identity(a, b, {"lookup": ["id"]})
+    assert set((p.index_a, p.index_b) for p in pairs) == {(0, 0), (2, 1)}
+    assert all(p.tier == "identity" for p in pairs)
+    assert only_a == [UnmatchedEvent(1, "identity")]
+    assert only_b == [UnmatchedEvent(2, "identity")]
+
+
+def test_tier1_keyed_versus_unkeyed_non_pairing():
+    # a's keyed event must never pair with b's same-name but unkeyed event.
+    a = [_ev("lookup", {"id": "abc"})]
+    b = [_ev("lookup", {"other": "field"})]  # missing "id" -> unresolved, falls to remainder
+    pairs, only_a, only_b, rem_a, rem_b = _tier1_identity(a, b, {"lookup": ["id"]})
+    assert pairs == []
+    assert only_a == [UnmatchedEvent(0, "identity")]
+    assert only_b == []
+    assert rem_a == []
+    assert [i for i, _ in rem_b] == [0]
+
+
+def test_tier1_no_identity_fields_everything_is_remainder():
+    a = [_ev("lookup", {"id": "abc"}), _ev("other")]
+    b = [_ev("lookup", {"id": "abc"})]
+    pairs, only_a, only_b, rem_a, rem_b = _tier1_identity(a, b, None)
+    assert pairs == []
+    assert only_a == []
+    assert only_b == []
+    assert [i for i, _ in rem_a] == [0, 1]
+    assert [i for i, _ in rem_b] == [0]
+
+
+def test_tier1_missing_tool_entry_in_mapping_is_identity_less():
+    a = [_ev("undeclared", {"id": "abc"})]
+    b = [_ev("undeclared", {"id": "abc"})]
+    pairs, only_a, only_b, rem_a, rem_b = _tier1_identity(a, b, {"other_tool": ["id"]})
+    assert pairs == []
+    assert [i for i, _ in rem_a] == [0]
+    assert [i for i, _ in rem_b] == [0]

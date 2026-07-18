@@ -248,3 +248,77 @@ class OrdinalAligner:
             else:
                 pairs.append(AlignedPair(index_a=i, index_b=i, tier="ordinal"))
         return Alignment(pairs=pairs, only_a=only_a, only_b=only_b)
+
+
+def _resolve_event(
+    event: ToolEvent, identity_fields: Mapping[str, list[str]] | None
+) -> IdentityKey | None:
+    fields = identity_fields.get(event.name) if identity_fields is not None else None
+    return resolve_identity(event.name, event.args, fields)
+
+
+def _tier1_identity(
+    a: list[ToolEvent],
+    b: list[ToolEvent],
+    identity_fields: Mapping[str, list[str]] | None,
+) -> tuple[
+    list[AlignedPair],
+    list[UnmatchedEvent],
+    list[UnmatchedEvent],
+    list[tuple[int, ToolEvent]],
+    list[tuple[int, ToolEvent]],
+]:
+    """Identity-tier pairing plus the identity-less remainder of each side.
+
+    Every event that resolves a composite key (via ``resolve_identity``)
+    is permanently consumed here — paired ordinally within its key's
+    group, or left as identity-tier unmatched surplus — and never
+    appears in the returned remainders. Groups are processed in
+    first-a-encounter order, then b-only keys in first-b-encounter
+    order, so the result does not depend on dict iteration order.
+
+    Returns ``(pairs, only_a, only_b, remainder_a, remainder_b)`` where
+    the remainders are ``(original_index, event)`` pairs for
+    identity-less events, in source order.
+    """
+    groups: dict[IdentityKey, dict[str, list[int]]] = {}
+    key_order: list[IdentityKey] = []
+
+    key_a: list[IdentityKey | None] = []
+    for i, event in enumerate(a):
+        key = _resolve_event(event, identity_fields)
+        key_a.append(key)
+        if key is not None:
+            if key not in groups:
+                groups[key] = {"a": [], "b": []}
+                key_order.append(key)
+            groups[key]["a"].append(i)
+
+    key_b: list[IdentityKey | None] = []
+    for j, event in enumerate(b):
+        key = _resolve_event(event, identity_fields)
+        key_b.append(key)
+        if key is not None:
+            if key not in groups:
+                groups[key] = {"a": [], "b": []}
+                key_order.append(key)
+            groups[key]["b"].append(j)
+
+    pairs: list[AlignedPair] = []
+    only_a: list[UnmatchedEvent] = []
+    only_b: list[UnmatchedEvent] = []
+    for key in key_order:
+        a_idxs = groups[key]["a"]
+        b_idxs = groups[key]["b"]
+        n = min(len(a_idxs), len(b_idxs))
+        for k in range(n):
+            pairs.append(AlignedPair(index_a=a_idxs[k], index_b=b_idxs[k], tier="identity"))
+        for idx in a_idxs[n:]:
+            only_a.append(UnmatchedEvent(index=idx, tier="identity"))
+        for idx in b_idxs[n:]:
+            only_b.append(UnmatchedEvent(index=idx, tier="identity"))
+
+    remainder_a = [(i, event) for i, event in enumerate(a) if key_a[i] is None]
+    remainder_b = [(j, event) for j, event in enumerate(b) if key_b[j] is None]
+
+    return pairs, only_a, only_b, remainder_a, remainder_b
