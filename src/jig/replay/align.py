@@ -322,3 +322,74 @@ def _tier1_identity(
     remainder_b = [(j, event) for j, event in enumerate(b) if key_b[j] is None]
 
     return pairs, only_a, only_b, remainder_a, remainder_b
+
+
+def _tier2_anchors(
+    remainder_a: list[tuple[int, ToolEvent]],
+    remainder_b: list[tuple[int, ToolEvent]],
+) -> list[AlignedPair]:
+    """Deterministic patience-diff anchors over the identity-less remainder.
+
+    A candidate anchor is a tool name that occurs exactly once in each
+    remainder. Candidates are naturally ordered by ascending
+    ``index_a`` (remainder order preserves source order); the selected
+    anchors are the longest strictly-increasing-in-``index_b``
+    subsequence of candidates, i.e. the classic patience-diff LIS. When
+    multiple maximum-length subsequences exist, the lexicographically
+    smallest sequence of ``(index_a, index_b)`` pairs is chosen — since
+    candidates are already ascending by ``index_a``, this reduces to
+    always preferring the earliest eligible candidate at each step of
+    the reconstruction below.
+
+    Unselected (including crossing) candidates are simply not returned;
+    they remain in the remainder as ordinary members of whatever
+    anchor-delimited segment they fall into.
+    """
+    count_a: dict[str, int] = {}
+    for _, event in remainder_a:
+        count_a[event.name] = count_a.get(event.name, 0) + 1
+    count_b: dict[str, int] = {}
+    for _, event in remainder_b:
+        count_b[event.name] = count_b.get(event.name, 0) + 1
+
+    b_index_by_name: dict[str, int] = {}
+    for orig_idx, event in remainder_b:
+        if count_b[event.name] == 1:
+            b_index_by_name[event.name] = orig_idx
+
+    # Ascending by index_a by construction: remainder_a preserves source order.
+    candidates: list[tuple[int, int]] = [
+        (orig_idx, b_index_by_name[event.name])
+        for orig_idx, event in remainder_a
+        if count_a[event.name] == 1 and count_b.get(event.name) == 1
+    ]
+
+    m = len(candidates)
+    if m == 0:
+        return []
+
+    # f[k] = length of the longest strictly-increasing-in-index_b run
+    # of candidates starting at k (inclusive).
+    f = [1] * m
+    for k in range(m - 2, -1, -1):
+        best = 0
+        v_k = candidates[k][1]
+        for j in range(k + 1, m):
+            if candidates[j][1] > v_k and f[j] > best:
+                best = f[j]
+        f[k] = 1 + best
+
+    max_len = max(f)
+    selected: list[tuple[int, int]] = []
+    remaining = max_len
+    last_b = -1
+    for k in range(m):
+        if remaining == 0:
+            break
+        a_idx, b_idx = candidates[k]
+        if f[k] == remaining and b_idx > last_b:
+            selected.append((a_idx, b_idx))
+            last_b = b_idx
+            remaining -= 1
+
+    return [AlignedPair(index_a=a_idx, index_b=b_idx, tier="anchor") for a_idx, b_idx in selected]

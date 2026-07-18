@@ -18,6 +18,7 @@ from jig.replay.align import (
     UnmatchedEvent,
     ToolEvent,
     _tier1_identity,
+    _tier2_anchors,
     resolve_identity,
 )
 
@@ -581,3 +582,70 @@ def test_tier1_missing_tool_entry_in_mapping_is_identity_less():
     assert pairs == []
     assert [i for i, _ in rem_a] == [0]
     assert [i for i, _ in rem_b] == [0]
+
+
+# --- _tier2_anchors ---
+
+
+def _rem(*items: tuple[int, str]) -> list[tuple[int, ToolEvent]]:
+    return [(idx, _ev(name)) for idx, name in items]
+
+
+def test_tier2_unique_anchors_selected_in_order():
+    remainder_a = _rem((0, "A"), (1, "B"), (2, "C"))
+    remainder_b = _rem((0, "A"), (1, "B"), (2, "C"))
+    anchors = _tier2_anchors(remainder_a, remainder_b)
+    assert anchors == [
+        AlignedPair(0, 0, "anchor"),
+        AlignedPair(1, 1, "anchor"),
+        AlignedPair(2, 2, "anchor"),
+    ]
+
+
+def test_tier2_no_anchors_when_no_shared_names():
+    remainder_a = _rem((0, "A"))
+    remainder_b = _rem((0, "B"))
+    assert _tier2_anchors(remainder_a, remainder_b) == []
+
+
+def test_tier2_empty_remainders_no_anchors():
+    assert _tier2_anchors([], []) == []
+
+
+def test_tier2_unique_on_a_repeated_on_b_is_not_an_anchor():
+    remainder_a = _rem((0, "A"))
+    remainder_b = _rem((0, "A"), (1, "A"))
+    assert _tier2_anchors(remainder_a, remainder_b) == []
+
+
+def test_tier2_repeated_on_a_unique_on_b_is_not_an_anchor():
+    remainder_a = _rem((0, "A"), (1, "A"))
+    remainder_b = _rem((0, "A"))
+    assert _tier2_anchors(remainder_a, remainder_b) == []
+
+
+def test_tier2_crossing_candidates_only_non_crossing_selected():
+    # 'A' at a=0,b=1 and 'B' at a=1,b=0 — cross each other; only one
+    # can survive as an anchor since the pair can't both be increasing.
+    remainder_a = _rem((0, "A"), (1, "B"))
+    remainder_b = _rem((0, "B"), (1, "A"))
+    anchors = _tier2_anchors(remainder_a, remainder_b)
+    # Lexicographically smallest single-length selection is (0, 1) ("A").
+    assert anchors == [AlignedPair(0, 1, "anchor")]
+
+
+def test_tier2_equal_length_lis_lexicographically_smallest_tie_break():
+    # a-order: X0, X1, X2, X3 at original indices 10, 20, 30, 40.
+    # b unique-occurrence original indices: X0->1, X2->2, X1->3, X3->4.
+    # v (by a-order) = [1, 3, 2, 4]: two length-3 increasing subsequences
+    # exist ([1,3,4] via X0,X1,X3 and [1,2,4] via X0,X2,X3); the
+    # lexicographically smallest picks X1 (index_a=20) over X2 (index_a=30)
+    # as the second element.
+    remainder_a = _rem((10, "X0"), (20, "X1"), (30, "X2"), (40, "X3"))
+    remainder_b = _rem((1, "X0"), (2, "X2"), (3, "X1"), (4, "X3"))
+    anchors = _tier2_anchors(remainder_a, remainder_b)
+    assert anchors == [
+        AlignedPair(10, 1, "anchor"),
+        AlignedPair(20, 3, "anchor"),
+        AlignedPair(40, 4, "anchor"),
+    ]
