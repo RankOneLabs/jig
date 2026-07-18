@@ -1,8 +1,17 @@
 """Structured diff between two recorded traces.
 
-Pairs TOOL_CALL spans by ordinal position, reports the first field
-that diverges (name > args > output > error), and rolls up final-output,
-cost, latency, grader-score, and error-category deltas.
+Aligns each trace's TOOL_CALL spans via :mod:`jig.replay.align`
+(legacy ordinal by default; three-tier identity-aware when the caller
+supplies ``identity_fields`` — see :func:`trace_diff`), reports the
+first field that diverges per aligned pair (name > args > output >
+error), and rolls up final-output, cost, latency, grader-score, and
+error-category deltas.
+
+Identity matching is order-insensitive: equal keyed calls that moved
+position produce no divergence, so :attr:`TraceDiff.identical` does
+not imply the two tool-call sequences are identical in source order —
+see :class:`TraceDiff` and :func:`trace_diff` for the full semantics.
+Report order is A-centric, not B position or pair-generation order.
 
 ``submit_output`` spans are intentionally skipped — they're runner-
 internal bookkeeping, not agent-observable tool calls, and including
@@ -53,6 +62,22 @@ class ToolDiff:
 
 @dataclass
 class TraceDiff:
+    """Structured comparison of two recorded traces.
+
+    ``tool_divergence`` is built A-centrically: divergent pairs and
+    ``only_a`` entries are sorted by their trace-A source index
+    (``index_a``), followed by every ``only_b`` entry sorted by its
+    trace-B source index (``index_b``); ``ToolDiff.index`` is then
+    assigned as consecutive report ordinals starting at zero. Under
+    identity alignment (see ``identity_fields`` on :func:`trace_diff`),
+    equal keyed calls can pair out of trace-B source order without
+    producing a divergence — use ``index_b`` on each :class:`ToolDiff`,
+    not report position, to recover a divergence's location in trace
+    B. Neither this report nor :attr:`identical` / :attr:`fully_identical`
+    proves the two tool-call sequences are exactly equal; ordering
+    assertions belong to ``TrajectoryGrader``.
+    """
+
     trace_a_id: str
     trace_b_id: str
     tool_divergence: list[ToolDiff] = field(default_factory=list)
@@ -68,16 +93,25 @@ class TraceDiff:
 
     @property
     def identical(self) -> bool:
-        """True when the two traces show no *behavioral* divergence.
+        """True when the two traces show no *behavioral* divergence
+        under the alignment selected for this diff.
 
-        "Behavioral" means tool-call sequence, final output, terminal
-        error category, and grader scores all match. ``cost_delta`` and
-        ``latency_ms_delta`` are deliberately excluded — swapping models
-        is the main use case, and a different model will almost always
-        have different token prices and latency, so folding those in
-        would make ``identical`` always False for the exact workflow
-        this property exists to support. Use :attr:`fully_identical`
-        when you want to detect any change at all.
+        "Behavioral" means the aligned tool calls, final output,
+        terminal error category, and grader scores all match.
+        ``cost_delta`` and ``latency_ms_delta`` are deliberately
+        excluded — swapping models is the main use case, and a
+        different model will almost always have different token prices
+        and latency, so folding those in would make ``identical``
+        always False for the exact workflow this property exists to
+        support. Use :attr:`fully_identical` when you want to detect
+        any change at all.
+
+        Identity matching (see ``identity_fields`` on
+        :func:`trace_diff`) is order-insensitive: two traces that make
+        the same identity-keyed calls in a different order are
+        ``identical`` even though their tool-call *sequences* differ.
+        This property does not prove exact sequence equality; sequence
+        ordering assertions belong to ``TrajectoryGrader``.
         """
         return (
             not self.tool_divergence
@@ -92,7 +126,9 @@ class TraceDiff:
 
         Stricter sibling of :attr:`identical`. Useful when you're not
         swapping models — e.g. verifying a deterministic replay of the
-        same config reproduces the recording down to spend.
+        same config reproduces the recording down to spend. Like
+        :attr:`identical`, this does not prove exact tool-call sequence
+        equality under identity alignment.
         """
         return (
             self.identical
