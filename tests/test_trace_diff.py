@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pytest
@@ -99,6 +99,169 @@ def _llm(trace_id: str, idx: int, cost: float) -> Span:
         parent_id=f"{trace_id}-root",
         usage=Usage(input_tokens=5, output_tokens=5, cost=cost),
     )
+
+
+# --- Legacy-equivalence scaffolding ---
+#
+# ``_legacy_fields`` extracts every field a caller could observe from a
+# TraceDiff before the ToolDiff schema grew tier/index_a/index_b, so it
+# can pin behavioral equivalence across the alignment-integration change
+# without demanding byte-identical dataclasses. ``_LEGACY_FIXTURES``
+# mirrors every pre-existing StubTracer-based fixture shape in this file
+# so each can be replayed under different alignment configurations.
+
+
+def _legacy_fields(diff: TraceDiff) -> dict[str, Any]:
+    return {
+        "divergence_count": len(diff.tool_divergence),
+        "kinds": [d.divergence for d in diff.tool_divergence],
+        "payloads": [(d.a, d.b) for d in diff.tool_divergence],
+        "output_diff": diff.output_diff,
+        "error_category_change": diff.error_category_change,
+        "score_deltas": diff.score_deltas,
+        "score_details": diff.score_details,
+        "cost_delta": diff.cost_delta,
+        "latency_ms_delta": diff.latency_ms_delta,
+        "identical": diff.identical,
+        "fully_identical": diff.fully_identical,
+    }
+
+
+def _fixture_identical() -> tuple[_StubTracer, str, str]:
+    return _StubTracer({
+        "a": [_root("a", output="done"), _tool("a", 0, "echo", {"text": "x"}, "x")],
+        "b": [_root("b", output="done"), _tool("b", 0, "echo", {"text": "x"}, "x")],
+    }), "a", "b"
+
+
+def _fixture_args_divergence() -> tuple[_StubTracer, str, str]:
+    return _StubTracer({
+        "a": [_root("a"), _tool("a", 0, "echo", {"text": "x"}, "x")],
+        "b": [_root("b"), _tool("b", 0, "echo", {"text": "y"}, "y")],
+    }), "a", "b"
+
+
+def _fixture_only_b_trailing() -> tuple[_StubTracer, str, str]:
+    return _StubTracer({
+        "a": [_root("a"), _tool("a", 0, "echo", {"text": "x"}, "x")],
+        "b": [
+            _root("b"),
+            _tool("b", 0, "echo", {"text": "x"}, "x"),
+            _tool("b", 1, "echo", {"text": "extra"}, "extra"),
+        ],
+    }), "a", "b"
+
+
+def _fixture_only_a_missing() -> tuple[_StubTracer, str, str]:
+    return _StubTracer({
+        "a": [
+            _root("a"),
+            _tool("a", 0, "echo", {"text": "x"}, "x"),
+            _tool("a", 1, "echo", {"text": "y"}, "y"),
+        ],
+        "b": [_root("b"), _tool("b", 0, "echo", {"text": "x"}, "x")],
+    }), "a", "b"
+
+
+def _fixture_output_diff() -> tuple[_StubTracer, str, str]:
+    return _StubTracer({
+        "a": [_root("a", output="alpha")],
+        "b": [_root("b", output="beta")],
+    }), "a", "b"
+
+
+def _fixture_error_category_change() -> tuple[_StubTracer, str, str]:
+    return _StubTracer({
+        "a": [_root("a", error_category="max_llm_calls")],
+        "b": [_root("b", error_category=None)],
+    }), "a", "b"
+
+
+def _fixture_score_deltas() -> tuple[_StubTracer, str, str]:
+    return _StubTracer({
+        "a": [_root("a"), _grading("a", [{"dimension": "quality", "value": 0.6}])],
+        "b": [_root("b"), _grading("b", [{"dimension": "quality", "value": 0.8}])],
+    }), "a", "b"
+
+
+def _fixture_score_deltas_add_drop() -> tuple[_StubTracer, str, str]:
+    return _StubTracer({
+        "a": [_root("a"), _grading("a", [
+            {"dimension": "quality", "value": 0.7},
+            {"dimension": "accuracy", "value": 0.5},
+        ])],
+        "b": [_root("b"), _grading("b", [
+            {"dimension": "quality", "value": 0.7},
+            {"dimension": "relevance", "value": 0.9},
+        ])],
+    }), "a", "b"
+
+
+def _fixture_cost_latency_drift() -> tuple[_StubTracer, str, str]:
+    return _StubTracer({
+        "a": [_root("a", output="done", duration_ms=10.0), _llm("a", 0, cost=0.01)],
+        "b": [_root("b", output="done", duration_ms=50.0), _llm("b", 0, cost=0.05)],
+    }), "a", "b"
+
+
+def _fixture_cost_latency_delta() -> tuple[_StubTracer, str, str]:
+    return _StubTracer({
+        "a": [
+            _root("a", duration_ms=100.0),
+            _llm("a", 0, cost=0.01),
+            _llm("a", 1, cost=0.02),
+        ],
+        "b": [
+            _root("b", duration_ms=250.0),
+            _llm("b", 0, cost=0.05),
+        ],
+    }), "a", "b"
+
+
+def _fixture_submit_output_ignored() -> tuple[_StubTracer, str, str]:
+    return _StubTracer({
+        "a": [
+            _root("a"),
+            Span(
+                id="a-so", trace_id="a", kind=SpanKind.TOOL_CALL, name="submit_output",
+                started_at=datetime.now(), input={"result": "x"}, output="{}",
+            ),
+        ],
+        "b": [
+            _root("b"),
+            Span(
+                id="b-so", trace_id="b", kind=SpanKind.TOOL_CALL, name="submit_output",
+                started_at=datetime.now(), input={"result": "y"}, output="{}",
+            ),
+        ],
+    }), "a", "b"
+
+
+_LEGACY_FIXTURES: list[tuple[str, Callable[[], tuple[_StubTracer, str, str]]]] = [
+    ("identical", _fixture_identical),
+    ("args_divergence", _fixture_args_divergence),
+    ("only_b_trailing", _fixture_only_b_trailing),
+    ("only_a_missing", _fixture_only_a_missing),
+    ("output_diff", _fixture_output_diff),
+    ("error_category_change", _fixture_error_category_change),
+    ("score_deltas", _fixture_score_deltas),
+    ("score_deltas_add_drop", _fixture_score_deltas_add_drop),
+    ("cost_latency_drift", _fixture_cost_latency_drift),
+    ("cost_latency_delta", _fixture_cost_latency_delta),
+    ("submit_output_ignored", _fixture_submit_output_ignored),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name,build", _LEGACY_FIXTURES, ids=[n for n, _ in _LEGACY_FIXTURES])
+async def test_legacy_fields_helper_is_stable(name, build):
+    """Guard for the legacy-equivalence harness: the field-extraction
+    helper and fixture table must themselves be deterministic before
+    they're used to pin identity_fields=None vs. {} equivalence."""
+    tracer, id_a, id_b = build()
+    diff1 = await trace_diff(id_a, id_b, tracer=tracer)
+    diff2 = await trace_diff(id_a, id_b, tracer=tracer)
+    assert _legacy_fields(diff1) == _legacy_fields(diff2)
 
 
 @pytest.mark.asyncio
