@@ -58,6 +58,43 @@ class ToolDefinition:
     name: str
     description: str
     parameters: dict[str, Any]
+    # Optional declaration of argument paths (dot-separated for nested
+    # dicts) that jointly identify "the same real-world entity" across
+    # calls to this tool, for replay alignment. ``None`` means the tool
+    # author has not declared an identity; see jig.replay.align.
+    identity_fields: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.identity_fields is None:
+            return
+        if len(self.identity_fields) == 0:
+            raise ValueError(
+                "ToolDefinition.identity_fields must not be an empty list "
+                "(omit it, or pass None, to declare no identity)"
+            )
+        seen: set[str] = set()
+        for path in self.identity_fields:
+            if not isinstance(path, str):
+                raise ValueError(
+                    f"ToolDefinition.identity_fields entries must be str, "
+                    f"got {path!r}"
+                )
+            if path == "":
+                raise ValueError(
+                    "ToolDefinition.identity_fields entries must not be "
+                    "empty strings"
+                )
+            if any(segment == "" for segment in path.split(".")):
+                raise ValueError(
+                    f"ToolDefinition.identity_fields entry {path!r} has an "
+                    f"empty dot segment"
+                )
+            if path in seen:
+                raise ValueError(
+                    f"ToolDefinition.identity_fields entry {path!r} is "
+                    f"repeated"
+                )
+            seen.add(path)
 
 
 @dataclass
