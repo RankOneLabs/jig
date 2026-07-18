@@ -1,5 +1,6 @@
-"""Tests for tool-identity declaration (``ToolDefinition.identity_fields``)
-and fail-soft resolution (``jig.replay.align.resolve_identity``).
+"""Tests for tool-identity declaration (``ToolDefinition.identity_fields``),
+fail-soft resolution (``jig.replay.align.resolve_identity``), and the
+three-tier deterministic alignment engine (identity, anchor, ordinal).
 """
 from __future__ import annotations
 
@@ -8,7 +9,17 @@ import math
 import pytest
 
 from jig.core.types import ToolDefinition
-from jig.replay.align import resolve_identity
+from jig.replay.align import (
+    AlignedPair,
+    Alignment,
+    UnmatchedEvent,
+    ToolEvent,
+    resolve_identity,
+)
+
+
+def _ev(name: str = "t", args: dict | None = None) -> ToolEvent:
+    return ToolEvent(name=name, args=args if args is not None else {}, output=None, error=None)
 
 
 def _make_tool(identity_fields: list[str] | None = None) -> ToolDefinition:
@@ -252,3 +263,108 @@ def test_resolve_identity_scopes_by_tool_name():
     assert key_a != key_b
     assert key_a[0] == "tool_a"
     assert key_b[0] == "tool_b"
+
+
+# --- Alignment.validate(): invariant checks ---
+
+
+def test_validate_accepts_trivial_ordinal_pair():
+    a = [_ev()]
+    b = [_ev()]
+    alignment = Alignment(pairs=[AlignedPair(0, 0, "ordinal")], only_a=[], only_b=[])
+    alignment.validate(a, b)
+
+
+def test_validate_rejects_missing_a_index():
+    a = [_ev(), _ev()]
+    b = [_ev()]
+    alignment = Alignment(pairs=[AlignedPair(0, 0, "ordinal")], only_a=[], only_b=[])
+    with pytest.raises(AssertionError):
+        alignment.validate(a, b)
+
+
+def test_validate_rejects_duplicated_a_index():
+    a = [_ev()]
+    b = [_ev(), _ev()]
+    alignment = Alignment(
+        pairs=[AlignedPair(0, 0, "ordinal"), AlignedPair(0, 1, "ordinal")],
+        only_a=[],
+        only_b=[],
+    )
+    with pytest.raises(AssertionError):
+        alignment.validate(a, b)
+
+
+def test_validate_rejects_out_of_range_index():
+    a = [_ev()]
+    b = [_ev()]
+    alignment = Alignment(pairs=[AlignedPair(0, 1, "ordinal")], only_a=[], only_b=[])
+    with pytest.raises(AssertionError):
+        alignment.validate(a, b)
+
+
+def test_validate_rejects_unsorted_pairs():
+    a = [_ev(), _ev()]
+    b = [_ev(), _ev()]
+    alignment = Alignment(
+        pairs=[AlignedPair(1, 1, "ordinal"), AlignedPair(0, 0, "ordinal")],
+        only_a=[],
+        only_b=[],
+    )
+    with pytest.raises(AssertionError):
+        alignment.validate(a, b)
+
+
+def test_validate_rejects_unsorted_only_a():
+    a = [_ev(), _ev()]
+    b = []
+    alignment = Alignment(
+        pairs=[],
+        only_a=[UnmatchedEvent(1, "ordinal"), UnmatchedEvent(0, "ordinal")],
+        only_b=[],
+    )
+    with pytest.raises(AssertionError):
+        alignment.validate(a, b)
+
+
+def test_validate_rejects_unsorted_only_b():
+    a = []
+    b = [_ev(), _ev()]
+    alignment = Alignment(
+        pairs=[],
+        only_a=[],
+        only_b=[UnmatchedEvent(1, "ordinal"), UnmatchedEvent(0, "ordinal")],
+    )
+    with pytest.raises(AssertionError):
+        alignment.validate(a, b)
+
+
+def test_validate_rejects_keyed_pair_at_wrong_tier():
+    a = [_ev("lookup", {"id": "abc"})]
+    b = [_ev("lookup", {"id": "abc"})]
+    alignment = Alignment(pairs=[AlignedPair(0, 0, "ordinal")], only_a=[], only_b=[])
+    with pytest.raises(AssertionError):
+        alignment.validate(a, b, identity_fields={"lookup": ["id"]})
+
+
+def test_validate_rejects_mismatched_keys_at_identity_tier():
+    a = [_ev("lookup", {"id": "abc"})]
+    b = [_ev("lookup", {"id": "xyz"})]
+    alignment = Alignment(pairs=[AlignedPair(0, 0, "identity")], only_a=[], only_b=[])
+    with pytest.raises(AssertionError):
+        alignment.validate(a, b, identity_fields={"lookup": ["id"]})
+
+
+def test_validate_rejects_keyed_versus_unkeyed_pair():
+    a = [_ev("lookup", {"id": "abc"})]
+    b = [_ev("other", {})]
+    alignment = Alignment(pairs=[AlignedPair(0, 0, "anchor")], only_a=[], only_b=[])
+    with pytest.raises(AssertionError):
+        alignment.validate(a, b, identity_fields={"lookup": ["id"]})
+
+
+def test_validate_accepts_equal_key_identity_pair():
+    a = [_ev("lookup", {"id": "abc"})]
+    b = [_ev("lookup", {"id": "abc"})]
+    alignment = Alignment(pairs=[AlignedPair(0, 0, "identity")], only_a=[], only_b=[])
+    alignment.validate(a, b, identity_fields={"lookup": ["id"]})
