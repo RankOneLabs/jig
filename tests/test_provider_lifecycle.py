@@ -12,11 +12,31 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from jig.core.types import CompletionParams, LLMResponse, Message, Role, Usage
+from jig.core.types import CompletionParams, LLMResponse, Message, Role, ToolDefinition, Usage
 
 
 def _dummy_params() -> CompletionParams:
     return CompletionParams(messages=[Message(role=Role.USER, content="hi")])
+
+
+def _identity_tool() -> ToolDefinition:
+    return ToolDefinition(
+        name="lookup_customer",
+        description="Look up a customer record",
+        parameters={"type": "object", "properties": {"id": {"type": "string"}}},
+        identity_fields=["id"],
+    )
+
+
+def _assert_no_identity_fields_key(obj) -> None:
+    """Recursively assert that ``identity_fields`` never appears as a dict key."""
+    if isinstance(obj, dict):
+        assert "identity_fields" not in obj, f"identity_fields leaked into {obj!r}"
+        for value in obj.values():
+            _assert_no_identity_fields_key(value)
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            _assert_no_identity_fields_key(item)
 
 
 def _mock_response() -> LLMResponse:
@@ -504,3 +524,48 @@ class TestManagedMemorySdkLifecycle:
         await memory.close()
 
         sdk_client.close.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# identity_fields exclusion from provider-facing tool schemas
+# ---------------------------------------------------------------------------
+# identity_fields is jig-internal metadata (see jig.replay.align). Each
+# adapter already whitelists the fields it serializes onto the wire; these
+# tests prove that whitelisting also holds for a ToolDefinition that
+# declares an identity.
+
+
+class TestIdentityFieldsExcludedFromProviderSchemas:
+    def test_anthropic_schema_excludes_identity_fields(self):
+        from jig.llm.anthropic import AnthropicClient
+
+        payload = AnthropicClient._convert_tools(None, [_identity_tool()])
+        _assert_no_identity_fields_key(payload)
+        assert payload[0]["name"] == "lookup_customer"
+
+    def test_openai_schema_excludes_identity_fields(self):
+        from jig.llm.openai import OpenAIClient
+
+        payload = OpenAIClient._convert_tools(None, [_identity_tool()])
+        _assert_no_identity_fields_key(payload)
+        assert payload[0]["function"]["name"] == "lookup_customer"
+
+    def test_ollama_schema_excludes_identity_fields(self):
+        from jig.llm.ollama import OllamaClient
+
+        payload = OllamaClient._convert_tools(None, [_identity_tool()])
+        _assert_no_identity_fields_key(payload)
+        assert payload[0]["function"]["name"] == "lookup_customer"
+
+    def test_gemini_schema_excludes_identity_fields(self):
+        genai_types_stub = MagicMock()
+
+        with patch("jig.llm.google.genai_types", genai_types_stub):
+            from jig.llm.google import GeminiClient
+
+            GeminiClient._convert_tools(None, [_identity_tool()])
+
+        call_kwargs = genai_types_stub.FunctionDeclaration.call_args.kwargs
+        assert "identity_fields" not in call_kwargs
+        assert set(call_kwargs) == {"name", "description", "parameters"}
+        assert call_kwargs["name"] == "lookup_customer"
