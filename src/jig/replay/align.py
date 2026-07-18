@@ -393,3 +393,88 @@ def _tier2_anchors(
             remaining -= 1
 
     return [AlignedPair(index_a=a_idx, index_b=b_idx, tier="anchor") for a_idx, b_idx in selected]
+
+
+def _segment(
+    remainder: list[tuple[int, ToolEvent]], anchor_orig_indices: list[int]
+) -> list[list[tuple[int, ToolEvent]]]:
+    """Split ``remainder`` into ``len(anchor_orig_indices) + 1`` runs.
+
+    Anchor elements themselves are dropped (they're already paired at
+    tier 2); everything else lands in the run before, between, or
+    after the anchors that bound it.
+    """
+    anchor_set = set(anchor_orig_indices)
+    segments: list[list[tuple[int, ToolEvent]]] = [[]]
+    for orig_idx, event in remainder:
+        if orig_idx in anchor_set:
+            segments.append([])
+        else:
+            segments[-1].append((orig_idx, event))
+    return segments
+
+
+def _tier3_ordinal_segments(
+    remainder_a: list[tuple[int, ToolEvent]],
+    remainder_b: list[tuple[int, ToolEvent]],
+    anchors: list[AlignedPair],
+) -> tuple[list[AlignedPair], list[UnmatchedEvent], list[UnmatchedEvent]]:
+    """Ordinal fallback, local to each anchor-delimited segment.
+
+    Partitions both remainders around the selected anchors (before,
+    between, after), zips corresponding segments by position, and
+    emits each segment's overhang as sorted ordinal-tier unmatched.
+    Crossing or otherwise-unselected tier-2 candidates fall into a
+    segment here like any other identity-less event — their overhang,
+    if any, carries ordinal (not anchor) provenance.
+    """
+    anchors_sorted = sorted(anchors, key=lambda p: p.index_a)
+    segments_a = _segment(remainder_a, [p.index_a for p in anchors_sorted])
+    segments_b = _segment(remainder_b, [p.index_b for p in anchors_sorted])
+
+    pairs: list[AlignedPair] = []
+    only_a: list[UnmatchedEvent] = []
+    only_b: list[UnmatchedEvent] = []
+
+    for seg_a, seg_b in zip(segments_a, segments_b):
+        n = min(len(seg_a), len(seg_b))
+        for k in range(n):
+            pairs.append(AlignedPair(index_a=seg_a[k][0], index_b=seg_b[k][0], tier="ordinal"))
+        for orig_idx, _ in seg_a[n:]:
+            only_a.append(UnmatchedEvent(index=orig_idx, tier="ordinal"))
+        for orig_idx, _ in seg_b[n:]:
+            only_b.append(UnmatchedEvent(index=orig_idx, tier="ordinal"))
+
+    return pairs, only_a, only_b
+
+
+class IdentityAligner:
+    """Three-tier deterministic alignment: identity, then anchor, then
+    segment-local ordinal fallback.
+
+    Only tier-1 ("identity") pairs assert entity-level event continuity
+    — see the module-level note above. Identity matching is
+    order-insensitive; anchors and ordinal fallback are purely
+    structural. Whether the resulting pair *sequence* is in the
+    expected order is downstream business, not asserted here.
+    """
+
+    def align(
+        self,
+        a: list[ToolEvent],
+        b: list[ToolEvent],
+        *,
+        identity_fields: Mapping[str, list[str]] | None = None,
+    ) -> Alignment:
+        id_pairs, id_only_a, id_only_b, remainder_a, remainder_b = _tier1_identity(
+            a, b, identity_fields
+        )
+        anchors = _tier2_anchors(remainder_a, remainder_b)
+        ord_pairs, ord_only_a, ord_only_b = _tier3_ordinal_segments(
+            remainder_a, remainder_b, anchors
+        )
+
+        pairs = sorted(id_pairs + anchors + ord_pairs, key=lambda p: p.index_a)
+        only_a = sorted(id_only_a + ord_only_a, key=lambda u: u.index)
+        only_b = sorted(id_only_b + ord_only_b, key=lambda u: u.index)
+        return Alignment(pairs=pairs, only_a=only_a, only_b=only_b)

@@ -17,8 +17,10 @@ from jig.replay.align import (
     OrdinalAligner,
     UnmatchedEvent,
     ToolEvent,
+    IdentityAligner,
     _tier1_identity,
     _tier2_anchors,
+    _tier3_ordinal_segments,
     resolve_identity,
 )
 
@@ -649,3 +651,163 @@ def test_tier2_equal_length_lis_lexicographically_smallest_tie_break():
         AlignedPair(20, 3, "anchor"),
         AlignedPair(40, 4, "anchor"),
     ]
+
+
+# --- _tier3_ordinal_segments ---
+
+
+def test_tier3_pairs_between_and_after_anchors():
+    remainder_a = _rem((0, "p"), (1, "q"), (2, "anchor"), (3, "r"))
+    remainder_b = _rem((0, "p"), (1, "anchor"), (2, "r"))
+    anchors = [AlignedPair(2, 1, "anchor")]
+    pairs, only_a, only_b = _tier3_ordinal_segments(remainder_a, remainder_b, anchors)
+    assert pairs == [
+        AlignedPair(0, 0, "ordinal"),
+        AlignedPair(3, 2, "ordinal"),
+    ]
+    assert only_a == [UnmatchedEvent(1, "ordinal")]
+    assert only_b == []
+
+
+def test_tier3_segment_overhang_both_sides():
+    remainder_a = _rem((0, "x"), (1, "y"), (2, "ANCHOR"), (3, "z"), (4, "w"))
+    remainder_b = _rem((0, "x"), (10, "ANCHOR"), (11, "z"))
+    anchors = [AlignedPair(2, 10, "anchor")]
+    pairs, only_a, only_b = _tier3_ordinal_segments(remainder_a, remainder_b, anchors)
+    assert pairs == [
+        AlignedPair(0, 0, "ordinal"),
+        AlignedPair(3, 11, "ordinal"),
+    ]
+    assert only_a == [UnmatchedEvent(1, "ordinal"), UnmatchedEvent(4, "ordinal")]
+    assert only_b == []
+
+
+def test_tier3_crossing_candidate_gets_ordinal_unmatched_provenance():
+    # From the crossing-anchors scenario: 'A' at a=0,b=1 was selected as
+    # the anchor; the crossing 'B' candidate (a=1,b=0) was excluded and
+    # must resurface here with ordinal (never anchor) tier, unpaired.
+    remainder_a = _rem((0, "A"), (1, "B"))
+    remainder_b = _rem((0, "B"), (1, "A"))
+    anchors = [AlignedPair(0, 1, "anchor")]
+    pairs, only_a, only_b = _tier3_ordinal_segments(remainder_a, remainder_b, anchors)
+    assert pairs == []
+    assert only_a == [UnmatchedEvent(1, "ordinal")]
+    assert only_b == [UnmatchedEvent(0, "ordinal")]
+    assert all(u.tier == "ordinal" for u in only_a + only_b)
+
+
+def test_tier3_no_anchors_is_one_segment_spanning_everything():
+    remainder_a = _rem((0, "a"), (1, "b"), (2, "c"))
+    remainder_b = _rem((0, "a"), (1, "b"))
+    pairs, only_a, only_b = _tier3_ordinal_segments(remainder_a, remainder_b, [])
+    assert pairs == [AlignedPair(0, 0, "ordinal"), AlignedPair(1, 1, "ordinal")]
+    assert only_a == [UnmatchedEvent(2, "ordinal")]
+    assert only_b == []
+
+
+# --- IdentityAligner: full integration ---
+
+
+def test_identity_aligner_combines_all_three_tiers():
+    identity_fields = {"lookup": ["id"]}
+    a = [
+        _ev("lookup", {"id": 1}),  # 0: identity, matches b0
+        _ev("unique_x"),  # 1: anchor
+        _ev("common"),  # 2: ordinal (between anchors)
+        _ev("common"),  # 3: ordinal overhang (only_a)
+        _ev("lookup", {"id": 2}),  # 4: identity, a-only surplus
+        _ev("unique_y"),  # 5: anchor
+        _ev("tail_a"),  # 6: ordinal (after last anchor)
+    ]
+    b = [
+        _ev("lookup", {"id": 1}),  # 0: identity, matches a0
+        _ev("unique_x"),  # 1: anchor
+        _ev("common"),  # 2: ordinal (between anchors)
+        _ev("unique_y"),  # 3: anchor
+        _ev("tail_b1"),  # 4: ordinal (after last anchor)
+        _ev("tail_b2"),  # 5: ordinal overhang (only_b)
+    ]
+
+    alignment = IdentityAligner().align(a, b, identity_fields=identity_fields)
+    alignment.validate(a, b, identity_fields=identity_fields)
+
+    assert alignment.pairs == [
+        AlignedPair(0, 0, "identity"),
+        AlignedPair(1, 1, "anchor"),
+        AlignedPair(2, 2, "ordinal"),
+        AlignedPair(5, 3, "anchor"),
+        AlignedPair(6, 4, "ordinal"),
+    ]
+    assert alignment.only_a == [UnmatchedEvent(3, "ordinal"), UnmatchedEvent(4, "identity")]
+    assert alignment.only_b == [UnmatchedEvent(5, "ordinal")]
+
+
+def test_identity_aligner_pairs_sorted_ascending_by_index_a():
+    identity_fields = {"lookup": ["id"]}
+    a = [
+        _ev("lookup", {"id": 2}),  # identity pair with b1 — deliberately
+        _ev("unique_x"),           # out of a/b-position sync with anchors
+        _ev("lookup", {"id": 1}),
+    ]
+    b = [
+        _ev("lookup", {"id": 1}),
+        _ev("lookup", {"id": 2}),
+        _ev("unique_x"),
+    ]
+    alignment = IdentityAligner().align(a, b, identity_fields=identity_fields)
+    index_a_seq = [p.index_a for p in alignment.pairs]
+    assert index_a_seq == sorted(index_a_seq)
+    alignment.validate(a, b, identity_fields=identity_fields)
+
+
+def test_identity_aligner_complete_partitioning_via_validate():
+    identity_fields = {"lookup": ["id"]}
+    a = [_ev("lookup", {"id": 1}), _ev("x"), _ev("y"), _ev("lookup", {"id": 3})]
+    b = [_ev("y"), _ev("lookup", {"id": 1}), _ev("x"), _ev("z")]
+    alignment = IdentityAligner().align(a, b, identity_fields=identity_fields)
+    alignment.validate(a, b, identity_fields=identity_fields)  # raises if partition incomplete
+
+
+def test_identity_aligner_identical_repeat_run_results():
+    identity_fields = {"lookup": ["id"]}
+
+    def build():
+        return (
+            [
+                _ev("lookup", {"id": 1}),
+                _ev("unique_x"),
+                _ev("common"),
+                _ev("common"),
+                _ev("lookup", {"id": 2}),
+                _ev("unique_y"),
+                _ev("tail_a"),
+            ],
+            [
+                _ev("lookup", {"id": 1}),
+                _ev("unique_x"),
+                _ev("common"),
+                _ev("unique_y"),
+                _ev("tail_b1"),
+                _ev("tail_b2"),
+            ],
+        )
+
+    a1, b1 = build()
+    a2, b2 = build()
+    aligner = IdentityAligner()
+    alignment1 = aligner.align(a1, b1, identity_fields=identity_fields)
+    alignment2 = aligner.align(a2, b2, identity_fields=identity_fields)
+    assert alignment1.pairs == alignment2.pairs
+    assert alignment1.only_a == alignment2.only_a
+    assert alignment1.only_b == alignment2.only_b
+
+
+def test_identity_aligner_without_identity_fields_still_finds_anchors():
+    # identity_fields=None makes every event identity-less, but the
+    # anchor/ordinal tiers still run — unlike OrdinalAligner.
+    a = [_ev("common"), _ev("unique_x"), _ev("common")]
+    b = [_ev("unique_x"), _ev("common")]
+    alignment = IdentityAligner().align(a, b)
+    alignment.validate(a, b)
+    assert AlignedPair(1, 0, "anchor") in alignment.pairs
+    assert all(p.tier != "identity" for p in alignment.pairs)
