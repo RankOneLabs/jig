@@ -15,6 +15,7 @@ import logging
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from itertools import zip_longest
 from typing import Any, Literal, Protocol
 
 logger = logging.getLogger(__name__)
@@ -215,3 +216,35 @@ class Aligner(Protocol):
         *,
         identity_fields: Mapping[str, list[str]] | None = None,
     ) -> Alignment: ...
+
+
+_OVERHANG = object()
+
+
+class OrdinalAligner:
+    """Legacy pairing: zip by source position, no identity awareness.
+
+    Pairs index ``i`` with ``i`` through ``min(len(a), len(b))``; the
+    longer side's overhang becomes sorted ordinal-tier unmatched events.
+    ``identity_fields`` is accepted (to satisfy :class:`Aligner`) and
+    ignored.
+    """
+
+    def align(
+        self,
+        a: list[ToolEvent],
+        b: list[ToolEvent],
+        *,
+        identity_fields: Mapping[str, list[str]] | None = None,
+    ) -> Alignment:
+        pairs: list[AlignedPair] = []
+        only_a: list[UnmatchedEvent] = []
+        only_b: list[UnmatchedEvent] = []
+        for i, (event_a, event_b) in enumerate(zip_longest(a, b, fillvalue=_OVERHANG)):
+            if event_a is _OVERHANG:
+                only_b.append(UnmatchedEvent(index=i, tier="ordinal"))
+            elif event_b is _OVERHANG:
+                only_a.append(UnmatchedEvent(index=i, tier="ordinal"))
+            else:
+                pairs.append(AlignedPair(index_a=i, index_b=i, tier="ordinal"))
+        return Alignment(pairs=pairs, only_a=only_a, only_b=only_b)

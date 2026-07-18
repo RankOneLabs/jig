@@ -5,6 +5,8 @@ three-tier deterministic alignment engine (identity, anchor, ordinal).
 from __future__ import annotations
 
 import math
+import random
+from itertools import zip_longest
 
 import pytest
 
@@ -12,6 +14,7 @@ from jig.core.types import ToolDefinition
 from jig.replay.align import (
     AlignedPair,
     Alignment,
+    OrdinalAligner,
     UnmatchedEvent,
     ToolEvent,
     resolve_identity,
@@ -368,3 +371,108 @@ def test_validate_accepts_equal_key_identity_pair():
     b = [_ev("lookup", {"id": "abc"})]
     alignment = Alignment(pairs=[AlignedPair(0, 0, "identity")], only_a=[], only_b=[])
     alignment.validate(a, b, identity_fields={"lookup": ["id"]})
+
+
+# --- OrdinalAligner ---
+
+
+def test_ordinal_aligner_empty_both_sides():
+    alignment = OrdinalAligner().align([], [])
+    assert alignment.pairs == []
+    assert alignment.only_a == []
+    assert alignment.only_b == []
+    alignment.validate([], [])
+
+
+def test_ordinal_aligner_equal_length_all_paired():
+    a = [_ev("x"), _ev("y"), _ev("z")]
+    b = [_ev("x"), _ev("y2"), _ev("z")]
+    alignment = OrdinalAligner().align(a, b)
+    assert alignment.pairs == [
+        AlignedPair(0, 0, "ordinal"),
+        AlignedPair(1, 1, "ordinal"),
+        AlignedPair(2, 2, "ordinal"),
+    ]
+    assert alignment.only_a == []
+    assert alignment.only_b == []
+    alignment.validate(a, b)
+
+
+def test_ordinal_aligner_a_longer_overhang_only_a():
+    a = [_ev("x"), _ev("y"), _ev("z")]
+    b = [_ev("x")]
+    alignment = OrdinalAligner().align(a, b)
+    assert alignment.pairs == [AlignedPair(0, 0, "ordinal")]
+    assert alignment.only_a == [UnmatchedEvent(1, "ordinal"), UnmatchedEvent(2, "ordinal")]
+    assert alignment.only_b == []
+    alignment.validate(a, b)
+
+
+def test_ordinal_aligner_b_longer_overhang_only_b():
+    a = [_ev("x")]
+    b = [_ev("x"), _ev("y"), _ev("z")]
+    alignment = OrdinalAligner().align(a, b)
+    assert alignment.pairs == [AlignedPair(0, 0, "ordinal")]
+    assert alignment.only_a == []
+    assert alignment.only_b == [UnmatchedEvent(1, "ordinal"), UnmatchedEvent(2, "ordinal")]
+    alignment.validate(a, b)
+
+
+def test_ordinal_aligner_ignores_identity_fields():
+    a = [_ev("lookup", {"id": "abc"})]
+    b = [_ev("lookup", {"id": "xyz"})]
+    alignment = OrdinalAligner().align(a, b, identity_fields={"lookup": ["id"]})
+    assert alignment.pairs == [AlignedPair(0, 0, "ordinal")]
+
+
+def _legacy_zip_longest_alignment(a, b):
+    """Vendored test-only copy of the pre-cohort ``trace_diff`` pairing
+    loop (see git history of ``jig/replay/diff.py`` before this cohort):
+    ``for idx, (a_span, b_span) in enumerate(zip_longest(a_tools, b_tools))``,
+    classifying each position as paired / only_a / only_b by presence.
+    Kept independent of ``OrdinalAligner`` so the compatibility check
+    below isn't just comparing the implementation to itself.
+    """
+    sentinel = object()
+    pair_indices = []
+    only_a_indices = []
+    only_b_indices = []
+    for idx, (av, bv) in enumerate(zip_longest(a, b, fillvalue=sentinel)):
+        if av is sentinel:
+            only_b_indices.append(idx)
+        elif bv is sentinel:
+            only_a_indices.append(idx)
+        else:
+            pair_indices.append(idx)
+    return pair_indices, only_a_indices, only_b_indices
+
+
+def _random_tool_event(rng: random.Random) -> ToolEvent:
+    name = rng.choice(["alpha", "beta", "gamma"])
+    args = {"k": rng.choice([1, 2, "x", None])}
+    output = rng.choice([None, "ok", "err-ish"])
+    error = rng.choice([None, "boom"])
+    return ToolEvent(name=name, args=args, output=output, error=error)
+
+
+def test_ordinal_aligner_matches_legacy_zip_longest_pairing():
+    rng = random.Random(0)
+    aligner = OrdinalAligner()
+    for _ in range(500):
+        len_a = rng.randint(0, 8)
+        len_b = rng.randint(0, 8)
+        a = [_random_tool_event(rng) for _ in range(len_a)]
+        b = [_random_tool_event(rng) for _ in range(len_b)]
+
+        expected_pairs, expected_only_a, expected_only_b = _legacy_zip_longest_alignment(a, b)
+
+        alignment = aligner.align(a, b)
+        alignment.validate(a, b)
+
+        assert [p.index_a for p in alignment.pairs] == expected_pairs
+        assert [p.index_b for p in alignment.pairs] == expected_pairs
+        assert all(p.tier == "ordinal" for p in alignment.pairs)
+        assert [u.index for u in alignment.only_a] == expected_only_a
+        assert all(u.tier == "ordinal" for u in alignment.only_a)
+        assert [u.index for u in alignment.only_b] == expected_only_b
+        assert all(u.tier == "ordinal" for u in alignment.only_b)
