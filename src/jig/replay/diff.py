@@ -11,12 +11,18 @@ them clutters the diff.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from itertools import zip_longest
 from typing import Literal
 
 from jig.core.runner import SUBMIT_OUTPUT_TOOL as _SUBMIT_OUTPUT_TOOL
 from jig.core.types import Span, SpanKind, TracingLogger
-from jig.replay.align import ToolEvent
+from jig.replay.align import (
+    Aligner,
+    Alignment,
+    AlignmentTier,
+    IdentityAligner,
+    OrdinalAligner,
+    ToolEvent,
+)
 
 ToolDivergenceKind = Literal[
     "name", "args", "output", "error", "only_a", "only_b",
@@ -25,12 +31,24 @@ ToolDivergenceKind = Literal[
 
 @dataclass
 class ToolDiff:
-    """A single divergence in the ordered TOOL_CALL stream."""
+    """A single divergence in the aligned TOOL_CALL stream.
+
+    ``index`` is the A-centric report ordinal (see :class:`TraceDiff`),
+    not a source position. ``index_a`` / ``index_b`` are the event's
+    position in the filtered (post submit_output) trace-A / trace-B
+    tool-call lists — a paired divergence has both, ``only_a`` has only
+    ``index_a``, and ``only_b`` has only ``index_b``. ``tier`` records
+    the alignment strength that produced the pairing or unmatched
+    status; see :mod:`jig.replay.align` for what each tier asserts.
+    """
 
     index: int
     divergence: ToolDivergenceKind
     a: ToolEvent | None
     b: ToolEvent | None
+    tier: AlignmentTier | None = None
+    index_a: int | None = None
+    index_b: int | None = None
 
 
 @dataclass
@@ -115,6 +133,119 @@ def _classify(a: ToolEvent, b: ToolEvent) -> ToolDivergenceKind | None:
     return None
 
 
+def _validate_identity_fields(identity_fields: dict[str, list[str]] | None) -> None:
+    """Reject a malformed raw ``identity_fields`` mapping before any I/O.
+
+    Raw dicts bypass :meth:`ToolDefinition.__post_init__`, so this
+    re-checks the same shape constraints synchronously: every tool name
+    must be a string, every declaration a non-empty list of non-empty
+    strings with no empty dot segment and no duplicate path.
+    """
+    if identity_fields is None:
+        return
+    if not isinstance(identity_fields, dict):
+        raise ValueError(
+            f"identity_fields must be a dict[str, list[str]] or None, "
+            f"got {identity_fields!r}"
+        )
+    for tool_name, paths in identity_fields.items():
+        if not isinstance(tool_name, str):
+            raise ValueError(
+                f"identity_fields has a non-string tool name: {tool_name!r}"
+            )
+        if not isinstance(paths, list):
+            raise ValueError(
+                f"identity_fields[{tool_name!r}] must be a list[str], "
+                f"got {paths!r}"
+            )
+        if len(paths) == 0:
+            raise ValueError(
+                f"identity_fields[{tool_name!r}] must not be an empty list "
+                f"(omit the tool to declare no identity)"
+            )
+        seen: set[str] = set()
+        for path in paths:
+            if not isinstance(path, str):
+                raise ValueError(
+                    f"identity_fields[{tool_name!r}] has a non-string "
+                    f"path: {path!r}"
+                )
+            if path == "":
+                raise ValueError(
+                    f"identity_fields[{tool_name!r}] has an empty path"
+                )
+            if any(segment == "" for segment in path.split(".")):
+                raise ValueError(
+                    f"identity_fields[{tool_name!r}] path {path!r} has an "
+                    f"empty dot segment"
+                )
+            if path in seen:
+                raise ValueError(
+                    f"identity_fields[{tool_name!r}] path {path!r} is "
+                    f"duplicated"
+                )
+            seen.add(path)
+
+
+def _build_tool_divergence(
+    a_events: list[ToolEvent],
+    b_events: list[ToolEvent],
+    alignment: Alignment,
+) -> list[ToolDiff]:
+    """Classify each aligned pair, convert unmatched events, and order
+    the result A-centrically.
+
+    Divergent pairs and ``only_a`` entries are sorted together by
+    ``index_a``, then every ``only_b`` entry is appended sorted by
+    ``index_b``; ``ToolDiff.index`` is finally assigned as consecutive
+    report ordinals starting at zero.
+    """
+    a_centric: list[ToolDiff] = []
+    for pair in alignment.pairs:
+        a_event = a_events[pair.index_a]
+        b_event = b_events[pair.index_b]
+        kind = _classify(a_event, b_event)
+        if kind is not None:
+            a_centric.append(ToolDiff(
+                index=0,
+                divergence=kind,
+                a=a_event,
+                b=b_event,
+                tier=pair.tier,
+                index_a=pair.index_a,
+                index_b=pair.index_b,
+            ))
+    for unmatched in alignment.only_a:
+        a_centric.append(ToolDiff(
+            index=0,
+            divergence="only_a",
+            a=a_events[unmatched.index],
+            b=None,
+            tier=unmatched.tier,
+            index_a=unmatched.index,
+            index_b=None,
+        ))
+    a_centric.sort(key=lambda d: d.index_a)  # type: ignore[arg-type, return-value]
+
+    only_b_diffs = [
+        ToolDiff(
+            index=0,
+            divergence="only_b",
+            a=None,
+            b=b_events[unmatched.index],
+            tier=unmatched.tier,
+            index_a=None,
+            index_b=unmatched.index,
+        )
+        for unmatched in sorted(alignment.only_b, key=lambda u: u.index)
+    ]
+
+    tool_divergence = a_centric + only_b_diffs
+    for report_index, diff_entry in enumerate(tool_divergence):
+        diff_entry.index = report_index
+    return tool_divergence
+
+
 def _root(spans: list[Span]) -> Span | None:
     return next(
         (s for s in spans if s.parent_id is None and s.kind == SpanKind.AGENT_RUN),
@@ -184,6 +315,7 @@ async def trace_diff(
     trace_b_id: str,
     *,
     tracer: TracingLogger,
+    identity_fields: dict[str, list[str]] | None = None,
 ) -> TraceDiff:
     """Diff two recorded traces via the supplied tracer.
 
@@ -191,7 +323,24 @@ async def trace_diff(
     reads — typically :class:`SQLiteTracer`. The :class:`TraceDiff`
     returned is frame-agnostic; serialize it to JSON if you need
     dashboards.
+
+    ``identity_fields`` is an optional ``{tool_name: [path, ...]}`` map
+    of the same shape as :attr:`ToolDefinition.identity_fields`,
+    applied symmetrically and retroactively to both traces — it must be
+    valid for both, and there is no support for comparing histories
+    recorded under incompatible identity contracts. A falsey value
+    (``None`` or ``{}``) preserves exact legacy ordinal (zip-by-
+    position) pairing; a non-empty mapping opts the whole diff into the
+    three-tier identity-aware aligner. A tool omitted from a non-empty
+    mapping is identity-less and may still be paired by patience
+    anchors or segment-ordinal fallback, which can differ from legacy
+    whole-list ordinal pairing. The mapping is validated synchronously,
+    before either trace is read: a non-string tool name, a non-list or
+    empty declaration, a non-string or empty path, a path with an empty
+    dot segment, or a duplicate path all raise ``ValueError``.
     """
+    _validate_identity_fields(identity_fields)
+
     a_spans = await tracer.get_trace(trace_a_id)
     b_spans = await tracer.get_trace(trace_b_id)
 
@@ -213,32 +362,12 @@ async def trace_diff(
 
     a_tools = _tool_spans(a_spans)
     b_tools = _tool_spans(b_spans)
+    a_events = [_to_event(s) for s in a_tools]
+    b_events = [_to_event(s) for s in b_tools]
 
-    tool_divergence: list[ToolDiff] = []
-    for idx, (a_span, b_span) in enumerate(zip_longest(a_tools, b_tools)):
-        if a_span is None:
-            tool_divergence.append(ToolDiff(
-                index=idx,
-                divergence="only_b",
-                a=None,
-                b=_to_event(b_span),
-            ))
-            continue
-        if b_span is None:
-            tool_divergence.append(ToolDiff(
-                index=idx,
-                divergence="only_a",
-                a=_to_event(a_span),
-                b=None,
-            ))
-            continue
-        a_event = _to_event(a_span)
-        b_event = _to_event(b_span)
-        kind = _classify(a_event, b_event)
-        if kind is not None:
-            tool_divergence.append(ToolDiff(
-                index=idx, divergence=kind, a=a_event, b=b_event,
-            ))
+    aligner: Aligner = IdentityAligner() if identity_fields else OrdinalAligner()
+    alignment = aligner.align(a_events, b_events, identity_fields=identity_fields)
+    tool_divergence = _build_tool_divergence(a_events, b_events, alignment)
 
     a_root = _root(a_spans)
     b_root = _root(b_spans)
