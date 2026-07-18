@@ -727,3 +727,229 @@ async def test_score_deltas_from_real_runner_grading_spans(tmp_path: Any):
     assert "quality" in diff.score_deltas
     assert diff.score_deltas["quality"] == pytest.approx(-0.6, abs=1e-6)
     assert diff.identical is False
+
+
+# --- Identity alignment integration ---
+
+
+def _mixed_tier_tracer() -> tuple[_StubTracer, str, str]:
+    a_spans = [
+        _root("a"),
+        _tool("a", 0, "write", {"id": 1, "val": "old"}, "wrote"),
+        _tool("a", 1, "search", {"q": "A"}, "resultA"),
+        _tool("a", 2, "delete", {"id": 9}, "deleted"),
+        _tool("a", 3, "search", {"q": "B"}, "resultB"),
+        _tool("a", 4, "notify", {"msg": "done"}, "ok"),
+        _tool("a", 5, "write", {"id": 2, "val": "fresh"}, "wrote2"),
+    ]
+    b_spans = [
+        _root("b"),
+        _tool("b", 0, "delete", {"id": 9}, "deleted"),
+        _tool("b", 1, "write", {"id": 1, "val": "new"}, "wrote"),
+        _tool("b", 2, "search", {"q": "A"}, "resultA"),
+        _tool("b", 3, "search", {"q": "B"}, "resultB"),
+        _tool("b", 4, "audit", {"msg": "inserted"}, "logged"),
+        _tool("b", 5, "notify", {"msg": "done"}, "ok"),
+    ]
+    return _StubTracer({"a": a_spans, "b": b_spans}), "a", "b"
+
+
+@pytest.mark.asyncio
+async def test_mixed_tier_alignment_pins_full_partition():
+    """A single fixture with two declared tools, a repeated undeclared
+    search, a unique-both undeclared notify, an insertion, a deletion,
+    a same-entity argument change, and reordered identity matches —
+    pinning the intermediate identity/anchor/ordinal partition and the
+    resulting public divergence list without conflating the tiers."""
+    tracer, id_a, id_b = _mixed_tier_tracer()
+    identity_fields = {"write": ["id"], "delete": ["id"]}
+
+    diff = await trace_diff(id_a, id_b, tracer=tracer, identity_fields=identity_fields)
+
+    assert len(diff.tool_divergence) == 3
+
+    d0 = diff.tool_divergence[0]
+    assert d0.index == 0
+    assert d0.divergence == "args"
+    assert d0.tier == "identity"
+    assert d0.index_a == 0
+    assert d0.index_b == 1
+    assert d0.a.args == {"id": 1, "val": "old"}
+    assert d0.b.args == {"id": 1, "val": "new"}
+
+    d1 = diff.tool_divergence[1]
+    assert d1.index == 1
+    assert d1.divergence == "only_a"
+    assert d1.tier == "identity"
+    assert d1.index_a == 5
+    assert d1.index_b is None
+    assert d1.a.name == "write"
+    assert d1.b is None
+
+    d2 = diff.tool_divergence[2]
+    assert d2.index == 2
+    assert d2.divergence == "only_b"
+    assert d2.tier == "ordinal"
+    assert d2.index_a is None
+    assert d2.index_b == 4
+    assert d2.b.name == "audit"
+    assert d2.a is None
+
+
+def _insertion_cascade_tracer() -> tuple[_StubTracer, str, str]:
+    a_spans = [
+        _root("a"),
+        _tool("a", 0, "toolX", {"id": 1}, "outX"),
+        _tool("a", 1, "toolY", {"q": "y"}, "outY"),
+        _tool("a", 2, "toolZ", {"q": "z"}, "outZ"),
+    ]
+    b_spans = [
+        _root("b"),
+        _tool("b", 0, "new_tool", {"q": "new"}, "outNew"),
+        _tool("b", 1, "toolX", {"id": 1}, "outX"),
+        _tool("b", 2, "toolY", {"q": "y"}, "outY"),
+        _tool("b", 3, "toolZ", {"q": "z"}, "outZ"),
+    ]
+    return _StubTracer({"a": a_spans, "b": b_spans}), "a", "b"
+
+
+@pytest.mark.asyncio
+async def test_insertion_cascade_prevented_when_fully_anchored():
+    """When every unchanged call is identity-keyed or a unique-both
+    anchor, a single new insertion produces exactly one ordinal-tier
+    only_b and no paired divergences — cascade prevention only in the
+    domain where identities/anchors can claim every unchanged call."""
+    tracer, id_a, id_b = _insertion_cascade_tracer()
+
+    diff = await trace_diff(id_a, id_b, tracer=tracer, identity_fields={"toolX": ["id"]})
+
+    assert len(diff.tool_divergence) == 1
+    d = diff.tool_divergence[0]
+    assert d.index == 0
+    assert d.divergence == "only_b"
+    assert d.tier == "ordinal"
+    assert d.index_a is None
+    assert d.index_b == 0
+    assert d.b.name == "new_tool"
+
+
+def _ambiguity_tracer() -> tuple[_StubTracer, str, str]:
+    a_spans = [
+        _root("a"),
+        _tool("a", 0, "search", {"q": "q1"}, "r1"),
+        _tool("a", 1, "search", {"q": "q2"}, "r2"),
+    ]
+    b_spans = [
+        _root("b"),
+        _tool("b", 0, "search", {"q": "new"}, "rnew"),
+        _tool("b", 1, "search", {"q": "q1"}, "r1"),
+        _tool("b", 2, "search", {"q": "q2"}, "r2"),
+    ]
+    return _StubTracer({"a": a_spans, "b": b_spans}), "a", "b"
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_repeated_unkeyed_calls_stay_positional():
+    """Repeated unkeyed calls have no anchor and remain positionally
+    ambiguous within their segment even with IdentityAligner enabled —
+    guards against later fuzzy matching being mistaken for a bug fix."""
+    tracer, id_a, id_b = _ambiguity_tracer()
+
+    diff = await trace_diff(id_a, id_b, tracer=tracer, identity_fields={"other_tool": ["id"]})
+
+    assert len(diff.tool_divergence) == 3
+
+    d0 = diff.tool_divergence[0]
+    assert d0.divergence == "args"
+    assert d0.tier == "ordinal"
+    assert d0.index_a == 0
+    assert d0.index_b == 0
+    assert d0.a.args == {"q": "q1"}
+    assert d0.b.args == {"q": "new"}
+
+    d1 = diff.tool_divergence[1]
+    assert d1.divergence == "args"
+    assert d1.tier == "ordinal"
+    assert d1.index_a == 1
+    assert d1.index_b == 1
+    assert d1.a.args == {"q": "q2"}
+    assert d1.b.args == {"q": "q1"}
+
+    d2 = diff.tool_divergence[2]
+    assert d2.divergence == "only_b"
+    assert d2.tier == "ordinal"
+    assert d2.index_a is None
+    assert d2.index_b == 2
+    assert d2.b.args == {"q": "q2"}
+
+
+def _reordered_identity_tracer() -> tuple[_StubTracer, str, str]:
+    a_spans = [
+        _root("a", output="done"),
+        _tool("a", 0, "write", {"id": 1}, "wrote1"),
+        _tool("a", 1, "write", {"id": 2}, "wrote2"),
+    ]
+    b_spans = [
+        _root("b", output="done"),
+        _tool("b", 0, "write", {"id": 2}, "wrote2"),
+        _tool("b", 1, "write", {"id": 1}, "wrote1"),
+    ]
+    return _StubTracer({"a": a_spans, "b": b_spans}), "a", "b"
+
+
+@pytest.mark.asyncio
+async def test_reordered_identity_calls_are_not_divergent():
+    """Central semantic change: equal keyed calls in opposite orders
+    with otherwise-equal traces produce zero tool divergences and
+    identical=True, directly disproving exact sequence equality as an
+    implication of `identical` — see the order-insensitivity docs on
+    TraceDiff.identical."""
+    tracer, id_a, id_b = _reordered_identity_tracer()
+
+    diff = await trace_diff(id_a, id_b, tracer=tracer, identity_fields={"write": ["id"]})
+
+    assert diff.tool_divergence == []
+    assert diff.identical is True
+
+
+def _a_centric_ordering_tracer() -> tuple[_StubTracer, str, str]:
+    a_spans = [
+        _root("a"),
+        _tool("a", 0, "write", {"id": 1, "val": "old"}, "w1"),
+        _tool("a", 1, "delete", {"id": 9}, "d9"),
+        _tool("a", 2, "write", {"id": 2, "val": "old2"}, "w2"),
+    ]
+    b_spans = [
+        _root("b"),
+        _tool("b", 0, "write", {"id": 1, "val": "new"}, "w1"),
+        _tool("b", 1, "write", {"id": 2, "val": "new2"}, "w2"),
+        _tool("b", 2, "notify", {"msg": "extra"}, "logged"),
+    ]
+    return _StubTracer({"a": a_spans, "b": b_spans}), "a", "b"
+
+
+@pytest.mark.asyncio
+async def test_a_centric_report_order_interleaves_only_a():
+    """A divergent pair, an interleaved only_a, a later divergent pair,
+    and a trailing only_b — pins A-centric sorting independently of the
+    mixed-tier fixture's particular event arrangement."""
+    tracer, id_a, id_b = _a_centric_ordering_tracer()
+    identity_fields = {"write": ["id"], "delete": ["id"]}
+
+    diff = await trace_diff(id_a, id_b, tracer=tracer, identity_fields=identity_fields)
+
+    assert len(diff.tool_divergence) == 4
+
+    d0 = diff.tool_divergence[0]
+    assert (d0.index, d0.divergence, d0.tier, d0.index_a, d0.index_b) == (0, "args", "identity", 0, 0)
+
+    d1 = diff.tool_divergence[1]
+    assert (d1.index, d1.divergence, d1.tier, d1.index_a, d1.index_b) == (1, "only_a", "identity", 1, None)
+    assert d1.a.name == "delete"
+
+    d2 = diff.tool_divergence[2]
+    assert (d2.index, d2.divergence, d2.tier, d2.index_a, d2.index_b) == (2, "args", "identity", 2, 1)
+
+    d3 = diff.tool_divergence[3]
+    assert (d3.index, d3.divergence, d3.tier, d3.index_a, d3.index_b) == (3, "only_b", "ordinal", None, 2)
+    assert d3.b.name == "notify"
