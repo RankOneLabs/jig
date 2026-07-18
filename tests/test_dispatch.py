@@ -94,6 +94,33 @@ class TestBuildPayload:
         assert payload["tools"][0]["function"]["description"] == "echoes input"
         assert payload["tools"][0]["function"]["parameters"]["type"] == "object"
 
+    def test_identity_fields_excluded_from_tools_payload(self):
+        """identity_fields is jig-internal metadata (see jig.replay.align)
+        and must not leak into the smithers-facing tool payload."""
+        client = DispatchClient()
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hi")],
+            tools=[ToolDefinition(
+                name="lookup_customer",
+                description="Look up a customer record",
+                parameters={"type": "object", "properties": {"id": {"type": "string"}}},
+                identity_fields=["id"],
+            )],
+        )
+        payload = client._build_payload(params)
+
+        def _assert_no_identity_fields_key(obj) -> None:
+            if isinstance(obj, dict):
+                assert "identity_fields" not in obj, f"identity_fields leaked into {obj!r}"
+                for value in obj.values():
+                    _assert_no_identity_fields_key(value)
+            elif isinstance(obj, (list, tuple)):
+                for item in obj:
+                    _assert_no_identity_fields_key(item)
+
+        _assert_no_identity_fields_key(payload)
+        assert payload["tools"][0]["function"]["name"] == "lookup_customer"
+
     def test_skips_system_role_in_messages(self):
         client = DispatchClient()
         params = CompletionParams(

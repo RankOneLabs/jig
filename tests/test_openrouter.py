@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from jig.core.errors import JigLLMError
-from jig.core.types import CompletionParams, Message, Role, ToolCall
+from jig.core.types import CompletionParams, Message, Role, ToolCall, ToolDefinition
 from jig.llm.openrouter import OpenRouterClient, _OPENROUTER_BASE_URL
 
 
@@ -393,3 +393,31 @@ class TestOpenRouterComplete:
             assert exc.value.provider == "openrouter"
             assert "Response parsing failed" in str(exc.value)
             assert "pricing exploded" in str(exc.value)
+
+
+def _assert_no_identity_fields_key(obj) -> None:
+    """Recursively assert that ``identity_fields`` never appears as a dict key."""
+    if isinstance(obj, dict):
+        assert "identity_fields" not in obj, f"identity_fields leaked into {obj!r}"
+        for value in obj.values():
+            _assert_no_identity_fields_key(value)
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            _assert_no_identity_fields_key(item)
+
+
+class TestIdentityFieldsExcludedFromSchema:
+    def test_openrouter_schema_excludes_identity_fields(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-x")
+        with patch("jig.llm.openai.openai"):
+            client = OpenRouterClient(model="anthropic/claude-3.5-sonnet")
+
+        tool = ToolDefinition(
+            name="lookup_customer",
+            description="Look up a customer record",
+            parameters={"type": "object", "properties": {"id": {"type": "string"}}},
+            identity_fields=["id"],
+        )
+        payload = client._convert_tools([tool])
+        _assert_no_identity_fields_key(payload)
+        assert payload[0]["function"]["name"] == "lookup_customer"
