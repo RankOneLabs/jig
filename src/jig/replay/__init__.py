@@ -18,6 +18,29 @@ Two entry points:
   per aligned pair, and rolls up final-output, grader-score, cost,
   latency, and error-category deltas.
 
+**Registry-driven identity_fields.** Build ``trace_diff``'s
+``identity_fields`` argument straight from a live
+:class:`~jig.tools.ToolRegistry` with :func:`identity_map` (exported
+from both ``jig.replay`` and ``jig``)::
+
+    trace_diff(
+        trace_a_id, trace_b_id,
+        tracer=tracer,
+        identity_fields=identity_map(registry.list()),
+    )
+
+A registry where no tool declares ``identity_fields`` yields ``{}``
+from :func:`identity_map`; since that's falsey, ``trace_diff`` takes
+its legacy-ordinal branch and pairs both traces by exact
+zip-by-position, unconditionally — the caller never has to branch on
+whether any tool opted in. As soon as one tool declares
+``identity_fields``, the map is non-empty and the whole diff opts
+into the three-tier aligner: tools present in the map pair by
+identity where possible, but tools *absent* from a non-empty map are
+still identity-less and may be paired by patience anchors or
+segment-local ordinal fallback instead — a different result than
+exact legacy ordinal pairing for those specific tools.
+
 **Scope — what replay covers.** Tool outputs from the recording.
 
 **Scope — what replay does NOT cover (deferred):**
