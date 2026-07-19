@@ -51,7 +51,10 @@ comparable, and debuggable.
   variable without re-running expensive tool calls.
 - `jig.trace_diff` produces a structured diff between two recorded
   traces (requires a `tracer` instance): which tools were called
-  differently, score deltas, cost deltas.
+  differently, score deltas, and cost deltas. Tool authors can declare
+  entity identity to prevent positional insertion cascades; see the
+  [usage guide](../jig-usage-guide.md#replay-and-compare-recorded-traces)
+  and [release note](release-notes/span-id.md).
 
 **Optional distributed dispatch**
 

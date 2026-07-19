@@ -701,6 +701,95 @@ result.scores        # list[Score] | None — batch-level grading
 
 What you do with the result is your business. jig returns it and gets out of the way.
 
+## Replay and compare recorded traces
+
+Every agent result includes a `trace_id`. Use `replay` to rerun a recorded
+trace with different live configuration while serving tool outputs from the
+recording, then use `trace_diff` to compare the original and replayed traces.
+
+By default, `trace_diff` pairs tool calls by ordinal position. Tools that act
+on stable entities can declare one or more argument paths as identity fields:
+
+```python
+from jig import ToolDefinition
+
+definition = ToolDefinition(
+    name="update_work_item",
+    description="Update a work item's status",
+    parameters={
+        "type": "object",
+        "required": ["work_item"],
+        "properties": {
+            "work_item": {
+                "type": "object",
+                "required": ["id", "status"],
+                "properties": {
+                    "id": {"type": "string"},
+                    "status": {"type": "string"},
+                },
+            },
+        },
+    },
+    identity_fields=["work_item.id"],
+)
+```
+
+Each identity field is a dot-path into the call's `arguments` dictionary.
+All declared fields must resolve to finite JSON scalar values for a call to
+have an identity. Choose stable entity identifiers, not mutable values such as
+status or content. `identity_fields` is jig metadata and is not sent to the
+LLM provider as part of the tool schema.
+
+Callers with a live tool registry can build the diff configuration directly:
+
+```python
+from jig import identity_map, replay, trace_diff
+
+replayed = await replay(
+    original.trace_id,
+    {"temperature": 0.0},
+    tracer=tracer,
+    llm=candidate_llm,
+    feedback=feedback,
+    tools_fallback=registry,
+)
+
+diff = await trace_diff(
+    original.trace_id,
+    replayed.trace_id,
+    tracer=tracer,
+    identity_fields=identity_map(registry.list()),
+)
+
+for change in diff.tool_divergence:
+    print(change.tier, change.index_a, change.index_b, change.divergence)
+```
+
+`identity_map(registry.list())` returns `{}` when no registered tool declares
+identity. Both `{}` and `None` retain exact legacy ordinal pairing. Any
+non-empty map enables identity-aware alignment for the whole diff: calls with
+resolved identities pair first, unique tool names in the remainder act as
+patience anchors, and ambiguous segments fall back to ordinal pairing. A tool
+absent from a non-empty map can therefore align differently than it does in
+legacy mode.
+
+The alignment metadata on each reported `ToolDiff` is:
+
+| Field | Meaning |
+| --- | --- |
+| `tier` | `identity` asserts the same entity-level event; `anchor` and `ordinal` are structural comparisons only. |
+| `index_a` | Position in trace A's filtered tool-event list, or `None` for a B-only event. |
+| `index_b` | Position in trace B's filtered tool-event list, or `None` for an A-only event. |
+
+Identity matching is intentionally order-insensitive, so `identical` and
+`fully_identical` do not imply exact tool-call sequence equality when identity
+alignment is enabled. Use `TrajectoryGrader` for ordering assertions. The
+same identity mapping is applied retroactively to both traces and must be
+valid for both histories.
+
+See the [identity-aware trace diff release note](docs/release-notes/span-id.md)
+for the serialized schema and compatibility details.
+
 ## Eval with promptfoo
 
 jig agents are testable via promptfoo Python providers. Export eval sets from the feedback loop, or write test cases by hand.
