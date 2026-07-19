@@ -169,31 +169,37 @@ def _classify(a: ToolEvent, b: ToolEvent) -> ToolDivergenceKind | None:
     return None
 
 
-def _validate_identity_fields(identity_fields: dict[str, list[str]] | None) -> None:
-    """Reject a malformed raw ``identity_fields`` mapping before any I/O.
+def _validate_identity_fields(
+    identity_fields: dict[str, list[str]] | None,
+) -> dict[str, list[str]] | None:
+    """Validate and snapshot raw ``identity_fields`` before any I/O.
 
     Raw dicts bypass :meth:`ToolDefinition.__post_init__`, so this
     re-checks the same shape constraints synchronously: every tool name
     must be a string, every declaration a non-empty list of non-empty
-    strings with no empty dot segment and no duplicate path.
+    strings with no empty dot segment and no duplicate path. The return
+    value owns both the mapping and its path lists, preventing caller
+    mutation during later trace-read awaits from changing alignment.
     """
     if identity_fields is None:
-        return
+        return None
     if not isinstance(identity_fields, dict):
         raise ValueError(
             f"identity_fields must be a dict[str, list[str]] or None, "
             f"got {identity_fields!r}"
         )
-    for tool_name, paths in identity_fields.items():
+    validated: dict[str, list[str]] = {}
+    for tool_name, caller_paths in identity_fields.items():
         if not isinstance(tool_name, str):
             raise ValueError(
                 f"identity_fields has a non-string tool name: {tool_name!r}"
             )
-        if not isinstance(paths, list):
+        if not isinstance(caller_paths, list):
             raise ValueError(
                 f"identity_fields[{tool_name!r}] must be a list[str], "
-                f"got {paths!r}"
+                f"got {caller_paths!r}"
             )
+        paths = list(caller_paths)
         if len(paths) == 0:
             raise ValueError(
                 f"identity_fields[{tool_name!r}] must not be an empty list "
@@ -221,6 +227,8 @@ def _validate_identity_fields(identity_fields: dict[str, list[str]] | None) -> N
                     f"duplicated"
                 )
             seen.add(path)
+        validated[tool_name] = paths
+    return validated
 
 
 def _build_tool_divergence(
@@ -370,12 +378,12 @@ async def trace_diff(
     three-tier identity-aware aligner. A tool omitted from a non-empty
     mapping is identity-less and may still be paired by patience
     anchors or segment-ordinal fallback, which can differ from legacy
-    whole-list ordinal pairing. The mapping is validated synchronously,
-    before either trace is read: a non-string tool name, a non-list or
-    empty declaration, a non-string or empty path, a path with an empty
-    dot segment, or a duplicate path all raise ``ValueError``.
+    whole-list ordinal pairing. The mapping is validated and copied
+    synchronously before either trace is read: a non-string tool name, a
+    non-list or empty declaration, a non-string or empty path, a path with
+    an empty dot segment, or a duplicate path all raise ``ValueError``.
     """
-    _validate_identity_fields(identity_fields)
+    identity_fields = _validate_identity_fields(identity_fields)
 
     a_spans = await tracer.get_trace(trace_a_id)
     b_spans = await tracer.get_trace(trace_b_id)

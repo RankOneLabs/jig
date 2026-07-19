@@ -14,7 +14,7 @@ import importlib
 
 import jig
 
-# ``jig.replay`` the submodule is shadowed on the ``jig`` package object by
+# The ``jig.replay`` submodule is shadowed on the ``jig`` package object by
 # the ``replay()`` function of the same name (both are exported from
 # ``jig/__init__.py``), so submodules under ``jig.replay`` must be reached
 # via ``importlib.import_module`` rather than dotted attribute access.

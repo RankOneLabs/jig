@@ -1144,6 +1144,28 @@ class _ExplodingTracer(TracingLogger):
         pass
 
 
+class _MutatingIdentityFieldsTracer(_StubTracer):
+    """Mutate caller-owned identity configuration during the first trace read."""
+
+    def __init__(
+        self,
+        traces: dict[str, list[Span]],
+        identity_fields: dict[str, list[str]],
+    ) -> None:
+        super().__init__(traces)
+        self.identity_fields = identity_fields
+        self.original_paths = identity_fields["write"]
+        self.get_trace_calls = 0
+
+    async def get_trace(self, trace_id: str) -> list[Span]:
+        self.get_trace_calls += 1
+        spans = await super().get_trace(trace_id)
+        if self.get_trace_calls == 1:
+            self.identity_fields.clear()
+            self.original_paths[:] = ["missing"]
+        return spans
+
+
 _INVALID_IDENTITY_FIELDS: list[tuple[str, Any]] = [
     ("not_a_dict", ["write", "id"]),
     ("non_string_tool_name", {123: ["id"]}),
@@ -1169,6 +1191,35 @@ async def test_invalid_identity_fields_raises_before_any_tracer_read(name, bad_f
         await trace_diff("a", "b", tracer=tracer, identity_fields=bad_fields)
 
     assert tracer.get_trace_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_identity_fields_are_snapshotted_before_trace_reads():
+    identity_fields = {"write": ["id"]}
+    tracer = _MutatingIdentityFieldsTracer(
+        {
+            "a": [
+                _root("a", output="done"),
+                _tool("a", 0, "write", {"id": 1}, "wrote1"),
+                _tool("a", 1, "write", {"id": 2}, "wrote2"),
+            ],
+            "b": [
+                _root("b", output="done"),
+                _tool("b", 0, "write", {"id": 2}, "wrote2"),
+                _tool("b", 1, "write", {"id": 1}, "wrote1"),
+            ],
+        },
+        identity_fields,
+    )
+
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=identity_fields
+    )
+
+    assert identity_fields == {}
+    assert tracer.original_paths == ["missing"]
+    assert diff.tool_divergence == []
+    assert diff.identical is True
 
 
 # --- Full legacy-equivalence harness ---
