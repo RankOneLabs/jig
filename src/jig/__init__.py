@@ -71,6 +71,7 @@ from jig.replay import (
     TraceDiff,
     ToolDiff,
     ToolEvent,
+    identity_map,
     replay,
     trace_diff,
 )
@@ -195,6 +196,7 @@ __all__ = [
     "TraceDiff",
     "ToolDiff",
     "ToolEvent",
+    "identity_map",
     "replay",
     "trace_diff",
     # Trajectory grading

@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import zip_longest
 from typing import Any, Literal, Protocol
+
+from jig.core.types import ToolDefinition
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +106,29 @@ def _resolve_path(tool_name: str, path: str, arguments: dict) -> Any:
         )
         return _MISSING
     return current
+
+
+def identity_map(tools: Iterable[ToolDefinition]) -> dict[str, list[str]]:
+    """Build a ``{tool_name: identity_fields}`` map for :func:`trace_diff`.
+
+    Extracts and copies each :class:`ToolDefinition`'s declared
+    ``identity_fields``, keyed by tool name; definitions with
+    ``identity_fields=None`` are skipped, not represented with an
+    empty or ``None`` entry. Each declared list is copied via
+    ``list(...)`` so later mutation of a ``ToolDefinition``'s list
+    cannot mutate the returned map.
+
+    Returns ``{}`` when ``tools`` is empty or no definition declares
+    identity fields — this is falsey, so passing the result straight
+    through to ``trace_diff(identity_fields=...)`` naturally preserves
+    legacy ordinal pairing for an all-undeclared registry.
+    """
+    result: dict[str, list[str]] = {}
+    for tool in tools:
+        if tool.identity_fields is None:
+            continue
+        result[tool.name] = list(tool.identity_fields)
+    return result
 
 
 # --- Alignment model ---
