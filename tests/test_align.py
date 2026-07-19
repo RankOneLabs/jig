@@ -21,6 +21,7 @@ from jig.replay.align import (
     _tier1_identity,
     _tier2_anchors,
     _tier3_ordinal_segments,
+    identity_map,
     resolve_identity,
 )
 
@@ -108,6 +109,51 @@ def test_identity_fields_rejects_interior_empty_dot_segment():
 def test_identity_fields_rejects_duplicate_path():
     with pytest.raises(ValueError, match="identity_fields"):
         _make_tool(["customer_id", "customer_id"])
+
+
+# --- identity_map ---
+
+
+def _def(name: str, identity_fields: list[str] | None = None) -> ToolDefinition:
+    return ToolDefinition(
+        name=name,
+        description="d",
+        parameters={"type": "object", "properties": {}},
+        identity_fields=identity_fields,
+    )
+
+
+def test_identity_map_mixed_none_flat_and_nested():
+    tools = [
+        _def("no_identity", None),
+        _def("flat", ["customer_id"]),
+        _def("nested", ["customer.id", "customer.region"]),
+    ]
+    assert identity_map(tools) == {
+        "flat": ["customer_id"],
+        "nested": ["customer.id", "customer.region"],
+    }
+
+
+def test_identity_map_returns_independent_copies():
+    original = ["customer_id"]
+    tool = _def("flat", original)
+    result = identity_map([tool])
+    original.append("region")
+    assert result == {"flat": ["customer_id"]}
+
+
+def test_identity_map_empty_iterable_returns_empty_dict():
+    result = identity_map([])
+    assert result == {}
+    assert not result
+
+
+def test_identity_map_all_none_returns_empty_dict():
+    tools = [_def("a", None), _def("b", None)]
+    result = identity_map(tools)
+    assert result == {}
+    assert not result
 
 
 # --- resolve_identity: top-level short circuits ---
