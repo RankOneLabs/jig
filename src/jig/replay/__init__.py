@@ -35,6 +35,7 @@ Two entry points:
   a normal ``TOOL_CALL``) its canned output substitutes as with any
   other tool.
 """
+from jig.replay.align import identity_map
 from jig.replay.diff import TraceDiff, ToolDiff, ToolEvent, trace_diff
 from jig.replay.errors import (
     ReplayConfigMissingError,
@@ -55,6 +56,7 @@ __all__ = [
     "TraceDiff",
     "ToolDiff",
     "ToolEvent",
+    "identity_map",
     "reconstruct_config",
     "replay",
     "serialize_config",
