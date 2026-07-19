@@ -71,6 +71,32 @@ started), dispatch calls silently fall back to polling:
 Callers never see a "listener broken" error; they just pay the
 polling cost on that call.
 
+## Timeout and cancellation ownership
+
+Smithers owns the execution deadline and the worker lifecycle. Jig sends
+`timeout_seconds` with the job, then waits an additional cleanup grace
+(10 seconds by default) for smithers to cancel the worker and publish a
+terminal status. The grace does not extend the worker's execution budget; it
+prevents a caller retry from racing the previous job's cleanup.
+
+Jig owns the request/response caller's intent:
+
+- Cancelling `dispatch.run()` or `DispatchClient.complete()` sends
+  `DELETE /jobs/{id}` to smithers and awaits the response before propagating
+  `CancelledError`.
+- If no terminal status arrives by the execution deadline plus cleanup grace,
+  Jig sends the same cancellation request before raising `JobTimeoutError`.
+- `dispatch.run(..., cancel_on_timeout=False)` is the explicit opt-out for a
+  function job that should remain durable after this caller stops waiting.
+  Coroutine cancellation still cancels the remote job; detached submission is
+  a separate lifecycle and should not use this request/response helper.
+
+`cleanup_grace_seconds` is configurable on both `dispatch.run()` and
+`DispatchClient`; it defaults to 10 seconds and is clamped to zero when a
+negative value is supplied. LLM dispatch always cancels on client timeout.
+Jig only talks to the smithers coordinator—smithers is responsible for
+propagating cancellation to Frink, McClure, or another selected worker.
+
 ## Security posture
 
 The shared-secret token in the URL query string is not HMAC-grade.
