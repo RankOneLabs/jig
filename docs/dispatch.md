@@ -74,10 +74,10 @@ polling cost on that call.
 ## Timeout and cancellation ownership
 
 Smithers owns the execution deadline and the worker lifecycle. Jig sends
-`timeout_seconds` with the job, then waits an additional 10-second cleanup
-grace for smithers to cancel the worker and publish a terminal status. The
-grace does not extend the worker's execution budget; it prevents a caller
-retry from racing the previous job's cleanup.
+`timeout_seconds` with the job, then waits an additional cleanup grace
+(10 seconds by default) for smithers to cancel the worker and publish a
+terminal status. The grace does not extend the worker's execution budget; it
+prevents a caller retry from racing the previous job's cleanup.
 
 Jig owns the request/response caller's intent:
 

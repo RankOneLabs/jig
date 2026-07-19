@@ -146,6 +146,32 @@ class TestBuildPayload:
         assert payload["messages"][0]["content"] == "Actual system prompt"
 
 
+class TestConstructorCompatibility:
+    @pytest.mark.asyncio
+    async def test_legacy_positional_arguments_keep_their_meaning(self):
+        trace_context = MagicMock()
+        client = DispatchClient(
+            "llama-70b",
+            "frink",
+            "http://willie:8900",
+            "gecko",
+            60,
+            0.1,
+            1.0,
+            trace_context,
+        )
+
+        assert client._model == "llama-70b"
+        assert client._machine == "frink"
+        assert client._requester == "gecko"
+        assert client._trace_context is trace_context
+        assert client._poll_config.timeout_seconds == 60
+        assert client._poll_config.poll_interval == 0.1
+        assert client._poll_config.poll_max_interval == 1.0
+        assert client._poll_config.cleanup_grace_seconds == 10.0
+        await client.aclose()
+
+
 class TestComplete:
     """Tests for the complete() method."""
 

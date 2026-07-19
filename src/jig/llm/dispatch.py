@@ -168,10 +168,10 @@ class DispatchClient(LLMClient):
         dispatch_url: str | None = None,
         requester: str = "jig",
         timeout_seconds: int = 300,
-        cleanup_grace_seconds: float = 10.0,
         poll_interval: float = 0.5,
         poll_max_interval: float = 5.0,
         trace_context: TraceContext | None = None,
+        cleanup_grace_seconds: float = 10.0,
     ) -> None:
         self._model = model
         self._machine = machine
