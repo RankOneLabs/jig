@@ -7,8 +7,15 @@ Two entry points:
   other config knobs) swapped via ``config_override``. The LLM is live;
   only tool results are pinned.
 - :func:`trace_diff` — structured diff between two recorded traces.
-  Pairs the ``TOOL_CALL`` span streams by position, reports the first
-  field that diverges, and rolls up final-output, grader-score, cost,
+  Aligns each trace's ``TOOL_CALL`` span stream via
+  :mod:`jig.replay.align`: a falsey ``identity_fields`` (``None`` or
+  ``{}``) preserves legacy ordinal (zip-by-position) pairing; a
+  non-empty ``identity_fields`` map opts the whole diff into the
+  three-tier identity-aware aligner. Only the "identity" tier asserts
+  entity-level event continuity — "anchor" and "ordinal" pairs are
+  structural position matches, not proof that the paired events are
+  semantically the same call. Reports the first field that diverges
+  per aligned pair, and rolls up final-output, grader-score, cost,
   latency, and error-category deltas.
 
 **Scope — what replay covers.** Tool outputs from the recording.
