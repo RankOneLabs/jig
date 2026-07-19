@@ -1,6 +1,7 @@
 """Tests for the smithers DispatchClient."""
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -35,6 +36,13 @@ def _mock_poll_response(
         "model": model,
         "error": error,
     }
+    resp.raise_for_status = MagicMock()
+    return resp
+
+
+def _mock_cancel_response(status_code: int = 200):
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = status_code
     resp.raise_for_status = MagicMock()
     return resp
 
@@ -217,20 +225,81 @@ class TestComplete:
 
     @pytest.mark.asyncio
     async def test_timeout(self):
-        """Should raise JigLLMError after timeout."""
+        """A client timeout cancels the smithers job before returning."""
         client = DispatchClient(
-            timeout_seconds=0.1, poll_interval=0.01, poll_max_interval=0.02,
+            timeout_seconds=0.1,
+            cleanup_grace_seconds=0,
+            poll_interval=0.01,
+            poll_max_interval=0.02,
         )
 
         client._http = AsyncMock(spec=httpx.AsyncClient)
         client._http.post.return_value = _mock_submit_response()
         client._http.get.return_value = _mock_poll_response(status="running", result=None)
+        client._http.delete.return_value = _mock_cancel_response()
 
         params = CompletionParams(
             messages=[Message(role=Role.USER, content="Hi")],
         )
         with pytest.raises(JigLLMError, match="timed out"):
             await client.complete(params)
+
+        client._http.delete.assert_awaited_once_with(
+            "http://localhost:8900/jobs/job-123", timeout=10.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_caller_cancellation_cancels_remote_job_before_propagating(self):
+        client = DispatchClient(
+            timeout_seconds=60,
+            poll_interval=30,
+            poll_max_interval=30,
+        )
+        client._http = AsyncMock(spec=httpx.AsyncClient)
+        submitted = asyncio.Event()
+
+        async def submit(*args, **kwargs):
+            submitted.set()
+            return _mock_submit_response()
+
+        client._http.post.side_effect = submit
+        client._http.delete.return_value = _mock_cancel_response()
+
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hi")],
+        )
+        task = asyncio.create_task(client.complete(params))
+        await submitted.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        client._http.delete.assert_awaited_once_with(
+            "http://localhost:8900/jobs/job-123", timeout=10.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_cleanup_grace_allows_server_terminal_update(self):
+        client = DispatchClient(
+            timeout_seconds=0.01,
+            cleanup_grace_seconds=0.05,
+            poll_interval=0.02,
+            poll_max_interval=0.02,
+        )
+        client._http = AsyncMock(spec=httpx.AsyncClient)
+        client._http.post.return_value = _mock_submit_response()
+        client._http.get.return_value = _mock_poll_response(
+            status="complete", result={"content": "cleaned up"},
+        )
+
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hi")],
+        )
+        response = await client.complete(params)
+
+        assert response.content == "cleaned up"
+        client._http.delete.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_submit_connect_error(self):

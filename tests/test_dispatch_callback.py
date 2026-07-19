@@ -223,6 +223,7 @@ class TestCallbackTerminalStates:
                     "demo.fn:slow", {},
                     dispatch_url=smithers_url,
                     timeout_seconds=1,
+                    cleanup_grace_seconds=0,
                 )
             assert "callback not received" in str(exc.value)
         finally:

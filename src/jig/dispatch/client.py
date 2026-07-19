@@ -75,8 +75,183 @@ class _PollConfig:
     """Knobs for the polling loop — tests override these to run fast."""
 
     timeout_seconds: int = 300
+    cleanup_grace_seconds: float = 10.0
+    cancel_on_timeout: bool = True
     poll_interval: float = 0.5
     poll_max_interval: float = 5.0
+
+
+async def _cancel_remote_job(
+    http: httpx.AsyncClient,
+    url: str,
+    job_id: str,
+) -> None:
+    """Best-effort cancellation for a request/response caller that gave up.
+
+    Smithers waits for its worker cancellation before marking the job
+    cancelled, so awaiting this endpoint also creates the ordering guarantee
+    callers need before they submit a retry. A terminal or missing job is
+    already safe; transport failures are logged because cancellation must not
+    replace the original timeout/cancellation exception.
+    """
+    try:
+        response = await http.delete(f"{url}/jobs/{job_id}", timeout=10.0)
+        if response.status_code in (404, 409):
+            return
+        response.raise_for_status()
+    except Exception as exc:
+        logger.warning("Could not cancel dispatch job %s: %s", job_id, exc)
+
+
+async def _wait_for_terminal(
+    *,
+    http: httpx.AsyncClient,
+    url: str,
+    job_id: str,
+    cfg: _PollConfig,
+    wait_timeout_seconds: float,
+    started_at: float,
+    listener: Any,
+    callback_nonce: str | None,
+    callback_future: Any,
+) -> dict[str, Any]:
+    """Wait for one submitted job without owning its cancellation policy."""
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + wait_timeout_seconds
+
+    def timeout_error(suffix: str = "") -> JobTimeoutError:
+        grace = cfg.cleanup_grace_seconds
+        grace_note = (
+            f" plus {grace:g}s cleanup grace" if grace > 0 else ""
+        )
+        return JobTimeoutError(
+            f"Dispatch job {job_id} timed out waiting for a terminal status after "
+            f"{cfg.timeout_seconds}s execution timeout{grace_note}{suffix}",
+            job_id=job_id,
+            timeout_seconds=cfg.timeout_seconds,
+        )
+
+    # On non-timeout listener trouble (listener stopped mid-flight,
+    # malformed callback body) fall through to polling — smithers still has
+    # the job_id and the poll endpoint can recover the result.
+    callback_data: dict[str, Any] | None = None
+    if listener is not None and callback_future is not None:
+        try:
+            callback_data = await asyncio.wait_for(
+                callback_future, timeout=max(0.0, deadline - loop.time()),
+            )
+        except asyncio.TimeoutError as exc:
+            raise timeout_error(" (callback not received)") from exc
+        except Exception as exc:
+            logger.warning(
+                "Callback future for job %s failed (%s) — falling back to polling",
+                job_id,
+                exc,
+            )
+            if callback_nonce is not None:
+                listener.unregister(callback_nonce)
+            callback_data = None
+
+    if callback_data is not None:
+        if not isinstance(callback_data, dict):
+            raise DispatchError(
+                f"Callback for job {job_id} delivered non-object body: {callback_data!r}",
+                job_id=job_id,
+            )
+
+        status = callback_data.get("status", "")
+        if status == "complete":
+            logger.info(
+                "Dispatch job %s complete via callback (%.0fms)",
+                job_id,
+                (time.time() - started_at) * 1000,
+            )
+            return callback_data
+        if status == "failed":
+            raise DispatchError(
+                callback_data.get("error") or f"Dispatch job {job_id} failed",
+                job_id=job_id,
+                status="failed",
+            )
+        if status == "cancelled":
+            raise DispatchError(
+                f"Dispatch job {job_id} was cancelled",
+                job_id=job_id,
+                status="cancelled",
+            )
+        raise DispatchError(
+            f"Unexpected callback status {status!r} for job {job_id}",
+            job_id=job_id,
+            status=status,
+        )
+
+    interval = cfg.poll_interval
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise timeout_error()
+
+        await asyncio.sleep(min(interval, remaining))
+        interval = min(interval * 2, cfg.poll_max_interval)
+
+        try:
+            poll = await http.get(f"{url}/jobs/{job_id}")
+            poll.raise_for_status()
+        except httpx.ConnectError:
+            logger.warning("Lost connection polling job %s, retrying...", job_id)
+            continue
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                raise DispatchError(
+                    f"Dispatch job {job_id} not found (expired or invalid)",
+                    job_id=job_id,
+                    status="not_found",
+                ) from exc
+            logger.warning(
+                "HTTP %s polling job %s, retrying...",
+                exc.response.status_code,
+                job_id,
+            )
+            continue
+        except httpx.RequestError:
+            logger.warning("Request error polling job %s, retrying...", job_id)
+            continue
+
+        try:
+            data = poll.json()
+        except ValueError:
+            logger.warning("Malformed JSON polling job %s, retrying...", job_id)
+            continue
+
+        if not isinstance(data, dict):
+            logger.warning("Non-object JSON polling job %s, retrying...", job_id)
+            continue
+
+        status = data.get("status", "")
+        if status in _PENDING_STATUSES:
+            continue
+        if status == "complete":
+            logger.info(
+                "Dispatch job %s complete (%.0fms)",
+                job_id,
+                (time.time() - started_at) * 1000,
+            )
+            return data
+        if status == "failed":
+            raise DispatchError(
+                data.get("error") or f"Dispatch job {job_id} failed",
+                job_id=job_id,
+                status="failed",
+            )
+        if status == "cancelled":
+            raise DispatchError(
+                f"Dispatch job {job_id} was cancelled",
+                job_id=job_id,
+                status="cancelled",
+            )
+
+        logger.warning("Unexpected status %r for job %s, continuing poll", status, job_id)
 
 
 async def _submit_and_poll(
@@ -187,141 +362,35 @@ async def _submit_and_poll(
         ) from e
 
     logger.info("Dispatch job %s submitted (task_type=%s)", job_id, task_type)
-
-    # --- Wait: callback path if listener active, else poll ---
-    # On non-timeout listener trouble (listener stopped mid-flight,
-    # malformed callback body) fall through to polling — smithers
-    # still has the job_id and the poll endpoint can recover the
-    # result. The job isn't lost just because our local receiver had
-    # a bad day.
-    callback_data: dict[str, Any] | None = None
-    if listener is not None and callback_future is not None:
-        try:
-            callback_data = await asyncio.wait_for(
-                callback_future, timeout=cfg.timeout_seconds
-            )
-        except asyncio.TimeoutError as e:
-            if callback_nonce is not None:
-                listener.unregister(callback_nonce)
-            raise JobTimeoutError(
-                f"Dispatch job {job_id} timed out after {cfg.timeout_seconds}s"
-                " (callback not received)",
-                job_id=job_id,
-                timeout_seconds=cfg.timeout_seconds,
-            ) from e
-        except Exception as e:
-            logger.warning(
-                "Callback future for job %s failed (%s) — falling back to polling",
-                job_id, e,
-            )
-            if callback_nonce is not None:
-                listener.unregister(callback_nonce)
-            callback_data = None
-
-    if callback_data is not None:
-        if not isinstance(callback_data, dict):
-            raise DispatchError(
-                f"Callback for job {job_id} delivered non-object body: {callback_data!r}",
-                job_id=job_id,
-            )
-
-        status = callback_data.get("status", "")
-        if status == "complete":
-            logger.info(
-                "Dispatch job %s complete via callback (%.0fms)",
-                job_id, (time.time() - start) * 1000,
-            )
-            return callback_data
-        if status == "failed":
-            raise DispatchError(
-                callback_data.get("error") or f"Dispatch job {job_id} failed",
-                job_id=job_id,
-                status="failed",
-            )
-        if status == "cancelled":
-            raise DispatchError(
-                f"Dispatch job {job_id} was cancelled",
-                job_id=job_id,
-                status="cancelled",
-            )
-        raise DispatchError(
-            f"Unexpected callback status {status!r} for job {job_id}",
+    wait_timeout_seconds = max(
+        0.0,
+        cfg.timeout_seconds + cfg.cleanup_grace_seconds,
+    )
+    try:
+        return await _wait_for_terminal(
+            http=http,
+            url=url,
             job_id=job_id,
-            status=status,
+            cfg=cfg,
+            wait_timeout_seconds=wait_timeout_seconds,
+            started_at=start,
+            listener=listener,
+            callback_nonce=callback_nonce,
+            callback_future=callback_future,
         )
-
-    # --- Poll ---
-    interval = cfg.poll_interval
-    while True:
-        remaining = cfg.timeout_seconds - (time.time() - start)
-        if remaining <= 0:
-            raise JobTimeoutError(
-                f"Dispatch job {job_id} timed out after {cfg.timeout_seconds}s",
-                job_id=job_id,
-                timeout_seconds=cfg.timeout_seconds,
-            )
-
-        await asyncio.sleep(min(interval, remaining))
-        interval = min(interval * 2, cfg.poll_max_interval)
-
-        try:
-            poll = await http.get(f"{url}/jobs/{job_id}")
-            poll.raise_for_status()
-        except httpx.ConnectError:
-            logger.warning("Lost connection polling job %s, retrying...", job_id)
-            continue
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                raise DispatchError(
-                    f"Dispatch job {job_id} not found (expired or invalid)",
-                    job_id=job_id,
-                    status="not_found",
-                ) from e
-            logger.warning(
-                "HTTP %s polling job %s, retrying...",
-                e.response.status_code, job_id,
-            )
-            continue
-        except httpx.RequestError:
-            logger.warning("Request error polling job %s, retrying...", job_id)
-            continue
-
-        try:
-            data = poll.json()
-        except ValueError:
-            logger.warning("Malformed JSON polling job %s, retrying...", job_id)
-            continue
-
-        if not isinstance(data, dict):
-            logger.warning("Non-object JSON polling job %s, retrying...", job_id)
-            continue
-
-        status = data.get("status", "")
-        if status in _PENDING_STATUSES:
-            continue
-
-        if status == "complete":
-            logger.info(
-                "Dispatch job %s complete (%.0fms)",
-                job_id, (time.time() - start) * 1000,
-            )
-            return data
-
-        if status == "failed":
-            raise DispatchError(
-                data.get("error") or f"Dispatch job {job_id} failed",
-                job_id=job_id,
-                status="failed",
-            )
-
-        if status == "cancelled":
-            raise DispatchError(
-                f"Dispatch job {job_id} was cancelled",
-                job_id=job_id,
-                status="cancelled",
-            )
-
-        logger.warning("Unexpected status %r for job %s, continuing poll", status, job_id)
+    except asyncio.CancelledError:
+        # The local request/response owner has abandoned the call. Wait for
+        # smithers to propagate cancellation to its worker before allowing a
+        # retry to occupy that same worker slot.
+        await asyncio.shield(_cancel_remote_job(http, url, job_id))
+        raise
+    except JobTimeoutError:
+        if cfg.cancel_on_timeout:
+            await asyncio.shield(_cancel_remote_job(http, url, job_id))
+        raise
+    finally:
+        if listener is not None and callback_nonce is not None:
+            listener.unregister(callback_nonce)
 
 
 # Shared httpx client for one-off run() calls. Most callers should use
@@ -405,6 +474,8 @@ async def run(
     machine: str | None = None,
     trace_context: dict[str, Any] | None = None,
     timeout_seconds: int = 300,
+    cleanup_grace_seconds: float = 10.0,
+    cancel_on_timeout: bool = True,
     poll_interval: float = 0.5,
     poll_max_interval: float = 5.0,
     http: httpx.AsyncClient | None = None,
@@ -421,10 +492,17 @@ async def run(
     back to polling. The choice is automatic; callers don't opt in
     per-call.
 
+    ``timeout_seconds`` is the execution deadline sent to smithers. Jig waits
+    an additional ``cleanup_grace_seconds`` for smithers to publish the
+    terminal result. If the caller cancels this coroutine, Jig asks smithers
+    to cancel the remote job before propagating cancellation. A client-side
+    timeout does the same by default; set ``cancel_on_timeout=False`` only
+    when the remote job is intentionally durable beyond this request.
+
     Returns whatever the worker put in ``job.result["value"]``. Raises
-    :class:`DispatchError` on failure, :class:`JobTimeoutError` on
-    timeout. Use this for deterministic steps you want offloaded —
-    backtests, embeddings, reindexes — while LLM calls go through
+    :class:`DispatchError` on failure, :class:`JobTimeoutError` on timeout.
+    Use this for deterministic steps you want offloaded — backtests,
+    embeddings, reindexes — while LLM calls go through
     :class:`jig.llm.DispatchClient`.
     """
     transport = http or _get_shared_http()
@@ -438,6 +516,8 @@ async def run(
         trace_context=trace_context,
         poll_config=_PollConfig(
             timeout_seconds=timeout_seconds,
+            cleanup_grace_seconds=max(0.0, cleanup_grace_seconds),
+            cancel_on_timeout=cancel_on_timeout,
             poll_interval=poll_interval,
             poll_max_interval=poll_max_interval,
         ),

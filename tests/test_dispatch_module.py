@@ -35,6 +35,13 @@ def _poll_resp(status: str = "complete", result: Any = None, model: str | None =
     return r
 
 
+def _cancel_resp(status_code: int = 200):
+    r = MagicMock(spec=httpx.Response)
+    r.status_code = status_code
+    r.raise_for_status = MagicMock()
+    return r
+
+
 @pytest.mark.asyncio
 class TestDispatchRun:
     async def test_submit_and_return_value(self):
@@ -91,15 +98,39 @@ class TestDispatchRun:
         http = AsyncMock(spec=httpx.AsyncClient)
         http.post.return_value = _submit_resp()
         http.get.return_value = _poll_resp(status="running")
+        http.delete.return_value = _cancel_resp()
 
         with pytest.raises(JobTimeoutError):
             await dispatch_run(
                 "m:f",
                 http=http,
                 timeout_seconds=1,  # int, minimum
+                cleanup_grace_seconds=0,
                 poll_interval=0.01,
                 poll_max_interval=0.02,
             )
+
+        http.delete.assert_awaited_once_with(
+            "http://localhost:8900/jobs/j-1", timeout=10.0,
+        )
+
+    async def test_durable_timeout_can_leave_remote_job_running(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.get.return_value = _poll_resp(status="running")
+
+        with pytest.raises(JobTimeoutError):
+            await dispatch_run(
+                "m:f",
+                http=http,
+                timeout_seconds=0.02,
+                cleanup_grace_seconds=0,
+                cancel_on_timeout=False,
+                poll_interval=0.01,
+                poll_max_interval=0.01,
+            )
+
+        http.delete.assert_not_awaited()
 
     async def test_trace_context_in_payload(self):
         """Phase 9 will have workers read this; phase 7+8 just propagates."""
@@ -346,10 +377,12 @@ class TestDispatchErrorRetryable:
         http = AsyncMock(spec=httpx.AsyncClient)
         http.post.return_value = _submit_resp()
         http.get.return_value = _poll_resp(status="running")
+        http.delete.return_value = _cancel_resp()
 
         with pytest.raises(JobTimeoutError) as exc:
             await dispatch_run(
                 "m:f", http=http, timeout_seconds=1,
+                cleanup_grace_seconds=0,
                 poll_interval=0.01, poll_max_interval=0.02,
             )
         assert exc.value.retryable is True

@@ -168,6 +168,7 @@ class DispatchClient(LLMClient):
         dispatch_url: str | None = None,
         requester: str = "jig",
         timeout_seconds: int = 300,
+        cleanup_grace_seconds: float = 10.0,
         poll_interval: float = 0.5,
         poll_max_interval: float = 5.0,
         trace_context: TraceContext | None = None,
@@ -179,6 +180,8 @@ class DispatchClient(LLMClient):
         self._trace_context = trace_context
         self._poll_config = _PollConfig(
             timeout_seconds=timeout_seconds,
+            cleanup_grace_seconds=max(0.0, cleanup_grace_seconds),
+            cancel_on_timeout=True,
             poll_interval=poll_interval,
             poll_max_interval=poll_max_interval,
         )
