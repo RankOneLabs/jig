@@ -103,8 +103,8 @@ class TraceDiff:
         different model will almost always have different token prices
         and latency, so folding those in would make ``identical``
         always False for the exact workflow this property exists to
-        support. Use :attr:`fully_identical` when you want to detect
-        any change at all.
+        support. Use :attr:`fully_identical` when you also require equal
+        cost and latency under the selected alignment semantics.
 
         Identity matching (see ``identity_fields`` on
         :func:`trace_diff`) is order-insensitive: two traces that make

@@ -23,7 +23,7 @@ Two entry points:
 :class:`~jig.tools.ToolRegistry` with :func:`identity_map` (exported
 from both ``jig.replay`` and ``jig``)::
 
-    trace_diff(
+    await trace_diff(
         trace_a_id, trace_b_id,
         tracer=tracer,
         identity_fields=identity_map(registry.list()),

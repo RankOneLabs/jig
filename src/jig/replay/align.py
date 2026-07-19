@@ -1,12 +1,20 @@
-"""Fail-soft identity resolution for replay alignment.
+"""Deterministic identity-aware alignment for replayed tool calls.
 
-Given a tool call's arguments and a tool's declared ``identity_fields``
-(see :class:`jig.core.types.ToolDefinition`), resolve a composite key that
-identifies "the same real-world entity" across calls, so that replay
-alignment can pair historical and new tool calls beyond simple ordering.
+Only an ``identity``-tier pair asserts that two calls are the same
+entity-level event. ``anchor`` and ``ordinal`` pairs are structural
+comparisons that keep the diff useful without claiming semantic event
+continuity. Identity matching is order-insensitive, while ordering
+assertions remain the responsibility of :class:`TrajectoryGrader`.
 
-Resolution is deliberately all-or-nothing and never raises: malformed or
-missing span data means the entity is unknown, not a crash.
+Patience anchors are computed from the identity-less remainder of both
+traces independently of tier-1 structure. Consequently, no ordering
+constraint is imposed between identity pairs and the anchor/ordinal tiers.
+Within anchor-delimited ambiguous segments, calls pair only by ordinal
+position; this module never infers identity from similarity.
+
+Identity resolution uses a tool's declared ``identity_fields`` (see
+:class:`jig.core.types.ToolDefinition`) and is deliberately all-or-nothing.
+Malformed or missing span data means the entity is unknown, not a crash.
 """
 
 from __future__ import annotations

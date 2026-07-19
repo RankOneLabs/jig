@@ -11,8 +11,9 @@ import pytest
 from jig import AgentConfig, CompletionParams, LLMResponse, Score, ScoreSource, Span, SpanKind, Usage, run_agent, trace_diff
 from jig.core.types import Grader, LLMClient, TracingLogger
 from jig.feedback.loop import SQLiteFeedbackLoop
-from jig.tools import ToolRegistry
+from jig.replay.align import AlignedPair, IdentityAligner, ToolEvent, UnmatchedEvent
 from jig.replay.diff import TraceDiff
+from jig.tools import ToolRegistry
 from jig.tracing import SQLiteTracer
 
 
@@ -101,6 +102,19 @@ def _llm(trace_id: str, idx: int, cost: float) -> Span:
     )
 
 
+@pytest.fixture(
+    params=[
+        pytest.param(None, id="identity-fields-none"),
+        pytest.param({}, id="identity-fields-empty"),
+    ]
+)
+def legacy_identity_fields(
+    request: pytest.FixtureRequest,
+) -> dict[str, list[str]] | None:
+    """Exercise every legacy trace-diff expectation through both falsey paths."""
+    return request.param
+
+
 # --- Legacy-equivalence scaffolding ---
 #
 # ``_legacy_fields`` extracts every field a caller could observe from a
@@ -113,7 +127,9 @@ def _llm(trace_id: str, idx: int, cost: float) -> Span:
 
 def _legacy_fields(diff: TraceDiff) -> dict[str, Any]:
     return {
+        "trace_ids": (diff.trace_a_id, diff.trace_b_id),
         "divergence_count": len(diff.tool_divergence),
+        "report_indices": [d.index for d in diff.tool_divergence],
         "kinds": [d.divergence for d in diff.tool_divergence],
         "payloads": [(d.a, d.b) for d in diff.tool_divergence],
         "output_diff": diff.output_diff,
@@ -265,7 +281,7 @@ async def test_legacy_fields_helper_is_stable(name, build):
 
 
 @pytest.mark.asyncio
-async def test_identical_traces_are_empty_diff():
+async def test_identical_traces_are_empty_diff(legacy_identity_fields):
     spans = [
         _root("a", output="done"),
         _tool("a", 0, "echo", {"text": "x"}, "x"),
@@ -276,19 +292,23 @@ async def test_identical_traces_are_empty_diff():
     ]
     tracer = _StubTracer({"a": spans, "b": spans_b})
 
-    diff = await trace_diff("a", "b", tracer=tracer)
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
     assert diff.identical is True
     assert diff.tool_divergence == []
     assert diff.output_diff is None
 
 
 @pytest.mark.asyncio
-async def test_args_divergence_classified():
+async def test_args_divergence_classified(legacy_identity_fields):
     tracer = _StubTracer({
         "a": [_root("a"), _tool("a", 0, "echo", {"text": "x"}, "x")],
         "b": [_root("b"), _tool("b", 0, "echo", {"text": "y"}, "y")],
     })
-    diff = await trace_diff("a", "b", tracer=tracer)
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
     assert len(diff.tool_divergence) == 1
     d = diff.tool_divergence[0]
     assert d.divergence == "args"
@@ -297,7 +317,7 @@ async def test_args_divergence_classified():
 
 
 @pytest.mark.asyncio
-async def test_only_b_trailing_tool():
+async def test_only_b_trailing_tool(legacy_identity_fields):
     tracer = _StubTracer({
         "a": [_root("a"), _tool("a", 0, "echo", {"text": "x"}, "x")],
         "b": [
@@ -306,7 +326,9 @@ async def test_only_b_trailing_tool():
             _tool("b", 1, "echo", {"text": "extra"}, "extra"),
         ],
     })
-    diff = await trace_diff("a", "b", tracer=tracer)
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
     assert len(diff.tool_divergence) == 1
     assert diff.tool_divergence[0].divergence == "only_b"
     assert diff.tool_divergence[0].a is None
@@ -314,7 +336,7 @@ async def test_only_b_trailing_tool():
 
 
 @pytest.mark.asyncio
-async def test_only_a_missing_from_b():
+async def test_only_a_missing_from_b(legacy_identity_fields):
     tracer = _StubTracer({
         "a": [
             _root("a"),
@@ -323,33 +345,39 @@ async def test_only_a_missing_from_b():
         ],
         "b": [_root("b"), _tool("b", 0, "echo", {"text": "x"}, "x")],
     })
-    diff = await trace_diff("a", "b", tracer=tracer)
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
     assert len(diff.tool_divergence) == 1
     assert diff.tool_divergence[0].divergence == "only_a"
 
 
 @pytest.mark.asyncio
-async def test_output_diff_populated_when_finals_differ():
+async def test_output_diff_populated_when_finals_differ(legacy_identity_fields):
     tracer = _StubTracer({
         "a": [_root("a", output="alpha")],
         "b": [_root("b", output="beta")],
     })
-    diff = await trace_diff("a", "b", tracer=tracer)
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
     assert diff.output_diff == ("alpha", "beta")
 
 
 @pytest.mark.asyncio
-async def test_error_category_change_populated():
+async def test_error_category_change_populated(legacy_identity_fields):
     tracer = _StubTracer({
         "a": [_root("a", error_category="max_llm_calls")],
         "b": [_root("b", error_category=None)],
     })
-    diff = await trace_diff("a", "b", tracer=tracer)
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
     assert diff.error_category_change == ("max_llm_calls", None)
 
 
 @pytest.mark.asyncio
-async def test_score_deltas_computed_per_dimension():
+async def test_score_deltas_computed_per_dimension(legacy_identity_fields):
     tracer = _StubTracer({
         "a": [
             _root("a"),
@@ -360,12 +388,16 @@ async def test_score_deltas_computed_per_dimension():
             _grading("b", [{"dimension": "quality", "value": 0.8}]),
         ],
     })
-    diff = await trace_diff("a", "b", tracer=tracer)
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
     assert diff.score_deltas == {"quality": pytest.approx(0.2)}
 
 
 @pytest.mark.asyncio
-async def test_score_deltas_surface_added_and_dropped_dimensions():
+async def test_score_deltas_surface_added_and_dropped_dimensions(
+    legacy_identity_fields,
+):
     """A dimension present in only one trace must show up in the diff —
     otherwise a grader change (adding/removing a rubric entry) would
     silently look identical and `identical` would wrongly return True."""
@@ -385,7 +417,9 @@ async def test_score_deltas_surface_added_and_dropped_dimensions():
             ]),
         ],
     })
-    diff = await trace_diff("a", "b", tracer=tracer)
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
     # accuracy was dropped (present in A, missing in B → negative delta)
     # relevance was added (missing in A, present in B → positive delta)
     # quality identical → omitted
@@ -396,7 +430,9 @@ async def test_score_deltas_surface_added_and_dropped_dimensions():
 
 
 @pytest.mark.asyncio
-async def test_fully_identical_requires_cost_and_latency_match():
+async def test_fully_identical_requires_cost_and_latency_match(
+    legacy_identity_fields,
+):
     """``identical`` tolerates cost/latency drift; ``fully_identical`` doesn't.
 
     Same-behavior traces with different spend should report
@@ -407,7 +443,9 @@ async def test_fully_identical_requires_cost_and_latency_match():
         "a": [_root("a", output="done", duration_ms=10.0), _llm("a", 0, cost=0.01)],
         "b": [_root("b", output="done", duration_ms=50.0), _llm("b", 0, cost=0.05)],
     })
-    diff = await trace_diff("a", "b", tracer=tracer)
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
     assert diff.identical is True
     assert diff.fully_identical is False
     assert diff.cost_delta == pytest.approx(0.04)
@@ -415,18 +453,22 @@ async def test_fully_identical_requires_cost_and_latency_match():
 
 
 @pytest.mark.asyncio
-async def test_fully_identical_true_on_byte_for_byte_match():
+async def test_fully_identical_true_on_byte_for_byte_match(
+    legacy_identity_fields,
+):
     tracer = _StubTracer({
         "a": [_root("a", output="done", duration_ms=10.0)],
         "b": [_root("b", output="done", duration_ms=10.0)],
     })
-    diff = await trace_diff("a", "b", tracer=tracer)
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
     assert diff.identical is True
     assert diff.fully_identical is True
 
 
 @pytest.mark.asyncio
-async def test_cost_and_latency_delta():
+async def test_cost_and_latency_delta(legacy_identity_fields):
     tracer = _StubTracer({
         "a": [
             _root("a", duration_ms=100.0),
@@ -438,13 +480,15 @@ async def test_cost_and_latency_delta():
             _llm("b", 0, cost=0.05),
         ],
     })
-    diff = await trace_diff("a", "b", tracer=tracer)
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
     assert diff.cost_delta == pytest.approx(0.02)
     assert diff.latency_ms_delta == pytest.approx(150.0)
 
 
 @pytest.mark.asyncio
-async def test_submit_output_spans_ignored_in_diff():
+async def test_submit_output_spans_ignored_in_diff(legacy_identity_fields):
     """``submit_output`` is runner-internal; diff must not surface it."""
     tracer = _StubTracer({
         "a": [
@@ -472,7 +516,9 @@ async def test_submit_output_spans_ignored_in_diff():
             ),
         ],
     })
-    diff = await trace_diff("a", "b", tracer=tracer)
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
     assert diff.tool_divergence == []
 
 
@@ -480,25 +526,34 @@ async def test_submit_output_spans_ignored_in_diff():
 
 
 @pytest.mark.asyncio
-async def test_missing_trace_ids_raise():
+async def test_missing_trace_ids_raise(legacy_identity_fields):
     tracer = _StubTracer({})
     with pytest.raises(ValueError, match="not found or has no spans"):
-        await trace_diff("missing-a", "missing-b", tracer=tracer)
+        await trace_diff(
+            "missing-a",
+            "missing-b",
+            tracer=tracer,
+            identity_fields=legacy_identity_fields,
+        )
 
 
 @pytest.mark.asyncio
-async def test_trace_with_no_agent_run_root_raises():
+async def test_trace_with_no_agent_run_root_raises(legacy_identity_fields):
     # Trace has spans but none is the AGENT_RUN root
     tracer = _StubTracer({
         "a": [_root("a")],
         "b": [_tool("b", 0, "echo", {"text": "x"}, "x")],  # no root!
     })
     with pytest.raises(ValueError, match="no AGENT_RUN root span"):
-        await trace_diff("a", "b", tracer=tracer)
+        await trace_diff(
+            "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+        )
 
 
 @pytest.mark.asyncio
-async def test_trace_diff_against_sqlite_backend(tmp_path: Any):
+async def test_trace_diff_against_sqlite_backend(
+    tmp_path: Any, legacy_identity_fields
+):
     """Sanity check the SQLite-backed read path (not just the stub)."""
     tracer = SQLiteTracer(db_path=str(tmp_path / "d.db"))
 
@@ -513,13 +568,17 @@ async def test_trace_diff_against_sqlite_backend(tmp_path: Any):
     t_b = write("B", "same", "done_b")
     await tracer.flush()
 
-    diff: TraceDiff = await trace_diff(t_a, t_b, tracer=tracer)
+    diff: TraceDiff = await trace_diff(
+        t_a, t_b, tracer=tracer, identity_fields=legacy_identity_fields
+    )
     assert diff.tool_divergence == []
     assert diff.output_diff == ("done_a", "done_b")
 
 
 @pytest.mark.asyncio
-async def test_canonical_grading_span_writer_contract(tmp_path: Any):
+async def test_canonical_grading_span_writer_contract(
+    tmp_path: Any, legacy_identity_fields
+):
     """Production-style grading span (canonical {dimension,value} shape written
     directly via the tracer) is correctly parsed by trace_diff."""
     tracer = SQLiteTracer(db_path=str(tmp_path / "canon.db"))
@@ -538,7 +597,9 @@ async def test_canonical_grading_span_writer_contract(tmp_path: Any):
     t_b = write_with_grade("B", 0.9)
     await tracer.flush()
 
-    diff: TraceDiff = await trace_diff(t_a, t_b, tracer=tracer)
+    diff: TraceDiff = await trace_diff(
+        t_a, t_b, tracer=tracer, identity_fields=legacy_identity_fields
+    )
     assert diff.score_deltas == {"quality": pytest.approx(0.3)}
     assert diff.score_details["quality"] == (pytest.approx(0.6), pytest.approx(0.9))
     assert diff.identical is False
@@ -548,7 +609,7 @@ async def test_canonical_grading_span_writer_contract(tmp_path: Any):
 
 
 @pytest.mark.asyncio
-async def test_legacy_dim_val_scores_are_read():
+async def test_legacy_dim_val_scores_are_read(legacy_identity_fields):
     """Legacy {dim, val} entries must be accepted alongside canonical {dimension, value}."""
     tracer = _StubTracer({
         "a": [
@@ -560,13 +621,17 @@ async def test_legacy_dim_val_scores_are_read():
             _grading("b", [{"dim": "quality", "val": 0.9}]),
         ],
     })
-    diff = await trace_diff("a", "b", tracer=tracer)
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
     assert diff.score_deltas == {"quality": pytest.approx(0.4)}
     assert diff.identical is False
 
 
 @pytest.mark.asyncio
-async def test_canonical_and_legacy_scores_mixed_across_traces():
+async def test_canonical_and_legacy_scores_mixed_across_traces(
+    legacy_identity_fields,
+):
     """Canonical shape in one trace and legacy shape in another must both be parsed."""
     tracer = _StubTracer({
         "a": [
@@ -578,13 +643,17 @@ async def test_canonical_and_legacy_scores_mixed_across_traces():
             _grading("b", [{"dim": "relevance", "val": 0.8}]),
         ],
     })
-    diff = await trace_diff("a", "b", tracer=tracer)
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
     assert diff.score_deltas == {"relevance": pytest.approx(0.2)}
     assert diff.identical is False
 
 
 @pytest.mark.asyncio
-async def test_score_details_exposes_per_dimension_old_and_new_values():
+async def test_score_details_exposes_per_dimension_old_and_new_values(
+    legacy_identity_fields,
+):
     """score_details must record (a_avg, b_avg) for each dimension in the union."""
     tracer = _StubTracer({
         "a": [
@@ -602,7 +671,9 @@ async def test_score_details_exposes_per_dimension_old_and_new_values():
             ]),
         ],
     })
-    diff = await trace_diff("a", "b", tracer=tracer)
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
     # quality: changed
     assert diff.score_details["quality"] == (pytest.approx(0.6), pytest.approx(0.9))
     # accuracy: dropped (only in A)
@@ -612,40 +683,52 @@ async def test_score_details_exposes_per_dimension_old_and_new_values():
 
 
 @pytest.mark.asyncio
-async def test_score_details_identical_dimension_has_matching_values():
+async def test_score_details_identical_dimension_has_matching_values(
+    legacy_identity_fields,
+):
     """A dimension with the same score in both traces must appear in score_details
     but not in score_deltas."""
     tracer = _StubTracer({
         "a": [_root("a"), _grading("a", [{"dimension": "quality", "value": 0.7}])],
         "b": [_root("b"), _grading("b", [{"dimension": "quality", "value": 0.7}])],
     })
-    diff = await trace_diff("a", "b", tracer=tracer)
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
     assert "quality" not in diff.score_deltas
     assert diff.score_details["quality"] == (pytest.approx(0.7), pytest.approx(0.7))
     assert diff.identical is True
 
 
 @pytest.mark.asyncio
-async def test_score_delta_zero_value_does_not_lose_dimension():
+async def test_score_delta_zero_value_does_not_lose_dimension(
+    legacy_identity_fields,
+):
     """A score of 0.0 must not be confused with an absent dimension (0.0 is falsy)."""
     tracer = _StubTracer({
         "a": [_root("a"), _grading("a", [{"dimension": "quality", "value": 0.0}])],
         "b": [_root("b"), _grading("b", [{"dimension": "quality", "value": 0.5}])],
     })
-    diff = await trace_diff("a", "b", tracer=tracer)
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
     assert diff.score_deltas == {"quality": pytest.approx(0.5)}
     assert diff.score_details["quality"] == (pytest.approx(0.0), pytest.approx(0.5))
 
 
 @pytest.mark.asyncio
-async def test_added_dimension_with_zero_score_makes_identical_false():
+async def test_added_dimension_with_zero_score_makes_identical_false(
+    legacy_identity_fields,
+):
     """A dimension added in B with score 0.0 must still appear in score_deltas and
     make identical=False — the numeric delta is 0.0 but the rubric changed."""
     tracer = _StubTracer({
         "a": [_root("a")],
         "b": [_root("b"), _grading("b", [{"dimension": "quality", "value": 0.0}])],
     })
-    diff = await trace_diff("a", "b", tracer=tracer)
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
     assert "quality" in diff.score_deltas
     assert diff.score_deltas["quality"] == pytest.approx(0.0)
     assert diff.score_details["quality"] == (None, pytest.approx(0.0))
@@ -653,14 +736,18 @@ async def test_added_dimension_with_zero_score_makes_identical_false():
 
 
 @pytest.mark.asyncio
-async def test_dropped_dimension_with_zero_score_makes_identical_false():
+async def test_dropped_dimension_with_zero_score_makes_identical_false(
+    legacy_identity_fields,
+):
     """A dimension dropped from A where its score was 0.0 must still appear in
     score_deltas and make identical=False."""
     tracer = _StubTracer({
         "a": [_root("a"), _grading("a", [{"dimension": "quality", "value": 0.0}])],
         "b": [_root("b")],
     })
-    diff = await trace_diff("a", "b", tracer=tracer)
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
     assert "quality" in diff.score_deltas
     assert diff.score_deltas["quality"] == pytest.approx(0.0)
     assert diff.score_details["quality"] == (pytest.approx(0.0), None)
@@ -699,7 +786,9 @@ class _FixedGrader(Grader):
 
 
 @pytest.mark.asyncio
-async def test_score_deltas_from_real_runner_grading_spans(tmp_path: Any):
+async def test_score_deltas_from_real_runner_grading_spans(
+    tmp_path: Any, legacy_identity_fields
+):
     """trace_diff reads score_deltas from grading spans produced by run_agent."""
     tracer = SQLiteTracer(db_path=str(tmp_path / "runner.db"))
 
@@ -722,7 +811,12 @@ async def test_score_deltas_from_real_runner_grading_spans(tmp_path: Any):
     result_b = await run_agent(_config("agent-b", 0.3), "question")
     await tracer.flush()
 
-    diff = await trace_diff(result_a.trace_id, result_b.trace_id, tracer=tracer)
+    diff = await trace_diff(
+        result_a.trace_id,
+        result_b.trace_id,
+        tracer=tracer,
+        identity_fields=legacy_identity_fields,
+    )
 
     assert "quality" in diff.score_deltas
     assert diff.score_deltas["quality"] == pytest.approx(-0.6, abs=1e-6)
@@ -732,26 +826,47 @@ async def test_score_deltas_from_real_runner_grading_spans(tmp_path: Any):
 # --- Identity alignment integration ---
 
 
-def _mixed_tier_tracer() -> tuple[_StubTracer, str, str]:
-    a_spans = [
-        _root("a"),
-        _tool("a", 0, "write", {"id": 1, "val": "old"}, "wrote"),
-        _tool("a", 1, "search", {"q": "A"}, "resultA"),
-        _tool("a", 2, "delete", {"id": 9}, "deleted"),
-        _tool("a", 3, "search", {"q": "B"}, "resultB"),
-        _tool("a", 4, "notify", {"msg": "done"}, "ok"),
-        _tool("a", 5, "write", {"id": 2, "val": "fresh"}, "wrote2"),
+def _mixed_tier_events() -> tuple[list[ToolEvent], list[ToolEvent]]:
+    return [
+        ToolEvent("write", {"id": 1, "val": "old"}, "wrote", None),
+        ToolEvent("search", {"q": "A"}, "resultA", None),
+        ToolEvent("delete", {"id": 9}, "deleted", None),
+        ToolEvent("search", {"q": "B"}, "resultB", None),
+        ToolEvent("notify", {"msg": "done"}, "ok", None),
+        ToolEvent("write", {"id": 2, "val": "fresh"}, "wrote2", None),
+    ], [
+        ToolEvent("delete", {"id": 9}, "deleted", None),
+        ToolEvent("write", {"id": 1, "val": "new"}, "wrote", None),
+        ToolEvent("search", {"q": "A"}, "resultA", None),
+        ToolEvent("search", {"q": "B"}, "resultB", None),
+        ToolEvent("audit", {"msg": "inserted"}, "logged", None),
+        ToolEvent("notify", {"msg": "done"}, "ok", None),
     ]
-    b_spans = [
-        _root("b"),
-        _tool("b", 0, "delete", {"id": 9}, "deleted"),
-        _tool("b", 1, "write", {"id": 1, "val": "new"}, "wrote"),
-        _tool("b", 2, "search", {"q": "A"}, "resultA"),
-        _tool("b", 3, "search", {"q": "B"}, "resultB"),
-        _tool("b", 4, "audit", {"msg": "inserted"}, "logged"),
-        _tool("b", 5, "notify", {"msg": "done"}, "ok"),
-    ]
-    return _StubTracer({"a": a_spans, "b": b_spans}), "a", "b"
+
+
+def _mixed_tier_tracer(
+) -> tuple[_StubTracer, str, str, list[ToolEvent], list[ToolEvent]]:
+    a_events, b_events = _mixed_tier_events()
+
+    def spans(trace_id: str, events: list[ToolEvent]) -> list[Span]:
+        result = [_root(trace_id)]
+        for index, event in enumerate(events):
+            assert isinstance(event.args, dict)
+            assert isinstance(event.output, str)
+            result.append(
+                _tool(
+                    trace_id,
+                    index,
+                    event.name,
+                    event.args,
+                    event.output,
+                    event.error,
+                )
+            )
+        return result
+
+    tracer = _StubTracer({"a": spans("a", a_events), "b": spans("b", b_events)})
+    return tracer, "a", "b", a_events, b_events
 
 
 @pytest.mark.asyncio
@@ -761,8 +876,22 @@ async def test_mixed_tier_alignment_pins_full_partition():
     a same-entity argument change, and reordered identity matches —
     pinning the intermediate identity/anchor/ordinal partition and the
     resulting public divergence list without conflating the tiers."""
-    tracer, id_a, id_b = _mixed_tier_tracer()
+    tracer, id_a, id_b, a_events, b_events = _mixed_tier_tracer()
     identity_fields = {"write": ["id"], "delete": ["id"]}
+
+    alignment = IdentityAligner().align(
+        a_events, b_events, identity_fields=identity_fields
+    )
+    alignment.validate(a_events, b_events, identity_fields=identity_fields)
+    assert alignment.pairs == [
+        AlignedPair(0, 1, "identity"),
+        AlignedPair(1, 2, "ordinal"),
+        AlignedPair(2, 0, "identity"),
+        AlignedPair(3, 3, "ordinal"),
+        AlignedPair(4, 5, "anchor"),
+    ]
+    assert alignment.only_a == [UnmatchedEvent(5, "identity")]
+    assert alignment.only_b == [UnmatchedEvent(4, "ordinal")]
 
     diff = await trace_diff(id_a, id_b, tracer=tracer, identity_fields=identity_fields)
 
@@ -1022,7 +1151,9 @@ _INVALID_IDENTITY_FIELDS: list[tuple[str, Any]] = [
     ("empty_list", {"write": []}),
     ("non_string_path", {"write": [123]}),
     ("empty_path", {"write": [""]}),
-    ("empty_dot_segment", {"write": ["a."]}),
+    ("leading_empty_dot_segment", {"write": [".id"]}),
+    ("trailing_empty_dot_segment", {"write": ["id."]}),
+    ("interior_empty_dot_segment", {"write": ["work..id"]}),
     ("duplicate_path", {"write": ["id", "id"]}),
 ]
 
@@ -1059,15 +1190,19 @@ async def test_legacy_equivalence_none_vs_empty_identity_fields(name, build):
 
     assert _legacy_fields(diff_none) == _legacy_fields(diff_empty)
 
-    for d in diff_none.tool_divergence:
-        assert d.tier == "ordinal"
-        if d.divergence == "only_a":
-            assert isinstance(d.index_a, int)
-            assert d.index_b is None
-        elif d.divergence == "only_b":
-            assert d.index_a is None
-            assert isinstance(d.index_b, int)
-        else:
-            assert isinstance(d.index_a, int)
-            assert isinstance(d.index_b, int)
-            assert d.index_a == d.index_b
+    for diff in (diff_none, diff_empty):
+        assert [d.index for d in diff.tool_divergence] == list(
+            range(len(diff.tool_divergence))
+        )
+        for d in diff.tool_divergence:
+            assert d.tier == "ordinal"
+            if d.divergence == "only_a":
+                assert isinstance(d.index_a, int)
+                assert d.index_b is None
+            elif d.divergence == "only_b":
+                assert d.index_a is None
+                assert isinstance(d.index_b, int)
+            else:
+                assert isinstance(d.index_a, int)
+                assert isinstance(d.index_b, int)
+                assert d.index_a == d.index_b
