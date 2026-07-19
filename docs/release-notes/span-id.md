@@ -3,6 +3,9 @@
 `trace_diff` can now align tool calls by tool-author-declared entity identity
 instead of relying exclusively on ordinal position.
 
+See [Replay and compare recorded traces](../../jig-usage-guide.md#replay-and-compare-recorded-traces)
+for a complete declaration and comparison example.
+
 ## Public API additions
 
 - `ToolDefinition.identity_fields` accepts an ordered list of dot-paths into

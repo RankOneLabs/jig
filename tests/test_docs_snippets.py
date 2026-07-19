@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from jig import AgentConfig, LLMResponse
+from jig import AgentConfig, LLMResponse, ToolDefinition, identity_map
 from jig.core.types import (
     CompletionParams,
     FeedbackLoop,
@@ -146,3 +146,30 @@ def test_legacy_memory_kwarg_rejected() -> None:
             tracer=_FakeTracer(),
             tools=ToolRegistry(),
         )
+
+
+def test_identity_aware_trace_diff_guide_mapping_constructs() -> None:
+    """The usage-guide identity declaration builds the public diff mapping."""
+    definition = ToolDefinition(
+        name="update_work_item",
+        description="Update a work item's status",
+        parameters={
+            "type": "object",
+            "required": ["work_item"],
+            "properties": {
+                "work_item": {
+                    "type": "object",
+                    "required": ["id", "status"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "status": {"type": "string"},
+                    },
+                },
+            },
+        },
+        identity_fields=["work_item.id"],
+    )
+
+    assert identity_map([definition]) == {
+        "update_work_item": ["work_item.id"]
+    }
