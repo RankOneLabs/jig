@@ -6,7 +6,7 @@ from typing import Any, AsyncIterator
 
 import httpx
 
-from jig.core.errors import JigLLMError
+from jig.core.errors import JigLLMError, UnsupportedResponseFormatError
 from jig.core.types import (
     CompletionParams,
     LLMClient,
@@ -27,6 +27,42 @@ try:
 except ImportError:
     _ollama = None  # type: ignore[assignment]
     OllamaAsyncClient = None  # type: ignore[assignment, misc]
+
+
+def _translate_response_format(response_format: Any) -> dict[str, Any]:
+    """Validate a portable json_schema response_format and unwrap it for Ollama.
+
+    Mirrors smithers' OllamaExecutor translation so direct and dispatched
+    Ollama calls behave identically: the ollama-python client's ``.chat()``
+    takes the JSON Schema object itself in a top-level ``format`` kwarg, with
+    no use for the OpenAI wrapper's ``name`` / ``description`` / ``strict``
+    metadata. Only ``{"type": "json_schema", "json_schema": {"schema": {...}}}``
+    is accepted; any other shape raises ``UnsupportedResponseFormatError`` so
+    the caller fails before inference instead of silently running
+    unconstrained.
+    """
+    if not isinstance(response_format, dict):
+        raise UnsupportedResponseFormatError(
+            f"response_format must be a mapping, got {type(response_format).__name__}"
+        )
+    if response_format.get("type") != "json_schema":
+        raise UnsupportedResponseFormatError(
+            "Ollama only supports response_format type 'json_schema', "
+            f"got {response_format.get('type')!r}"
+        )
+    json_schema = response_format.get("json_schema")
+    if not isinstance(json_schema, dict):
+        raise UnsupportedResponseFormatError(
+            "response_format.json_schema must be a mapping, got "
+            f"{type(json_schema).__name__}"
+        )
+    schema = json_schema.get("schema")
+    if not isinstance(schema, dict) or not schema:
+        raise UnsupportedResponseFormatError(
+            "response_format.json_schema.schema must be a nonempty JSON "
+            "object schema"
+        )
+    return schema
 
 
 class OllamaClient(LLMClient):
@@ -87,7 +123,12 @@ class OllamaClient(LLMClient):
                 options.update(params.provider_params)
             if options:
                 kwargs["options"] = options
+
+            if params.response_format is not None:
+                kwargs["format"] = _translate_response_format(params.response_format)
         except JigLLMError:
+            raise
+        except UnsupportedResponseFormatError:
             raise
         except Exception as e:
             raise JigLLMError(
