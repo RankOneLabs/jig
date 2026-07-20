@@ -217,21 +217,36 @@ class TestGeminiResponseFormatRejected:
         client._client.aio.models.generate_content.assert_not_called()
 
     async def test_omitted_does_not_raise(self):
-        client = GeminiClient.__new__(GeminiClient)
-        client._client = MagicMock()
-        client._model = "gemini-test"
-        response = SimpleNamespace(
-            candidates=[SimpleNamespace(content=SimpleNamespace(parts=[]))],
-            usage_metadata=SimpleNamespace(
-                prompt_token_count=1, candidates_token_count=1,
-            ),
-            model_version="gemini-test",
-        )
-        client._client.aio.models.generate_content = AsyncMock(return_value=response)
+        # google-genai isn't installed in CI (jig[google] is an optional
+        # extra), so genai_types must be stubbed rather than exercised for
+        # real — same pattern as TestGeminiAdapterErrorBoundaries in
+        # test_errors.py.
+        genai_stub = MagicMock()
+        genai_types_stub = MagicMock()
+        genai_types_stub.GenerateContentConfig.return_value = MagicMock()
+        genai_types_stub.Content = MagicMock
+        genai_types_stub.Part = MagicMock
 
-        params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
-        # Must not raise UnsupportedResponseFormatError when omitted.
-        await client.complete(params)
+        candidate = MagicMock()
+        candidate.content.parts = []
+        response = MagicMock()
+        response.candidates = [candidate]
+        response.usage_metadata = SimpleNamespace(
+            prompt_token_count=1, candidates_token_count=1,
+        )
+        genai_stub.Client.return_value.aio.models.generate_content = AsyncMock(
+            return_value=response
+        )
+
+        with patch("jig.llm.google.genai", genai_stub), \
+             patch("jig.llm.google.genai_types", genai_types_stub):
+            client = GeminiClient.__new__(GeminiClient)
+            client._client = genai_stub.Client()
+            client._model = "gemini-test"
+
+            params = CompletionParams(messages=[Message(role=Role.USER, content="hi")])
+            # Must not raise UnsupportedResponseFormatError when omitted.
+            await client.complete(params)
 
 
 @pytest.mark.asyncio
