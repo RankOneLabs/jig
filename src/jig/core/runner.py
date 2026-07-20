@@ -7,7 +7,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 
 from pydantic import BaseModel, ValidationError
 
@@ -17,9 +17,11 @@ from jig.core.errors import (
     AgentLLMPermanentError,
     AgentMaxLLMCallsError,
     AgentMaxLLMRetriesError,
+    AgentNativeOutputError,
     AgentSchemaNotCalledError,
     AgentSchemaValidationError,
     JigLLMError,
+    UnsupportedResponseFormatError,
 )
 from jig.core.grading import grade_and_record
 from jig.core.prompt import build_system_message
@@ -69,6 +71,13 @@ ROOT_OUTPUT_KIND_KEY = "output_kind"
 ROOT_OUTPUT_COMPLETE_KEY = "output_complete"
 ROOT_OUTPUT_SHA256_KEY = "output_sha256"
 ROOT_OUTPUT_BYTE_LENGTH_KEY = "output_byte_length"
+
+# "legacy" injects the synthetic submit_output tool and validates its
+# arguments (the long-standing behavior). "native" omits that tool, converts
+# output_schema into a strict response_format, and parses the schema-
+# constrained terminal assistant content directly. No "auto": callers pick
+# explicitly so benchmark attribution and production guarantees stay knowable.
+StructuredOutputMode = Literal["legacy", "native"]
 
 # HTTP status codes that indicate a definitely-permanent LLM failure.
 # 400 / 422 — malformed request; 401 / 403 — auth problem; 404 — bad
@@ -133,6 +142,9 @@ class AgentConfig[T]:
     # ``AgentResult.parsed`` as None.
     output_schema: type[T] | None = None
     max_parse_retries: int = 2
+    # "legacy" (default) or "native" — see StructuredOutputMode. Only
+    # meaningful when output_schema is set; native mode requires it.
+    structured_output_mode: StructuredOutputMode = "legacy"
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -152,6 +164,15 @@ class AgentConfig[T]:
         if self.max_parse_retries < 0:
             raise ValueError(
                 f"max_parse_retries must be non-negative, got {self.max_parse_retries}."
+            )
+        if self.structured_output_mode not in ("legacy", "native"):
+            raise ValueError(
+                f"structured_output_mode must be 'legacy' or 'native', "
+                f"got {self.structured_output_mode!r}."
+            )
+        if self.structured_output_mode == "native" and self.output_schema is None:
+            raise ValueError(
+                "structured_output_mode='native' requires output_schema to be set."
             )
         if (
             isinstance(self.feedback_limit, bool)
@@ -211,6 +232,22 @@ def _build_submit_output_tool(schema: type[BaseModel]) -> ToolDefinition:
     )
 
 
+def _build_response_format(schema: type[BaseModel]) -> dict[str, Any]:
+    """Convert a pydantic output_schema into the portable response_format
+    envelope: ``{"type": "json_schema", "json_schema": {"name", "schema",
+    "strict"}}``. ``name`` is the schema class name — deterministic and
+    stable across runs of the same agent config.
+    """
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": schema.__name__,
+            "schema": schema.model_json_schema(),
+            "strict": True,
+        },
+    }
+
+
 def _append_schema_instruction(system_message: str) -> str:
     return (
         f"{system_message}\n\n"
@@ -260,6 +297,7 @@ def _serialize_config_snapshot(config: AgentConfig[Any]) -> dict[str, Any]:
         "include_feedback_in_prompt": config.include_feedback_in_prompt,
         "session_id": config.session_id,
         "output_schema": schema_fqn,
+        "structured_output_mode": config.structured_output_mode,
         "feedback_limit": config.feedback_limit,
         "feedback_min_score": config.feedback_min_score,
         "feedback_source": config.feedback_source.value if config.feedback_source else None,
@@ -425,6 +463,18 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
         _validate_output_schema(config.output_schema)
     output_kind = "structured" if config.output_schema is not None else "text"
 
+    # Fail fast, before the trace even starts: a native-mode agent on a
+    # client that hasn't declared response_format support must never
+    # silently run unconstrained or fall back to legacy. This is a
+    # caller-side contract violation, not a provider failure, so it
+    # propagates as a raised exception rather than an AgentResult.error.
+    if config.structured_output_mode == "native" and not config.llm.supports_response_format:
+        raise UnsupportedResponseFormatError(
+            f"LLM client {type(config.llm).__name__} does not declare "
+            f"response_format support; cannot run agent {config.name!r} in "
+            f"structured_output_mode='native'."
+        )
+
     # 1. Start trace. Snapshot the config alongside the input so phase 11
     # replay can reconstruct an equivalent AgentConfig without the caller
     # having to supply state fields that were already recorded.
@@ -501,7 +551,13 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
 
         # 5. Assemble messages (system prompt is separate, not in messages list)
         system_message = build_system_message(system_prompt, memory_context, feedback_signals)
-        if config.output_schema is not None:
+        is_legacy_structured = (
+            config.output_schema is not None and config.structured_output_mode == "legacy"
+        )
+        is_native_structured = (
+            config.output_schema is not None and config.structured_output_mode == "native"
+        )
+        if is_legacy_structured:
             system_message = _append_schema_instruction(system_message)
         messages: list[Message] = []
         if config.session_id and config.store is not None:
@@ -509,10 +565,12 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
             messages.extend(history)
         messages.append(Message(role=Role.USER, content=input))
 
-        # Build the tool list — user tools + submit_output when a schema is set.
+        # Build the tool list. Legacy mode adds the synthetic submit_output
+        # tool; native mode relies on response_format instead and leaves the
+        # tool list to ordinary working tools only.
         user_tools = config.tools.list()
         extra_tools: list[ToolDefinition] = []
-        if config.output_schema is not None:
+        if is_legacy_structured:
             if any(t.name == SUBMIT_OUTPUT_TOOL for t in user_tools):
                 raise ValueError(
                     f"Tool name {SUBMIT_OUTPUT_TOOL!r} is reserved by the runner "
@@ -520,6 +578,10 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                 )
             extra_tools.append(_build_submit_output_tool(config.output_schema))
         tools_for_llm = (user_tools + extra_tools) or None
+
+        response_format = (
+            _build_response_format(config.output_schema) if is_native_structured else None
+        )
 
         # 6. LLM call + tool loop
         tool_call_count = 0
@@ -549,6 +611,7 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                     messages=messages,
                     system=system_message,
                     tools=tools_for_llm,
+                    response_format=response_format,
                 )
 
                 try:
@@ -617,7 +680,7 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
             # that look like "my RAG lookup result vanished."
             submit_calls: list[ToolCall] = []
             other_tool_calls: list[ToolCall] = []
-            if config.output_schema is not None and response.tool_calls:
+            if is_legacy_structured and response.tool_calls:
                 for call in response.tool_calls:
                     if call.name == SUBMIT_OUTPUT_TOOL:
                         submit_calls.append(call)
@@ -732,8 +795,29 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                     )
                     break
 
-            # --- Plain-text termination path (no schema, or schema set but model
-            # didn't call submit_output this turn). ---
+            # --- Native structured-output termination path ---
+            # A schema-constrained turn with no tool calls is the terminal
+            # result. Parsed once, no retry: response_format is decode-time
+            # enforcement, so a violation here is a provider bug or schema
+            # drift, not a correctable model mistake — see
+            # AgentNativeOutputError.
+            if is_native_structured and not response.tool_calls:
+                assert config.output_schema is not None  # guaranteed by __post_init__
+                try:
+                    parsed = config.output_schema.model_validate_json(response.content)
+                except (ValidationError, ValueError) as ve:
+                    agent_error = AgentNativeOutputError(str(ve))
+                    final_output = f"[agent terminated: {agent_error}]"
+                    break
+                final_output = parsed.model_dump_json()
+                # Same rationale as the legacy submit_output path: persist
+                # the validated value, not the raw content, as complete
+                # evidence (Pydantic may add unset-field defaults).
+                structured_complete = parsed.model_dump(mode="json")
+                break
+
+            # --- Plain-text termination path (no schema, or legacy schema set
+            # but model didn't call submit_output this turn). ---
             if not response.tool_calls:
                 if config.output_schema is not None:
                     # Model ignored the schema instruction. Nudge and retry, up
