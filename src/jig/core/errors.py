@@ -49,6 +49,21 @@ class JigLLMError(JigError):
         self.retryable = retryable
 
 
+class UnsupportedResponseFormatError(ValueError):
+    """A CompletionParams.response_format value the adapter cannot honor.
+
+    Raised for two distinct cases: the adapter has no structured-output
+    support at all, or the value doesn't match the portable
+    ``{"type": "json_schema", "json_schema": {"schema": {...}}}`` shape
+    a supporting adapter requires. Deliberately a ``ValueError`` subclass
+    rather than ``JigError`` — this is a caller-side contract violation
+    (bad request shape / unsupported capability), not a provider or
+    network failure, and callers should be able to catch it distinctly
+    from ``JigLLMError`` without it being swallowed by broader jig error
+    handling.
+    """
+
+
 class JigMemoryError(JigError):
     """Raised by memory backends (store, retriever, session)."""
 

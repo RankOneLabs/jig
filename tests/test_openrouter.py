@@ -421,3 +421,31 @@ class TestIdentityFieldsExcludedFromSchema:
         payload = client._convert_tools([tool])
         _assert_no_identity_fields_key(payload)
         assert payload[0]["function"]["name"] == "lookup_customer"
+
+
+class TestOpenRouterResponseFormat:
+    async def test_forwarded_unchanged(self, monkeypatch):
+        """OpenRouter shares OpenAIClient.complete() unmodified — the same
+        OpenAI-compatible response_format envelope forwards through it."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-x")
+        rf = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer",
+                "schema": {"type": "object", "properties": {"x": {"type": "integer"}}},
+            },
+        }
+        with patch("jig.llm.openai.openai") as mock_openai:
+            instance = mock_openai.AsyncOpenAI.return_value
+            instance.chat.completions.create = AsyncMock(
+                return_value=_fake_response()
+            )
+            client = OpenRouterClient(model="anthropic/claude-3.5-sonnet")
+            params = CompletionParams(
+                messages=[Message(role=Role.USER, content="hi")],
+                response_format=rf,
+            )
+            await client.complete(params)
+
+            create_kwargs = instance.chat.completions.create.call_args.kwargs
+            assert create_kwargs["response_format"] == rf
