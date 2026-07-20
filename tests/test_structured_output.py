@@ -1,6 +1,8 @@
 """Tests for typed agent outputs (AgentConfig.output_schema, submit_output tool)."""
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime
 from typing import Any
 
@@ -33,6 +35,7 @@ from jig.core.types import (
     TracingLogger,
 )
 from jig.tools import ToolRegistry
+from jig.tracing import SQLiteTracer
 
 
 # --- Fakes ---
@@ -146,6 +149,7 @@ def _config(
     grader: Grader | None = None,
     max_parse_retries: int = 2,
     tools: list | None = None,
+    tracer: TracingLogger | None = None,
 ) -> AgentConfig:
     return AgentConfig(
         name="test",
@@ -154,7 +158,7 @@ def _config(
         llm=llm,
         store=FakeMemory(), retriever=None,
         feedback=FakeFeedback(),
-        tracer=FakeTracer(),
+        tracer=tracer if tracer is not None else FakeTracer(),
         tools=ToolRegistry(tools or []),
         output_schema=output_schema,
         max_parse_retries=max_parse_retries,
@@ -515,3 +519,166 @@ class TestFailClosedOnPlainText:
         # free-form content must not leak through.
         assert "agent terminated" in result.output
         assert "free form" not in result.output
+
+
+def _canon(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+class TestFlushedSQLiteExtractionProof:
+    """Hermetic proof for the brief's 'next_action': is the durable,
+    flushed ``submit_output`` TOOL_CALL span byte-identical evidence for
+    the validated result, or does runner.py need to persist a separate
+    complete value on the AGENT_RUN root?
+
+    Runs against a real :class:`SQLiteTracer`, with the store closed and
+    reopened before assertions, so the answer reflects durable persisted
+    evidence rather than in-memory spans. Exercises retry (invalid then
+    valid submission) and a valid payload with unicode, nested objects,
+    ordered arrays, and a JSON encoding over 200 characters.
+
+    Answer: no. Pydantic fills in the default for a field the model never
+    supplied (``note``), so the raw ``submit_output`` arguments diverge
+    from ``parsed.model_dump(mode="json")``. This is why runner.py
+    persists the canonical complete value on the AGENT_RUN root (see
+    ``ROOT_OUTPUT_COMPLETE_KEY`` in ``jig.core.runner``) instead of
+    trusting the accepted tool-call span as the extraction source.
+    """
+
+    async def test_flushed_accepted_tool_call_diverges_from_validated_result(
+        self, tmp_path: Any,
+    ) -> None:
+        class NestedTag(BaseModel):
+            label: str
+            priority: int
+
+        class ProofOutput(BaseModel):
+            title: str
+            tags: list[NestedTag]
+            order: list[str]
+            note: str = "unset"  # model omits this — Pydantic fills the default
+
+        long_unicode_title = "Katamari café ☃ report — " + ("türk " * 60)
+        assert len(long_unicode_title) > 200
+
+        valid_args = {
+            "title": long_unicode_title,
+            "tags": [
+                {"label": "north", "priority": 2},
+                {"label": "south", "priority": 1},
+            ],
+            "order": ["first", "second", "third"],
+        }
+        invalid_args = {"title": 123, "tags": "not-a-list", "order": []}
+
+        llm = FakeLLM([
+            _submit_response(invalid_args, call_id="attempt-1"),
+            _submit_response(valid_args, call_id="attempt-2"),
+        ])
+
+        db_path = str(tmp_path / "proof.db")
+        tracer = SQLiteTracer(db_path=db_path)
+        config = _config(
+            llm, output_schema=ProofOutput, max_parse_retries=2, tracer=tracer,
+        )
+
+        result = await run_agent(config, "go")
+        assert result.parsed is not None
+        assert result.parsed.title == long_unicode_title
+        assert result.parsed.note == "unset"
+
+        # Durable, flushed read: close the tracer's connection and reopen a
+        # fresh SQLiteTracer against the same file.
+        await tracer.close()
+        reopened = SQLiteTracer(db_path=db_path)
+        spans = await reopened.get_trace(result.trace_id)
+
+        submit_spans = [s for s in spans if s.name == SUBMIT_OUTPUT_TOOL]
+        assert len(submit_spans) == 2  # one invalid attempt, one accepted
+
+        failed = [s for s in submit_spans if s.error is not None]
+        accepted = [s for s in submit_spans if s.error is None]
+        assert len(failed) == 1
+        assert len(accepted) == 1
+        # The first, invalid submission must not be selected as final output.
+        assert failed[0].input == invalid_args
+        assert accepted[0].output == valid_args
+
+        validated_value = result.parsed.model_dump(mode="json")
+
+        # The proof: the accepted tool-call's raw arguments are NOT
+        # reliable complete evidence on their own — Pydantic added
+        # `note`'s default, which the model never sent.
+        assert "note" not in accepted[0].output
+        assert validated_value["note"] == "unset"
+        assert _canon(accepted[0].output) != _canon(validated_value)
+
+        # The runner's root-persisted complete value IS what diff.py
+        # actually extracts, and it is byte-identical to the validated
+        # result (unicode preserved, array order preserved, nested
+        # objects intact).
+        root = next(
+            s for s in spans
+            if s.kind == SpanKind.AGENT_RUN and s.parent_id is None
+        )
+        assert root.output["output_kind"] == "structured"
+        assert root.output["output_complete"] == validated_value
+        assert _canon(root.output["output_complete"]) == _canon(validated_value)
+        expected_hash = hashlib.sha256(_canon(validated_value)).hexdigest()
+        assert root.output["output_sha256"] == expected_hash
+        assert root.output["output_byte_length"] == len(_canon(validated_value))
+
+
+class TestCanonicalOutputHash:
+    """Direct unit coverage of ``jig.core.runner._canonical_output_hash``,
+    the definition of complete-output equality that
+    ``jig.replay.diff.trace_diff`` relies on for ``identical``."""
+
+    def test_key_order_does_not_affect_hash(self):
+        from jig.core.runner import _canonical_output_hash
+
+        a = {"b": 1, "a": {"y": 2, "x": 1}}
+        b = {"a": {"x": 1, "y": 2}, "b": 1}
+        assert _canonical_output_hash(a) == _canonical_output_hash(b)
+
+    def test_array_order_does_affect_hash(self):
+        from jig.core.runner import _canonical_output_hash
+
+        assert _canonical_output_hash({"items": [1, 2, 3]}) != _canonical_output_hash(
+            {"items": [3, 2, 1]}
+        )
+
+    def test_rejects_nan(self):
+        from jig.core.runner import _canonical_output_hash
+
+        with pytest.raises(ValueError, match="non-finite"):
+            _canonical_output_hash({"score": float("nan")})
+
+    def test_rejects_infinity(self):
+        from jig.core.runner import _canonical_output_hash
+
+        with pytest.raises(ValueError, match="non-finite"):
+            _canonical_output_hash({"score": float("inf")})
+
+    def test_rejects_nested_non_finite(self):
+        from jig.core.runner import _canonical_output_hash
+
+        with pytest.raises(ValueError, match="non-finite"):
+            _canonical_output_hash({"outer": [{"inner": float("-inf")}]})
+
+    def test_rejects_unsupported_value(self):
+        from jig.core.runner import _canonical_output_hash
+
+        with pytest.raises(ValueError, match="unsupported"):
+            _canonical_output_hash({"when": object()})
+
+    def test_rejects_non_string_object_key(self):
+        """dict keys are always strings after JSON round-tripping in
+        practice, but a caller that hands a non-string-keyed dict must get
+        a clear rejection rather than a silently wrong hash."""
+        from jig.core.runner import _canonical_output_hash
+
+        with pytest.raises(ValueError, match="non-string object key"):
+            _canonical_output_hash({1: "x"})
