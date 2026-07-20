@@ -19,6 +19,8 @@ from jig.core.errors import (
 from jig.core.pipeline import MapResult, PipelineConfig, PipelineResult, Step
 from jig.core.types import (
     CompletionParams,
+    EffectiveScore,
+    EffectiveScoreFilter,
     EvalCase,
     FeedbackLoop,
     FeedbackQuery,
@@ -47,6 +49,8 @@ from jig.core.types import (
 
 __all__ = [
     "CompletionParams",
+    "EffectiveScore",
+    "EffectiveScoreFilter",
     "EvalCase",
     "FeedbackLoop",
     "FeedbackQuery",

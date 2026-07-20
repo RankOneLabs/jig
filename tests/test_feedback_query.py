@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 import numpy as np
 import pytest
 
-from jig import FeedbackQuery, PastResults, Score, ScoreSource
+from jig import EffectiveScoreFilter, FeedbackQuery, PastResults, Score, ScoreSource
 from jig.feedback.loop import SQLiteFeedbackLoop
 
 
@@ -400,3 +400,230 @@ class TestFeedbackQueryValidation:
         """True/False should never be accepted as a limit value."""
         with pytest.raises(ValueError, match="positive int"):
             FeedbackQuery(limit=True)  # type: ignore[arg-type]
+
+
+async def _insert_score_row(
+    loop: SQLiteFeedbackLoop,
+    result_id: str,
+    dimension: str,
+    value: float,
+    source: ScoreSource,
+    created_at: str,
+    metadata: dict | None = None,
+) -> None:
+    """Insert a scores row with an explicit created_at, bypassing score()'s
+    now()-stamping so tests can control ordering/ties deterministically.
+    Insertion order still drives rowid, the documented tie-breaker.
+    """
+    from jig._sqlite import json_dumps
+
+    db = await loop._get_db()
+    await loop._ensure_scores_metadata_column(db)
+    await db.execute(
+        "INSERT INTO scores (result_id, dimension, value, source, created_at, metadata) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (result_id, dimension, value, source.value, created_at,
+         json_dumps(metadata) if metadata is not None else None),
+    )
+    await db.commit()
+
+
+@pytest.mark.asyncio
+class TestEffectiveScoreResolution:
+    """Opt-in human-over-heuristic, newest-wins effective score resolution."""
+
+    async def test_legacy_query_leaves_effective_scores_none(self, feedback_db):
+        """Existing callers that don't opt in see no shape change."""
+        rid = await feedback_db.store_result("A", "i", {})
+        await feedback_db.score(rid, [Score("plausibility", 1.0, ScoreSource.HEURISTIC)])
+
+        out = await feedback_db.query(FeedbackQuery())
+        assert len(out) == 1
+        assert out[0].effective_scores is None
+
+    async def test_human_beats_heuristic_even_when_older(self, feedback_db):
+        rid = await feedback_db.store_result("A", "i", {})
+        await _insert_score_row(feedback_db, rid, "plausibility", 1.0, ScoreSource.HUMAN, "2020-01-01T00:00:00+00:00")
+        await _insert_score_row(feedback_db, rid, "plausibility", 0.0, ScoreSource.HEURISTIC, "2025-01-01T00:00:00+00:00")
+
+        out = await feedback_db.query(FeedbackQuery(resolve_effective=True))
+        assert len(out) == 1
+        es = out[0].effective_scores["plausibility"]
+        assert es.value == 1.0
+        assert es.source == ScoreSource.HUMAN
+
+    async def test_newest_heuristic_wins_when_no_human(self, feedback_db):
+        rid = await feedback_db.store_result("A", "i", {})
+        await _insert_score_row(feedback_db, rid, "plausibility", 0.0, ScoreSource.HEURISTIC, "2020-01-01T00:00:00+00:00")
+        await _insert_score_row(feedback_db, rid, "plausibility", 1.0, ScoreSource.HEURISTIC, "2025-01-01T00:00:00+00:00")
+
+        out = await feedback_db.query(FeedbackQuery(resolve_effective=True))
+        es = out[0].effective_scores["plausibility"]
+        assert es.value == 1.0
+        assert es.source == ScoreSource.HEURISTIC
+
+    async def test_newest_human_wins_when_multiple_human_rows(self, feedback_db):
+        rid = await feedback_db.store_result("A", "i", {})
+        await _insert_score_row(feedback_db, rid, "plausibility", 0.0, ScoreSource.HUMAN, "2020-01-01T00:00:00+00:00")
+        await _insert_score_row(feedback_db, rid, "plausibility", 1.0, ScoreSource.HUMAN, "2025-01-01T00:00:00+00:00")
+
+        out = await feedback_db.query(FeedbackQuery(resolve_effective=True))
+        es = out[0].effective_scores["plausibility"]
+        assert es.value == 1.0
+
+    async def test_timestamp_tie_broken_by_rowid_descending(self, feedback_db):
+        """Equal created_at: the later-inserted (higher rowid) row wins."""
+        rid = await feedback_db.store_result("A", "i", {})
+        same_ts = "2025-01-01T00:00:00+00:00"
+        await _insert_score_row(feedback_db, rid, "plausibility", 0.0, ScoreSource.HEURISTIC, same_ts)
+        await _insert_score_row(feedback_db, rid, "plausibility", 1.0, ScoreSource.HEURISTIC, same_ts)
+
+        out = await feedback_db.query(FeedbackQuery(resolve_effective=True))
+        es = out[0].effective_scores["plausibility"]
+        assert es.value == 1.0
+
+    async def test_llm_judge_and_ground_truth_never_become_effective(self, feedback_db):
+        rid = await feedback_db.store_result("A", "i", {})
+        await _insert_score_row(feedback_db, rid, "plausibility", 1.0, ScoreSource.LLM_JUDGE, "2025-01-01T00:00:00+00:00")
+        await _insert_score_row(feedback_db, rid, "plausibility", 1.0, ScoreSource.GROUND_TRUTH, "2025-01-01T00:00:00+00:00")
+
+        out = await feedback_db.query(FeedbackQuery(resolve_effective=True))
+        assert "plausibility" not in out[0].effective_scores
+
+    async def test_missing_dimension_has_no_effective_entry(self, feedback_db):
+        rid = await feedback_db.store_result("A", "i", {})
+        await feedback_db.score(rid, [Score("other_dim", 0.5, ScoreSource.HEURISTIC)])
+
+        out = await feedback_db.query(FeedbackQuery(resolve_effective=True))
+        assert "plausibility" not in out[0].effective_scores
+
+    async def test_full_history_retained_alongside_effective_resolution(self, feedback_db):
+        """Effective resolution never deletes/mutates score rows."""
+        rid = await feedback_db.store_result("A", "i", {})
+        await _insert_score_row(feedback_db, rid, "plausibility", 0.0, ScoreSource.HEURISTIC, "2020-01-01T00:00:00+00:00")
+        await _insert_score_row(feedback_db, rid, "plausibility", 1.0, ScoreSource.HUMAN, "2025-01-01T00:00:00+00:00")
+
+        out = await feedback_db.query(FeedbackQuery(resolve_effective=True))
+        assert len(out[0].scores) == 2
+        assert {s.source for s in out[0].scores} == {ScoreSource.HEURISTIC, ScoreSource.HUMAN}
+
+    async def test_effective_score_metadata_round_trips(self, feedback_db):
+        rid = await feedback_db.store_result("A", "i", {})
+        await _insert_score_row(
+            feedback_db, rid, "plausibility", 0.0, ScoreSource.HEURISTIC,
+            "2025-01-01T00:00:00+00:00",
+            metadata={"rule_id": "best_sharpe_ceiling", "rule_version": 1},
+        )
+
+        out = await feedback_db.query(FeedbackQuery(resolve_effective=True))
+        es = out[0].effective_scores["plausibility"]
+        assert es.metadata == {"rule_id": "best_sharpe_ceiling", "rule_version": 1}
+
+
+@pytest.mark.asyncio
+class TestEffectiveScoreFilters:
+    async def test_filter_excludes_below_min_value(self, feedback_db):
+        rid_low = await feedback_db.store_result("low", "i", {})
+        await feedback_db.score(rid_low, [Score("plausibility", 0.0, ScoreSource.HEURISTIC)])
+        rid_high = await feedback_db.store_result("high", "i", {})
+        await feedback_db.score(rid_high, [Score("plausibility", 1.0, ScoreSource.HEURISTIC)])
+
+        out = await feedback_db.query(FeedbackQuery(
+            effective_filters=[EffectiveScoreFilter(dimension="plausibility", min_value=0.5)],
+        ))
+        assert [r.content for r in out] == ["high"]
+
+    async def test_filter_is_inclusive_at_exact_boundary(self, feedback_db):
+        rid = await feedback_db.store_result("exact", "i", {})
+        await feedback_db.score(rid, [Score("plausibility", 0.5, ScoreSource.HEURISTIC)])
+
+        out = await feedback_db.query(FeedbackQuery(
+            effective_filters=[EffectiveScoreFilter(dimension="plausibility", min_value=0.5)],
+        ))
+        assert [r.content for r in out] == ["exact"]
+
+    async def test_filter_excludes_above_max_value(self, feedback_db):
+        rid = await feedback_db.store_result("too_high", "i", {})
+        await feedback_db.score(rid, [Score("sharpe_plausibility", 1.0, ScoreSource.HEURISTIC)])
+
+        out = await feedback_db.query(FeedbackQuery(
+            effective_filters=[EffectiveScoreFilter(dimension="sharpe_plausibility", max_value=0.5)],
+        ))
+        assert out == []
+
+    async def test_missing_effective_dimension_fails_filter(self, feedback_db):
+        rid = await feedback_db.store_result("ungraded", "i", {})
+        await feedback_db.score(rid, [Score("other_dim", 0.9, ScoreSource.HEURISTIC)])
+
+        out = await feedback_db.query(FeedbackQuery(
+            effective_filters=[EffectiveScoreFilter(dimension="plausibility", min_value=0.5)],
+        ))
+        assert out == []
+
+    async def test_multiple_filters_combine_with_and(self, feedback_db):
+        rid_both = await feedback_db.store_result("both", "i", {})
+        await feedback_db.score(rid_both, [
+            Score("plausibility", 1.0, ScoreSource.HEURISTIC),
+            Score("idea_quality", 1.0, ScoreSource.HEURISTIC),
+        ])
+        rid_one = await feedback_db.store_result("one", "i", {})
+        await feedback_db.score(rid_one, [
+            Score("plausibility", 1.0, ScoreSource.HEURISTIC),
+            Score("idea_quality", 0.0, ScoreSource.HEURISTIC),
+        ])
+
+        out = await feedback_db.query(FeedbackQuery(
+            effective_filters=[
+                EffectiveScoreFilter(dimension="plausibility", min_value=0.5),
+                EffectiveScoreFilter(dimension="idea_quality", min_value=0.5),
+            ],
+        ))
+        assert [r.content for r in out] == ["both"]
+
+    async def test_human_override_reinstates_excluded_result(self, feedback_db):
+        """A human plausibility row can override a disqualifying heuristic."""
+        rid = await feedback_db.store_result("reinstated", "i", {})
+        await _insert_score_row(feedback_db, rid, "plausibility", 0.0, ScoreSource.HEURISTIC, "2020-01-01T00:00:00+00:00")
+        await _insert_score_row(feedback_db, rid, "plausibility", 1.0, ScoreSource.HUMAN, "2020-06-01T00:00:00+00:00")
+
+        out = await feedback_db.query(FeedbackQuery(
+            effective_filters=[EffectiveScoreFilter(dimension="plausibility", min_value=0.5)],
+        ))
+        assert [r.content for r in out] == ["reinstated"]
+
+    async def test_human_override_can_also_exclude(self, feedback_db):
+        """A human row can veto a result that heuristics alone would pass."""
+        rid = await feedback_db.store_result("excluded", "i", {})
+        await _insert_score_row(feedback_db, rid, "plausibility", 1.0, ScoreSource.HEURISTIC, "2020-01-01T00:00:00+00:00")
+        await _insert_score_row(feedback_db, rid, "plausibility", 0.0, ScoreSource.HUMAN, "2020-06-01T00:00:00+00:00")
+
+        out = await feedback_db.query(FeedbackQuery(
+            effective_filters=[EffectiveScoreFilter(dimension="plausibility", min_value=0.5)],
+        ))
+        assert out == []
+
+    async def test_filter_applied_before_limit_fills_full_pool(self, feedback_db):
+        """A large corpus of qualifying results still fills the requested
+        limit after exclusions, rather than starving on an early window."""
+        for i in range(40):
+            rid = await feedback_db.store_result(f"unsafe-{i}", "i", {})
+            await feedback_db.score(rid, [Score("plausibility", 0.0, ScoreSource.HEURISTIC)])
+        for i in range(10):
+            rid = await feedback_db.store_result(f"safe-{i}", "i", {})
+            await feedback_db.score(rid, [Score("plausibility", 1.0, ScoreSource.HEURISTIC)])
+
+        out = await feedback_db.query(FeedbackQuery(
+            limit=10,
+            effective_filters=[EffectiveScoreFilter(dimension="plausibility", min_value=0.5)],
+        ))
+        assert len(out) == 10
+        assert all(r.content.startswith("safe-") for r in out)
+
+    async def test_effective_filters_imply_effective_scores_exposed(self, feedback_db):
+        rid = await feedback_db.store_result("A", "i", {})
+        await feedback_db.score(rid, [Score("plausibility", 1.0, ScoreSource.HEURISTIC)])
+
+        out = await feedback_db.query(FeedbackQuery(
+            effective_filters=[EffectiveScoreFilter(dimension="plausibility", min_value=0.5)],
+        ))
+        assert out[0].effective_scores["plausibility"].value == 1.0

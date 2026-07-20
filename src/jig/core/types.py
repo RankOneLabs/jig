@@ -144,6 +144,38 @@ class Score:
 
 
 @dataclass
+class EffectiveScore:
+    """The single score a consumer should trust for one (result, dimension).
+
+    Resolved from the append-only ``scores`` history: the newest ``human``
+    row if any exists, else the newest ``heuristic`` row, else absent.
+    Carries its own provenance (``source``, ``created_at``, ``metadata``)
+    separately from the full history so callers can see *why* this row
+    won — the history itself is never mutated to produce this.
+    """
+
+    dimension: str
+    value: float
+    source: ScoreSource
+    created_at: datetime
+    metadata: dict[str, Any] | None = None
+
+
+@dataclass
+class EffectiveScoreFilter:
+    """An inclusive [min_value, max_value] gate on one dimension's effective score.
+
+    Both bounds are optional and inclusive when set. A result missing an
+    effective score for ``dimension`` fails the filter — absence is never
+    treated as satisfying a quality requirement.
+    """
+
+    dimension: str
+    min_value: float | None = None
+    max_value: float | None = None
+
+
+@dataclass
 class ScoredResult:
     result_id: str
     content: str
@@ -151,6 +183,10 @@ class ScoredResult:
     avg_score: float
     metadata: dict[str, Any]
     created_at: datetime
+    # Populated only when the originating FeedbackQuery opted into effective
+    # resolution (``resolve_effective=True`` or a non-empty
+    # ``effective_filters``); keyed by dimension. None when not requested.
+    effective_scores: dict[str, EffectiveScore] | None = None
 
 
 @dataclass
@@ -186,6 +222,17 @@ class FeedbackQuery:
     # When set, only scores from this source are considered per result;
     # results whose filtered score list is empty are dropped entirely.
     source: ScoreSource | None = None
+    # Opt-in: when True, each returned ScoredResult.effective_scores is
+    # populated (human-over-heuristic, newest-wins resolution per
+    # dimension). Legacy callers that leave this False see no change in
+    # shape or ranking. Implied True whenever effective_filters is set.
+    resolve_effective: bool = False
+    # Opt-in: inclusive per-dimension gates on the *effective* score,
+    # combined with AND. Applied before similarity/ranking limits are
+    # finalized so a small pre-limit candidate window can't starve an
+    # otherwise-large eligible pool. A result missing an effective score
+    # for a named dimension fails that filter.
+    effective_filters: list[EffectiveScoreFilter] | None = None
 
     def __post_init__(self) -> None:
         # Reject bool explicitly: ``bool`` is an ``int`` subclass so
