@@ -110,6 +110,13 @@ class CompletionParams:
     temperature: float | None = None
     max_tokens: int | None = None
     provider_params: dict[str, Any] | None = None
+    # Portable OpenAI-compatible structured-output contract:
+    # {"type": "json_schema", "json_schema": {"name": ..., "schema": {...}}}.
+    # Adapters forward it unchanged when they speak the OpenAI-compatible
+    # request shape, translate it when the backend needs a different form
+    # (Ollama), or reject it before making a request when unsupported.
+    # Never normalized or mutated here — interpretation belongs to adapters.
+    response_format: dict[str, Any] | None = None
 
 
 @dataclass
