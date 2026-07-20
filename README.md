@@ -180,7 +180,37 @@ CompletionParams(
     temperature=0.7,             # universal
     max_tokens=4096,             # universal
     provider_params={"top_k": 40},  # forwarded to SDK, provider-specific
+    response_format={               # optional, portable structured output
+        "type": "json_schema",
+        "json_schema": {"name": "answer", "schema": {"type": "object", "...": "..."}},
+    },
 )
+```
+
+### Structured output (`response_format`)
+
+`response_format` carries the OpenAI-compatible envelope
+(`{"type": "json_schema", "json_schema": {"name": ..., "schema": {...}}}`).
+Adapters never normalize or mutate it — each adapter's own capability
+determines what happens with a non-null value:
+
+| Adapter | Behavior |
+| --- | --- |
+| Dispatch (→ vLLM) | Forwarded unchanged — an opaque transport; the smithers worker's executor owns validation. |
+| OpenAI | Forwarded unchanged as the `response_format` request field. |
+| OpenRouter | Forwarded unchanged (shares `OpenAIClient.complete()`). |
+| Ollama (direct + dispatched) | Validated, then translated: the inner `json_schema.schema` object becomes the top-level `format` field/kwarg. Wrapper metadata (`name`, `description`, `strict`) is not sent upstream. |
+| Anthropic, Gemini, and every other adapter | Rejected — `response_format` is not implemented there yet. |
+
+Omitting `response_format` leaves every existing request byte-identical to today. A malformed or unsupported value raises `UnsupportedResponseFormatError` (a `ValueError` subclass, exported from `jig`) before any request is made, so an unsupported constraint fails loudly instead of silently running unconstrained:
+
+```python
+from jig import CompletionParams, UnsupportedResponseFormatError
+
+try:
+    await client.complete(CompletionParams(messages=[...], response_format={"type": "text"}))
+except UnsupportedResponseFormatError as e:
+    ...  # bad shape or unsupported adapter — caller's contract violation, not a provider failure
 ```
 
 ## Project layout
