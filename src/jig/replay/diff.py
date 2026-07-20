@@ -20,8 +20,12 @@ them clutters the diff.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
+from jig.core.runner import ROOT_OUTPUT_BYTE_LENGTH_KEY as _ROOT_OUTPUT_BYTE_LENGTH_KEY
+from jig.core.runner import ROOT_OUTPUT_COMPLETE_KEY as _ROOT_OUTPUT_COMPLETE_KEY
+from jig.core.runner import ROOT_OUTPUT_KIND_KEY as _ROOT_OUTPUT_KIND_KEY
+from jig.core.runner import ROOT_OUTPUT_SHA256_KEY as _ROOT_OUTPUT_SHA256_KEY
 from jig.core.runner import SUBMIT_OUTPUT_TOOL as _SUBMIT_OUTPUT_TOOL
 from jig.core.types import Span, SpanKind, TracingLogger
 from jig.replay.align import (
@@ -90,6 +94,32 @@ class TraceDiff:
     score_details: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
     cost_delta: float = 0.0
     latency_ms_delta: float = 0.0
+    # --- Complete structured-output comparison ---
+    # These fields are the sole basis for output equality (see
+    # ``identical`` below); ``output_diff`` above stays a display-only
+    # preview pair and is never consulted for equality. ``comparison_
+    # complete`` is False, and ``comparison_incomplete_reason`` non-None,
+    # whenever either side lacks a validated ``submit_output`` result to
+    # hash — a plain-text run, a schema run that never validated, or a
+    # trace recorded before this feature shipped. Reason values:
+    # "preview_only_output" (the root predates complete-output capture
+    # entirely) or "structured_output_unavailable" (a current-format
+    # trace with no structured value to compare). ``a_output_complete`` /
+    # ``b_output_complete`` carry the actual canonicalization-safe value
+    # (JSON-native primitives / lists / dicts) for trusted callers
+    # building their own downstream diffs (e.g. Scout's domain diff over
+    # JSON-Pointer paths); they are ``None`` under the same conditions as
+    # the hash fields.
+    comparison_complete: bool = False
+    comparison_incomplete_reason: str | None = "structured_output_unavailable"
+    a_output_preview: str = ""
+    b_output_preview: str = ""
+    a_output_hash: str | None = None
+    b_output_hash: str | None = None
+    a_output_byte_length: int | None = None
+    b_output_byte_length: int | None = None
+    a_output_complete: Any = None
+    b_output_complete: Any = None
 
     @property
     def identical(self) -> bool:
@@ -106,6 +136,15 @@ class TraceDiff:
         support. Use :attr:`fully_identical` when you also require equal
         cost and latency under the selected alignment semantics.
 
+        Output equality is decided by :attr:`comparison_complete` and the
+        canonical ``a_output_hash`` / ``b_output_hash`` /
+        ``*_output_byte_length`` fields, never by the 200-character
+        ``output_diff`` preview — two different complete outputs can
+        share a preview, so preview equality is not output equality.
+        Whenever either side's complete output is unavailable
+        (:attr:`comparison_complete` is False), ``identical`` is False:
+        absence of a detected difference is not evidence of equality.
+
         Identity matching (see ``identity_fields`` on
         :func:`trace_diff`) is order-insensitive: two traces that make
         the same identity-keyed calls in a different order are
@@ -115,7 +154,10 @@ class TraceDiff:
         """
         return (
             not self.tool_divergence
-            and self.output_diff is None
+            and self.comparison_complete
+            and self.a_output_hash is not None
+            and self.a_output_hash == self.b_output_hash
+            and self.a_output_byte_length == self.b_output_byte_length
             and self.error_category_change is None
             and not self.score_deltas
         )
@@ -304,6 +346,36 @@ def _final_output_preview(root: Span) -> str:
     return ""
 
 
+def _complete_output_evidence(
+    root: Span,
+) -> tuple[Any, str | None, int | None, str | None]:
+    """Extract complete structured-output evidence from an AGENT_RUN root.
+
+    Returns ``(complete_value, sha256_hex, utf8_byte_length,
+    incomplete_reason)``. ``incomplete_reason`` is:
+
+    - ``"preview_only_output"`` when ``root.output`` carries no
+      :data:`~jig.core.runner.ROOT_OUTPUT_KIND_KEY` marker at all — the
+      trace predates complete-output capture, so only the truncated
+      preview survives.
+    - ``"structured_output_unavailable"`` when the trace is in the
+      current format but has no validated structured value — a
+      plain-text run, or a schema run that never validated.
+    - ``None`` when complete evidence is present; the first three return
+      values are then all non-None.
+    """
+    if not isinstance(root.output, dict) or _ROOT_OUTPUT_KIND_KEY not in root.output:
+        return None, None, None, "preview_only_output"
+    if _ROOT_OUTPUT_COMPLETE_KEY not in root.output:
+        return None, None, None, "structured_output_unavailable"
+    value = root.output[_ROOT_OUTPUT_COMPLETE_KEY]
+    output_hash = root.output.get(_ROOT_OUTPUT_SHA256_KEY)
+    byte_length = root.output.get(_ROOT_OUTPUT_BYTE_LENGTH_KEY)
+    if not isinstance(output_hash, str) or not isinstance(byte_length, int):
+        return None, None, None, "structured_output_unavailable"
+    return value, output_hash, byte_length, None
+
+
 def _error_category(root: Span) -> str | None:
     if isinstance(root.output, dict):
         value = root.output.get("error_category")
@@ -418,15 +490,39 @@ async def trace_diff(
 
     output_diff: tuple[str, str] | None = None
     error_category_change: tuple[str | None, str | None] | None = None
+    a_output_preview = ""
+    b_output_preview = ""
+    a_output_complete: Any = None
+    b_output_complete: Any = None
+    a_output_hash: str | None = None
+    b_output_hash: str | None = None
+    a_output_byte_length: int | None = None
+    b_output_byte_length: int | None = None
+    comparison_complete = False
+    comparison_incomplete_reason: str | None = "structured_output_unavailable"
     if a_root and b_root:
-        a_out = _final_output_preview(a_root)
-        b_out = _final_output_preview(b_root)
-        if a_out != b_out:
-            output_diff = (a_out, b_out)
+        a_output_preview = _final_output_preview(a_root)
+        b_output_preview = _final_output_preview(b_root)
+        if a_output_preview != b_output_preview:
+            output_diff = (a_output_preview, b_output_preview)
         a_err = _error_category(a_root)
         b_err = _error_category(b_root)
         if a_err != b_err:
             error_category_change = (a_err, b_err)
+
+        a_output_complete, a_output_hash, a_output_byte_length, a_reason = (
+            _complete_output_evidence(a_root)
+        )
+        b_output_complete, b_output_hash, b_output_byte_length, b_reason = (
+            _complete_output_evidence(b_root)
+        )
+        comparison_complete = a_reason is None and b_reason is None
+        if comparison_complete:
+            comparison_incomplete_reason = None
+        elif a_reason == "preview_only_output" or b_reason == "preview_only_output":
+            comparison_incomplete_reason = "preview_only_output"
+        else:
+            comparison_incomplete_reason = "structured_output_unavailable"
 
     a_scores = _avg_scores(a_spans)
     b_scores = _avg_scores(b_spans)
@@ -459,4 +555,14 @@ async def trace_diff(
         score_details=score_details,
         cost_delta=b_cost - a_cost,
         latency_ms_delta=b_duration - a_duration,
+        comparison_complete=comparison_complete,
+        comparison_incomplete_reason=comparison_incomplete_reason,
+        a_output_preview=a_output_preview,
+        b_output_preview=b_output_preview,
+        a_output_hash=a_output_hash,
+        b_output_hash=b_output_hash,
+        a_output_byte_length=a_output_byte_length,
+        b_output_byte_length=b_output_byte_length,
+        a_output_complete=a_output_complete,
+        b_output_complete=b_output_complete,
     )

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime
 from typing import Any, Callable
 
@@ -12,9 +13,12 @@ from jig import AgentConfig, CompletionParams, LLMResponse, Score, ScoreSource, 
 from jig.core.types import Grader, LLMClient, TracingLogger
 from jig.feedback.loop import SQLiteFeedbackLoop
 from jig.replay.align import AlignedPair, IdentityAligner, ToolEvent, UnmatchedEvent
+from jig.core.runner import _canonical_output_hash
 from jig.replay.diff import TraceDiff
 from jig.tools import ToolRegistry
 from jig.tracing import SQLiteTracer
+
+_MISSING = object()
 
 
 class _StubTracer(TracingLogger):
@@ -47,10 +51,39 @@ class _StubTracer(TracingLogger):
         pass
 
 
-def _root(trace_id: str, *, output: str = "", error_category: str | None = None, duration_ms: float = 10.0) -> Span:
+def _root(
+    trace_id: str,
+    *,
+    output: str = "",
+    complete: Any = _MISSING,
+    error_category: str | None = None,
+    duration_ms: float = 10.0,
+    legacy: bool = False,
+) -> Span:
+    """Build an AGENT_RUN root span.
+
+    By default the root also carries structured complete-output evidence
+    derived from ``output`` (or ``complete`` when passed explicitly) —
+    this is what a modern runner persists for a validated ``submit_output``
+    result, and keeps every pre-existing ``.identical``-based fixture in
+    this module behaving the same under the strengthened output contract.
+    Pass ``legacy=True`` to omit the ``output_kind`` marker entirely
+    (simulates a trace recorded before this feature — comparison reason
+    ``"preview_only_output"``), or ``complete=None`` to simulate a modern
+    trace with no structured source, e.g. a plain-text run (comparison
+    reason ``"structured_output_unavailable"``).
+    """
     out: dict[str, Any] = {"output": output, "scores": None}
     if error_category is not None:
         out["error_category"] = error_category
+    if not legacy:
+        value = output if complete is _MISSING else complete
+        out["output_kind"] = "structured" if value is not None else "text"
+        if value is not None:
+            output_hash, output_len = _canonical_output_hash(value)
+            out["output_complete"] = value
+            out["output_sha256"] = output_hash
+            out["output_byte_length"] = output_len
     return Span(
         id=f"{trace_id}-root",
         trace_id=trace_id,
@@ -520,6 +553,150 @@ async def test_submit_output_spans_ignored_in_diff(legacy_identity_fields):
         "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
     )
     assert diff.tool_divergence == []
+
+
+# --- Complete structured-output comparison ---
+
+
+@pytest.mark.asyncio
+async def test_identical_hashes_and_bytes_agree_for_key_order_variants(
+    legacy_identity_fields,
+):
+    """Complete values that differ only in key order canonicalize to the
+    same hash — key order must never register as a divergence."""
+    tracer = _StubTracer({
+        "a": [_root("a", complete={"b": 1, "a": {"y": 2, "x": 1}})],
+        "b": [_root("b", complete={"a": {"x": 1, "y": 2}, "b": 1})],
+    })
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
+    assert diff.comparison_complete is True
+    assert diff.a_output_hash == diff.b_output_hash
+    assert diff.a_output_byte_length == diff.b_output_byte_length
+    assert diff.identical is True
+
+
+@pytest.mark.asyncio
+async def test_unicode_preserved_in_hash_and_byte_length(legacy_identity_fields):
+    """Unicode must round-trip unescaped through the canonical encoding,
+    and the byte length must reflect UTF-8 bytes, not code points."""
+    payload = {"text": "café ☃ snowman"}
+    tracer = _StubTracer({
+        "a": [_root("a", complete=payload)],
+        "b": [_root("b", complete=dict(payload))],
+    })
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
+    assert diff.a_output_hash == diff.b_output_hash
+    assert diff.a_output_byte_length == len(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+
+
+@pytest.mark.asyncio
+async def test_same_200char_preview_different_tail_is_not_identical(
+    legacy_identity_fields,
+):
+    """Two complete outputs sharing a 200-char preview but diverging after
+    it must be caught by the hash — the exact regression this feature
+    exists to close."""
+    preview_prefix = {"kind": "note", "body": "x" * 190}
+    a_payload = {**preview_prefix, "tail": "AAAA"}
+    b_payload = {**preview_prefix, "tail": "BBBB"}
+    preview_of = lambda v: json.dumps(v, sort_keys=True)[:200]  # noqa: E731
+    assert preview_of(a_payload) == preview_of(b_payload)
+
+    tracer = _StubTracer({
+        "a": [_root("a", complete=a_payload)],
+        "b": [_root("b", complete=b_payload)],
+    })
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
+    assert diff.comparison_complete is True
+    assert diff.a_output_hash != diff.b_output_hash
+    assert diff.identical is False
+
+
+@pytest.mark.asyncio
+async def test_preview_only_history_is_incomplete(legacy_identity_fields):
+    """A trace recorded before complete-output capture (no ``output_kind``
+    marker) must report ``preview_only_output``, not silently compare
+    equal just because both previews match."""
+    tracer = _StubTracer({
+        "a": [_root("a", output="same preview", legacy=True)],
+        "b": [_root("b", output="same preview")],
+    })
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
+    assert diff.comparison_complete is False
+    assert diff.comparison_incomplete_reason == "preview_only_output"
+    assert diff.identical is False
+
+
+@pytest.mark.asyncio
+async def test_plain_text_run_is_structured_output_unavailable(
+    legacy_identity_fields,
+):
+    """A modern trace with no structured source (e.g. a plain-text run)
+    is incomplete for a different reason than a legacy trace — and must
+    never compare identical=True just because the text matches."""
+    tracer = _StubTracer({
+        "a": [_root("a", output="same text", complete=None)],
+        "b": [_root("b", output="same text", complete=None)],
+    })
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
+    assert diff.comparison_complete is False
+    assert diff.comparison_incomplete_reason == "structured_output_unavailable"
+    assert diff.identical is False
+
+
+@pytest.mark.asyncio
+async def test_tool_empty_phase_still_compares_complete_output(
+    legacy_identity_fields,
+):
+    """No TOOL_CALL spans at all, only the AGENT_RUN root — output
+    comparison must not depend on there being any tool activity."""
+    tracer = _StubTracer({
+        "a": [_root("a", complete={"result": "abstain"})],
+        "b": [_root("b", complete={"result": "abstain"})],
+    })
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
+    assert diff.comparison_complete is True
+    assert diff.identical is True
+
+
+@pytest.mark.asyncio
+async def test_trace_diff_is_json_serializable_without_default_str(
+    legacy_identity_fields,
+):
+    """Every TraceDiff field must be directly JSON-serializable — no
+    ``default=str`` escape hatch — so downstream (Scout) dashboards can
+    serialize a diff without special-casing types."""
+    tracer = _StubTracer({
+        "a": [
+            _root("a", complete={"nested": {"values": [1, 2, "x"]}}),
+            _tool("a", 0, "echo", {"text": "x"}, "x"),
+        ],
+        "b": [
+            _root("b", complete={"nested": {"values": [1, 2, "y"]}}),
+            _tool("b", 0, "echo", {"text": "y"}, "y"),
+        ],
+    })
+    diff = await trace_diff(
+        "a", "b", tracer=tracer, identity_fields=legacy_identity_fields
+    )
+    from dataclasses import asdict
+
+    serialized = json.dumps(asdict(diff))
+    assert json.loads(serialized)["comparison_complete"] is True
 
 
 # --- SQLite integration ---
