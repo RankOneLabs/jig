@@ -129,6 +129,31 @@ class TestBuildPayload:
         _assert_no_identity_fields_key(payload)
         assert payload["tools"][0]["function"]["name"] == "lookup_customer"
 
+    def test_response_format_forwarded_unchanged(self):
+        """Dispatch is an opaque transport — response_format passes through
+        verbatim; the worker's executor owns backend-specific validation."""
+        client = DispatchClient()
+        rf = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer",
+                "strict": True,
+                "schema": {"type": "object", "properties": {"x": {"type": "integer"}}},
+            },
+        }
+        params = CompletionParams(
+            messages=[Message(role=Role.USER, content="Hi")],
+            response_format=rf,
+        )
+        payload = client._build_payload(params)
+        assert payload["response_format"] == rf
+
+    def test_no_response_format_key_when_omitted(self):
+        client = DispatchClient()
+        params = CompletionParams(messages=[Message(role=Role.USER, content="Hi")])
+        payload = client._build_payload(params)
+        assert "response_format" not in payload
+
     def test_skips_system_role_in_messages(self):
         client = DispatchClient()
         params = CompletionParams(

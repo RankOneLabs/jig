@@ -221,7 +221,10 @@ class DispatchClient(LLMClient):
         payload: dict[str, Any] = {"messages": messages}
         if params.tools:
             payload["tools"] = _tools_payload(params.tools)
-        merge_completion_kwargs(payload, params)
+        # Dispatch is an opaque transport to the smithers worker — the
+        # worker's executor (vLLM, Ollama) owns backend-specific validation
+        # and translation, so response_format is always forwarded here.
+        merge_completion_kwargs(payload, params, supports_response_format=True)
         return payload
 
     async def complete(self, params: CompletionParams) -> LLMResponse:

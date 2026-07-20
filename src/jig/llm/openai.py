@@ -118,7 +118,9 @@ class OpenAIClient(LLMClient):
             }
             if params.tools:
                 kwargs["tools"] = self._convert_tools(params.tools)
-            merge_completion_kwargs(kwargs, params)
+            # OpenAI and OpenRouter (a subclass) both speak the same
+            # OpenAI-compatible response_format envelope natively.
+            merge_completion_kwargs(kwargs, params, supports_response_format=True)
             self._apply_extra_kwargs(kwargs)
         except JigLLMError:
             raise

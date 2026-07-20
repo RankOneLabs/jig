@@ -7,7 +7,7 @@ from __future__ import annotations
 import time
 from typing import Any, Callable
 
-from jig.core.errors import JigLLMError
+from jig.core.errors import JigLLMError, UnsupportedResponseFormatError
 from jig.core.types import CompletionParams, ToolDefinition
 
 
@@ -21,18 +21,39 @@ def start_timer() -> Callable[[], float]:
     return lambda: (time.monotonic() - t) * 1000
 
 
-def merge_completion_kwargs(kwargs: dict[str, Any], params: CompletionParams) -> None:
-    """Apply temperature, max_tokens, and provider_params to kwargs in-place.
+def merge_completion_kwargs(
+    kwargs: dict[str, Any],
+    params: CompletionParams,
+    *,
+    supports_response_format: bool = False,
+) -> None:
+    """Apply temperature, max_tokens, response_format, and provider_params
+    to kwargs in-place.
 
-    provider_params is merged last so caller-supplied values win over defaults.
-    Only sets temperature/max_tokens when those fields are not None; pre-set
-    defaults (e.g. Anthropic's ``max_tokens or 4096``) are left untouched when
-    ``params.temperature`` or ``params.max_tokens`` is None.
+    provider_params is merged last so caller-supplied values win over
+    defaults. Only sets temperature/max_tokens when those fields are not
+    None; pre-set defaults (e.g. Anthropic's ``max_tokens or 4096``) are
+    left untouched when ``params.temperature`` or ``params.max_tokens``
+    is None.
+
+    ``response_format`` is forwarded unchanged under the ``response_format``
+    key only when the caller passes ``supports_response_format=True`` (the
+    adapter speaks the OpenAI-compatible request shape natively). A non-null
+    value on an adapter that hasn't opted in raises
+    ``UnsupportedResponseFormatError`` before any request is built, so an
+    unsupported constraint fails loudly instead of silently running
+    unconstrained.
     """
     if params.temperature is not None:
         kwargs["temperature"] = params.temperature
     if params.max_tokens is not None:
         kwargs["max_tokens"] = params.max_tokens
+    if params.response_format is not None:
+        if not supports_response_format:
+            raise UnsupportedResponseFormatError(
+                "This adapter does not support response_format"
+            )
+        kwargs["response_format"] = params.response_format
     if params.provider_params:
         kwargs.update(params.provider_params)
 
