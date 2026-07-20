@@ -37,6 +37,10 @@ class OpenAIClient(LLMClient):
     # error telemetry attributes failures correctly.
     _provider_label: str = "openai"
 
+    # Speaks the OpenAI-compatible response_format envelope natively —
+    # forwarded unchanged in complete()/stream() via merge_completion_kwargs.
+    supports_response_format = True
+
     def __init__(self, model: str = "gpt-4o", **client_kwargs: Any):
         if openai is None:
             raise ImportError("Install openai: pip install 'jig[openai]'")

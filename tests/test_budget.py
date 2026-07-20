@@ -257,6 +257,30 @@ class TestBudgetedLLMClient:
             await client.complete(params)
         inner.complete.assert_not_called()
 
+    async def test_supports_response_format_delegates_to_inner(self):
+        """The wrapper's own capability declaration must not shadow the
+        wrapped client's — the runner's native-mode preflight check reads
+        this attribute on whatever LLMClient it was handed, wrapped or not.
+        """
+        class CapableInner:
+            supports_response_format = True
+
+            async def complete(self, params: CompletionParams) -> LLMResponse:
+                raise NotImplementedError
+
+        class IncapableInner:
+            supports_response_format = False
+
+            async def complete(self, params: CompletionParams) -> LLMResponse:
+                raise NotImplementedError
+
+        budget = BudgetTracker(limit_usd=1.0)
+        capable = BudgetedLLMClient(inner=CapableInner(), budget=budget)
+        incapable = BudgetedLLMClient(inner=IncapableInner(), budget=budget)
+
+        assert capable.supports_response_format is True
+        assert incapable.supports_response_format is False
+
     async def test_no_estimate_serializes_shared_tracker_completions(self):
         """No estimate_cost_usd falls back to serialized post-call accounting."""
         class FakeClient:

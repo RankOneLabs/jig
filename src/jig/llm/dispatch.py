@@ -161,6 +161,10 @@ class DispatchClient(LLMClient):
     phase 9 wires workers to reparent their spans under it.
     """
 
+    # Forwarded unchanged to the smithers worker as an opaque transport —
+    # the worker's executor (vLLM, recent Ollama) owns validation.
+    supports_response_format = True
+
     def __init__(
         self,
         model: str | None = None,
