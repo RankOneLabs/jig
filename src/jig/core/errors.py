@@ -223,6 +223,26 @@ class AgentAmbiguousTurnError(AgentError):
         self.retries = retries
 
 
+class AgentNativeOutputError(AgentError):
+    """Native structured-output mode: the terminal assistant content failed
+    JSON parsing or pydantic validation against ``output_schema``.
+
+    Unlike the legacy ``submit_output`` path, native mode does not retry —
+    decode-time response_format constraints should make this unreachable in
+    ordinary operation, so a violation here signals a provider bug or a
+    schema-translation defect rather than a correctable model mistake.
+    """
+
+    category = "native_structured_output_failed"
+
+    def __init__(self, message: str):
+        super().__init__(
+            f"Native structured-output parsing failed: {message}",
+            last_error=message,
+        )
+        self.last_error = message
+
+
 class AgentLLMPermanentError(AgentError):
     """Runner terminated because the LLM raised a known-permanent error.
 

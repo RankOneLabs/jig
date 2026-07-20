@@ -279,6 +279,15 @@ current_tool_context: ContextVar[ToolExecutionContext | None] = ContextVar(
 
 
 class LLMClient(ABC):
+    # Whether this client can honor CompletionParams.response_format (the
+    # OpenAI-compatible json_schema envelope) without silently dropping or
+    # downgrading it. Checked by the runner's native structured-output mode
+    # before the first completion call, so an incapable client fails fast
+    # instead of burning an LLM round-trip. Adapters that forward or
+    # translate response_format set this True; everything else keeps the
+    # False default.
+    supports_response_format: bool = False
+
     @abstractmethod
     async def complete(self, params: CompletionParams) -> LLMResponse: ...
 

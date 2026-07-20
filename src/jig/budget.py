@@ -266,6 +266,14 @@ class BudgetedLLMClient(LLMClient):
         self._budget = budget
         self._estimate_cost_usd = estimate_cost_usd
 
+    @property
+    def supports_response_format(self) -> bool:
+        # Delegate to the wrapped client — this wrapper doesn't touch
+        # response_format itself, so its capability is whatever the inner
+        # adapter declares. Without this override the class-level False
+        # default on LLMClient would shadow a capable inner client's True.
+        return self._inner.supports_response_format
+
     async def complete(self, params: CompletionParams) -> LLMResponse:
         estimate = self._estimate_cost_usd
         if estimate is None:

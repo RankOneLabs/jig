@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from jig import (
     AgentConfig,
+    AgentNativeOutputError,
     CompletionParams,
     LLMResponse,
     MemoryEntry,
@@ -20,6 +21,7 @@ from jig import (
     ScoreSource,
     ToolCall,
     ToolDefinition,
+    UnsupportedResponseFormatError,
     Usage,
     run_agent,
 )
@@ -54,6 +56,13 @@ class FakeLLM(LLMClient):
         resp = self._responses[self._call_count]
         self._call_count += 1
         return resp
+
+
+class FakeNativeLLM(FakeLLM):
+    """A FakeLLM that declares response_format support, as a real adapter
+    (OpenAI, Dispatch, Ollama) would."""
+
+    supports_response_format = True
 
 
 class FakeMemory(MemoryStore, Retriever):
@@ -150,6 +159,7 @@ def _config(
     max_parse_retries: int = 2,
     tools: list | None = None,
     tracer: TracingLogger | None = None,
+    structured_output_mode: str = "legacy",
 ) -> AgentConfig:
     return AgentConfig(
         name="test",
@@ -163,6 +173,7 @@ def _config(
         output_schema=output_schema,
         max_parse_retries=max_parse_retries,
         grader=grader,
+        structured_output_mode=structured_output_mode,
     )
 
 
@@ -519,6 +530,141 @@ class TestFailClosedOnPlainText:
         # free-form content must not leak through.
         assert "agent terminated" in result.output
         assert "free form" not in result.output
+
+
+def _content_response(payload: dict[str, Any] | str) -> LLMResponse:
+    content = payload if isinstance(payload, str) else json.dumps(payload)
+    return LLMResponse(
+        content=content, tool_calls=None, usage=Usage(10, 10), latency_ms=10, model="fake",
+    )
+
+
+class TestNativeModeHappyPath:
+    async def test_terminal_content_parsed_no_submit_output_tool(self):
+        """Native mode omits submit_output and parses schema-constrained
+        assistant content directly as the terminal result."""
+        llm = FakeNativeLLM([
+            _content_response({"strategy_types": ["mean_reversion"], "best_sharpe": 1.2}),
+        ])
+        result = await run_agent(
+            _config(llm, output_schema=StrategyOutput, structured_output_mode="native"),
+            "go",
+        )
+
+        assert isinstance(result.parsed, StrategyOutput)
+        assert result.parsed.strategy_types == ["mean_reversion"]
+        assert result.error is None
+
+        params = llm.calls[0]
+        assert params.tools is None
+        assert params.response_format == {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "StrategyOutput",
+                "schema": StrategyOutput.model_json_schema(),
+                "strict": True,
+            },
+        }
+
+    async def test_ordinary_tools_remain_available(self):
+        """Native mode still runs a normal working-tool turn before the
+        schema-constrained terminal content."""
+        class Echo:
+            @property
+            def definition(self):
+                return ToolDefinition(
+                    name="echo",
+                    description="echoes",
+                    parameters={"type": "object", "properties": {}},
+                )
+
+            async def execute(self, args):
+                return "echoed"
+
+        llm = FakeNativeLLM([
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCall(id="t1", name="echo", arguments={})],
+                usage=Usage(1, 1), latency_ms=1, model="fake",
+            ),
+            _content_response({"strategy_types": ["x"]}),
+        ])
+        result = await run_agent(
+            _config(
+                llm, output_schema=StrategyOutput, structured_output_mode="native",
+                tools=[Echo()],
+            ),
+            "go",
+        )
+
+        assert result.parsed is not None
+        assert result.parsed.strategy_types == ["x"]
+        # First turn's tool list carries the user tool, but never submit_output.
+        first_tools = [t.name for t in (llm.calls[0].tools or [])]
+        assert first_tools == ["echo"]
+
+
+class TestNativeModeTerminalErrors:
+    """Native mode never retries a schema violation — it's decode-time
+    enforcement, so a mismatch means a provider bug or schema drift, not a
+    correctable model mistake."""
+
+    async def test_invalid_json_terminates_without_retry(self):
+        llm = FakeNativeLLM([_content_response("not valid json")])
+        result = await run_agent(
+            _config(llm, output_schema=StrategyOutput, structured_output_mode="native"),
+            "go",
+        )
+
+        assert result.parsed is None
+        assert isinstance(result.error, AgentNativeOutputError)
+        assert len(llm.calls) == 1  # no retry burned a second round-trip
+
+    async def test_schema_violation_terminates_without_retry(self):
+        # best_sharpe must be float | None — a string violates the schema.
+        llm = FakeNativeLLM([_content_response({"strategy_types": ["x"], "best_sharpe": "nope"})])
+        result = await run_agent(
+            _config(llm, output_schema=StrategyOutput, structured_output_mode="native"),
+            "go",
+        )
+
+        assert result.parsed is None
+        assert isinstance(result.error, AgentNativeOutputError)
+        assert len(llm.calls) == 1
+
+
+class TestNativeModeCapabilityPreflight:
+    async def test_incapable_client_raises_before_first_completion_call(self):
+        """FakeLLM (base class) doesn't declare response_format support —
+        selecting native mode on it must fail before complete() runs at all."""
+        llm = FakeLLM([_content_response({"strategy_types": ["x"]})])
+        config = _config(llm, output_schema=StrategyOutput, structured_output_mode="native")
+
+        with pytest.raises(UnsupportedResponseFormatError):
+            await run_agent(config, "go")
+        assert llm.calls == []  # complete() was never invoked
+
+
+class TestStructuredOutputModeValidation:
+    async def test_native_requires_output_schema(self):
+        with pytest.raises(ValueError, match="requires output_schema"):
+            _config(FakeNativeLLM([]), structured_output_mode="native")
+
+    async def test_unknown_mode_rejected(self):
+        with pytest.raises(ValueError, match="structured_output_mode"):
+            _config(
+                FakeNativeLLM([]), output_schema=StrategyOutput,
+                structured_output_mode="auto",
+            )
+
+    async def test_legacy_is_the_default(self):
+        """Backward compatibility: omitting structured_output_mode keeps the
+        long-standing submit_output behavior."""
+        llm = FakeLLM([_submit_response({"strategy_types": ["x"]})])
+        result = await run_agent(_config(llm, output_schema=StrategyOutput), "go")
+
+        assert result.parsed is not None
+        assert SUBMIT_OUTPUT_TOOL in [t.name for t in llm.calls[0].tools]
 
 
 def _canon(value: Any) -> bytes:

@@ -66,6 +66,10 @@ def _translate_response_format(response_format: Any) -> dict[str, Any]:
 
 
 class OllamaClient(LLMClient):
+    # Validated then translated (json_schema.schema becomes the top-level
+    # ``format`` field) — see _translate_response_format below.
+    supports_response_format = True
+
     def __init__(self, model: str = "llama3.1", host: str | None = None):
         if OllamaAsyncClient is None:
             raise ImportError("Install ollama: pip install 'jig[ollama]'")
