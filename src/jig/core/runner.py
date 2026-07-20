@@ -284,7 +284,10 @@ def _reject_non_canonical(value: Any) -> None:
         return
     if isinstance(value, float):
         if not math.isfinite(value):
-            raise ValueError(f"non-finite float in structured output: {value!r}")
+            raise ValueError(
+                f"non-finite float in structured output (value type: "
+                f"{type(value).__name__})"
+            )
         return
     if isinstance(value, list):
         for item in value:
@@ -293,10 +296,16 @@ def _reject_non_canonical(value: Any) -> None:
     if isinstance(value, dict):
         for key, item in value.items():
             if not isinstance(key, str):
-                raise ValueError(f"non-string object key in structured output: {key!r}")
+                raise ValueError(
+                    f"non-string object key in structured output (key type: "
+                    f"{type(key).__name__})"
+                )
             _reject_non_canonical(item)
         return
-    raise ValueError(f"unsupported value in structured output: {value!r}")
+    raise ValueError(
+        f"unsupported value in structured output (value type: "
+        f"{type(value).__name__})"
+    )
 
 
 def _canonical_output_hash(value: Any) -> tuple[str, int]:
@@ -380,7 +389,12 @@ async def _finalize_trace(
     if complete_output is not None:
         try:
             output_hash, output_len = _canonical_output_hash(complete_output)
-        except ValueError:
+        except Exception:
+            # Canonicalization failure (non-finite float, unsupported
+            # value, or an unexpected error from json.dumps/recursion
+            # such as TypeError/OverflowError/RecursionError) must not
+            # abort finalization — treat it the same as "no complete
+            # output" and still close/flush the trace.
             logger.exception(
                 "failed to canonicalize structured output for trace persistence"
             )
