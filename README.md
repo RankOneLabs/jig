@@ -202,7 +202,7 @@ determines what happens with a non-null value:
 | Ollama (direct + dispatched) | Validated, then translated: the inner `json_schema.schema` object becomes the top-level `format` field/kwarg. Wrapper metadata (`name`, `description`, `strict`) is not sent upstream. |
 | Anthropic, Gemini, and every other adapter | Rejected — `response_format` is not implemented there yet. |
 
-Omitting `response_format` leaves every existing request byte-identical to today. A malformed or unsupported value raises `UnsupportedResponseFormatError` (a `ValueError` subclass, exported from `jig`) before any request is made, so an unsupported constraint fails loudly instead of silently running unconstrained:
+Omitting `response_format` leaves every existing request byte-identical to today. A malformed or unsupported value raises `UnsupportedResponseFormatError` (a `ValueError` subclass, exported from `jig`) before any request is made, so an unsupported constraint fails loudly instead of silently running unconstrained. On most adapters that error propagates directly; on `AnthropicClient` it is currently wrapped in `JigLLMError` instead (its request-preparation code predates this contract and wasn't updated to let the typed error through) — the call still fails before any request, just without the precise error type:
 
 ```python
 from jig import CompletionParams, UnsupportedResponseFormatError

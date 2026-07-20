@@ -108,6 +108,29 @@ class TestOpenAIResponseFormat:
             create_kwargs = instance.chat.completions.create.call_args.kwargs
             assert "response_format" not in create_kwargs
 
+    async def test_forwarded_unchanged_in_stream(self):
+        """stream() must accept response_format the same as complete() —
+        previously it silently lacked supports_response_format=True and
+        would raise UnsupportedResponseFormatError instead of forwarding."""
+        async def _chunks():
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+        with patch("jig.llm.openai.openai") as mock_openai:
+            instance = mock_openai.AsyncOpenAI.return_value
+            instance.chat.completions.create = AsyncMock(return_value=_chunks())
+            client = OpenAIClient(model="gpt-4o")
+            params = CompletionParams(
+                messages=[Message(role=Role.USER, content="hi")],
+                response_format=_RESPONSE_FORMAT,
+            )
+
+            async for _ in client.stream(params):
+                pass
+
+            create_kwargs = instance.chat.completions.create.call_args.kwargs
+            assert create_kwargs["response_format"] == _RESPONSE_FORMAT
+
 
 def _fake_ollama_response() -> SimpleNamespace:
     message = SimpleNamespace(content="{}", tool_calls=None)
