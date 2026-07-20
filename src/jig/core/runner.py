@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 import logging
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
@@ -51,6 +54,21 @@ _MAX_LLM_RETRIES = 3
 # loop terminates when the model calls this tool; its arguments are validated
 # against the schema to produce AgentResult.parsed.
 SUBMIT_OUTPUT_TOOL = "submit_output"
+
+# Reserved keys the runner writes into the AGENT_RUN root span's ``output``
+# dict, in addition to the pre-existing ``output`` (200-char preview) and
+# ``scores``. ``output_kind`` is written unconditionally on every finalized
+# run and marks the trace as understanding complete-output capture — its
+# absence (not merely a missing/false value) is how jig.replay.diff tells a
+# trace recorded before this feature ("preview_only_output") apart from a
+# modern trace that simply produced no structured value
+# ("structured_output_unavailable"), e.g. a plain-text run or a schema run
+# that never validated. The other three keys are only written together, and
+# only when a validated structured value was produced.
+ROOT_OUTPUT_KIND_KEY = "output_kind"
+ROOT_OUTPUT_COMPLETE_KEY = "output_complete"
+ROOT_OUTPUT_SHA256_KEY = "output_sha256"
+ROOT_OUTPUT_BYTE_LENGTH_KEY = "output_byte_length"
 
 # HTTP status codes that indicate a definitely-permanent LLM failure.
 # 400 / 422 — malformed request; 401 / 403 — auth problem; 404 — bad
@@ -253,6 +271,66 @@ def _serialize_config_snapshot(config: AgentConfig[Any]) -> dict[str, Any]:
     }
 
 
+def _reject_non_canonical(value: Any) -> None:
+    """Recursively validate a value is safe for canonical JSON encoding.
+
+    Raises ``ValueError`` for non-finite floats, non-string object keys, or
+    any value outside JSON's native null / bool / finite-number / string /
+    array / string-keyed-object surface. Silently coercing these (e.g. via
+    ``str()`` or ``default=str``) would make the canonical hash lossy and
+    non-reproducible across runs.
+    """
+    if value is None or isinstance(value, (bool, str, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(
+                f"non-finite float in structured output (value type: "
+                f"{type(value).__name__})"
+            )
+        return
+    if isinstance(value, list):
+        for item in value:
+            _reject_non_canonical(item)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(
+                    f"non-string object key in structured output (key type: "
+                    f"{type(key).__name__})"
+                )
+            _reject_non_canonical(item)
+        return
+    raise ValueError(
+        f"unsupported value in structured output (value type: "
+        f"{type(value).__name__})"
+    )
+
+
+def _canonical_output_hash(value: Any) -> tuple[str, int]:
+    """Return ``(sha256_hexdigest, utf8_byte_length)`` of ``value``'s
+    canonical JSON encoding.
+
+    Canonical means: UTF-8, keys sorted, compact separators, Unicode
+    preserved verbatim (``ensure_ascii=False``), array order preserved,
+    non-finite floats rejected (``allow_nan=False`` backstops
+    :func:`_reject_non_canonical`, which already raises first with a
+    stable message). This is the sole definition of output equality for
+    :func:`jig.replay.diff.trace_diff` — the 200-character root preview is
+    presentation-only and must never be hashed or compared for equality.
+    """
+    _reject_non_canonical(value)
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest(), len(payload)
+
+
 def _resolve_model_id(client: LLMClient | None) -> str | None:
     """Walk past LLMClient wrappers (e.g. BudgetedLLMClient) to find ``_model``.
 
@@ -278,6 +356,8 @@ async def _finalize_trace(
     final_output: str,
     scores: list[Score] | None,
     agent_error: AgentError | None,
+    complete_output: Any | None,
+    output_kind: str,
 ) -> None:
     """Close the root span and flush the tracer, best-effort.
 
@@ -285,11 +365,43 @@ async def _finalize_trace(
     ``SQLiteTracer``) don't drop failure traces when an exception propagates
     mid-run. Exceptions from ``end_span`` or ``flush`` are logged and
     swallowed so they don't shadow the original error.
+
+    ``complete_output`` is the post-Pydantic, JSON-native structured value
+    (``BaseModel.model_dump(mode="json")``) when the run produced a
+    validated ``submit_output`` result, or ``None`` otherwise (no schema,
+    or the run terminated before validating one). When present, its
+    canonical SHA-256 and UTF-8 byte length are persisted alongside it on
+    the AGENT_RUN root — see ``ROOT_OUTPUT_*_KEY`` — so
+    :func:`jig.replay.diff.trace_diff` can compare complete output instead
+    of the 200-char ``output`` preview. The accepted ``submit_output``
+    TOOL_CALL span's raw arguments are not used for this: Pydantic can add
+    defaults or coerce types the model never sent, so the raw call
+    arguments are not reliably byte-identical to the validated result.
+    Canonicalization failure (a non-finite float, an unsupported runtime
+    value) is logged and treated the same as "no complete output" — it
+    must not abort trace finalization.
     """
     trace_output: dict[str, Any] = {
         "output": final_output[:200],
         "scores": scores,
+        ROOT_OUTPUT_KIND_KEY: output_kind,
     }
+    if complete_output is not None:
+        try:
+            output_hash, output_len = _canonical_output_hash(complete_output)
+        except Exception:
+            # Canonicalization failure (non-finite float, unsupported
+            # value, or an unexpected error from json.dumps/recursion
+            # such as TypeError/OverflowError/RecursionError) must not
+            # abort finalization — treat it the same as "no complete
+            # output" and still close/flush the trace.
+            logger.exception(
+                "failed to canonicalize structured output for trace persistence"
+            )
+        else:
+            trace_output[ROOT_OUTPUT_COMPLETE_KEY] = complete_output
+            trace_output[ROOT_OUTPUT_SHA256_KEY] = output_hash
+            trace_output[ROOT_OUTPUT_BYTE_LENGTH_KEY] = output_len
     if agent_error is not None:
         trace_output["error_category"] = agent_error.category
     try:
@@ -311,6 +423,7 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
 
     if config.output_schema is not None:
         _validate_output_schema(config.output_schema)
+    output_kind = "structured" if config.output_schema is not None else "text"
 
     # 1. Start trace. Snapshot the config alongside the input so phase 11
     # replay can reconstruct an equivalent AgentConfig without the caller
@@ -325,6 +438,7 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
     # exception propagates from memory.add / grading / etc. mid-run.
     final_output = ""
     parsed: T | None = None
+    structured_complete: Any | None = None
     scores: list[Score] | None = None
     agent_error: AgentError | None = None
     total_usage: dict[str, Any] = {
@@ -604,6 +718,11 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                     # Validation succeeded — finalize.
                     extract_span.finish(submit_call.arguments)
                     final_output = parsed.model_dump_json()
+                    # Pydantic can add unset-field defaults or coerce types
+                    # the model never sent, so the raw submit_output
+                    # arguments recorded above are not reliable complete
+                    # evidence — persist the validated value itself.
+                    structured_complete = parsed.model_dump(mode="json")
                     messages.append(
                         Message(
                             role=Role.ASSISTANT,
@@ -770,7 +889,10 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
         # Always close the root span + flush the tracer, even if an
         # exception propagates mid-run. Buffered tracers (SQLiteTracer)
         # would otherwise drop the failure trace.
-        await _finalize_trace(config.tracer, trace, final_output, scores, agent_error)
+        await _finalize_trace(
+            config.tracer, trace, final_output, scores, agent_error,
+            structured_complete, output_kind,
+        )
 
     return AgentResult(
         output=final_output,

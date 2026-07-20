@@ -690,3 +690,58 @@ def test_canonical_args_sort_order_stable():
     a = _canonical_args({"a": 1, "b": 2})
     b = _canonical_args({"b": 2, "a": 1})
     assert a == b
+
+
+# --- Complete-output capture is additive to replay ---
+
+
+async def test_replay_and_trace_diff_compatible_with_complete_output_capture(
+    tracer: SQLiteTracer,
+):
+    """replay() must keep working once the AGENT_RUN root also carries
+    complete-output evidence (output_kind / output_complete / output_sha256
+    / output_byte_length) — those keys are additive, and trace_diff must
+    be able to compare the original run against its replay using them."""
+    from jig import trace_diff
+
+    llm_a = FakeLLM([
+        LLMResponse(
+            content="",
+            tool_calls=[ToolCall(
+                id="so-1", name="submit_output", arguments={"field_a": "hello"},
+            )],
+            usage=Usage(5, 5),
+            latency_ms=1,
+            model="fake",
+        ),
+    ])
+    result_a = await run_agent(
+        _make_config(llm_a, tracer, output_schema=_SchemaA, tools=ToolRegistry()),
+        "go",
+    )
+    await tracer.flush()
+    assert result_a.parsed is not None
+
+    llm_b = FakeLLM([
+        LLMResponse(
+            content="",
+            tool_calls=[ToolCall(
+                id="so-2", name="submit_output", arguments={"field_a": "hello"},
+            )],
+            usage=Usage(5, 5),
+            latency_ms=1,
+            model="fake",
+        ),
+    ])
+    result_b = await replay(
+        trace_id=result_a.trace_id,
+        tracer=tracer,
+        llm=llm_b,
+        feedback=FakeFeedback(),
+    )
+    await tracer.flush()
+    assert result_b.parsed is not None
+
+    diff = await trace_diff(result_a.trace_id, result_b.trace_id, tracer=tracer)
+    assert diff.comparison_complete is True
+    assert diff.identical is True
