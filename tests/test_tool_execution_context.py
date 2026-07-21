@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from datetime import datetime
 from typing import Any
 
@@ -233,6 +235,23 @@ class _KeywordOnlyDispatchTool(_DispatchTool):
         }
 
 
+class _AsyncDispatchTool(_DispatchTool):
+    async def dispatch_payload_extra(self, context=None, arguments=None):
+        await asyncio.sleep(0)
+        return {"async_hook": True, "trace_id": context.trace_id if context else None}
+
+
+class _NeverFinishingDispatchTool(_DispatchTool):
+    def __init__(self) -> None:
+        self.cancelled = asyncio.Event()
+
+    async def dispatch_payload_extra(self, context=None, arguments=None):
+        try:
+            await asyncio.Future()
+        finally:
+            self.cancelled.set()
+
+
 class _FakeLLM:
     def __init__(self) -> None:
         self.calls = 0
@@ -383,6 +402,50 @@ async def test_dispatch_payload_uses_current_tool_context(monkeypatch: pytest.Mo
         "parent_span_id": "span-3",
     }
     assert captured["context"] == context
+
+
+@pytest.mark.asyncio
+async def test_async_dispatch_payload_extra_is_awaited(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_dispatch_run(fn_ref, payload=None, **kwargs):
+        captured["payload"] = payload
+        return "ok"
+
+    monkeypatch.setattr("jig.dispatch.run", fake_dispatch_run)
+    context = ToolExecutionContext(
+        trace_id="trace-async", span_id="span", parent_span_id="root", tool_call_id="call"
+    )
+    token = current_tool_context.set(context)
+    try:
+        result = await ToolRegistry([_AsyncDispatchTool()]).execute(
+            ToolCall(id="call", name="dispatch_tool", arguments={"x": 1})
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert result.error is None
+    assert captured["payload"] == {"x": 1, "async_hook": True, "trace_id": "trace-async"}
+
+
+@pytest.mark.asyncio
+async def test_async_dispatch_hook_timeout_cancels_without_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    tool = _NeverFinishingDispatchTool()
+    dispatch_calls = 0
+
+    async def fake_dispatch_run(fn_ref, payload=None, **kwargs):
+        nonlocal dispatch_calls
+        dispatch_calls += 1
+        return "unexpected"
+
+    monkeypatch.setattr("jig.dispatch.run", fake_dispatch_run)
+    result = await ToolRegistry([tool], execute_timeout=0.01).execute(
+        ToolCall(id="call", name="dispatch_tool", arguments={})
+    )
+
+    assert result.error == "TimeoutError: Dispatched tool dispatch_tool timed out after 0.01s"
+    assert tool.cancelled.is_set()
+    assert dispatch_calls == 0
 
 
 @pytest.mark.asyncio
