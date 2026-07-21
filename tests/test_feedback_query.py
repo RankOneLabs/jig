@@ -627,3 +627,11 @@ class TestEffectiveScoreFilters:
             effective_filters=[EffectiveScoreFilter(dimension="plausibility", min_value=0.5)],
         ))
         assert out[0].effective_scores["plausibility"].value == 1.0
+
+    async def test_empty_effective_filters_imply_effective_scores_exposed(self, feedback_db):
+        rid = await feedback_db.store_result("A", "i", {})
+        await feedback_db.score(rid, [Score("plausibility", 1.0, ScoreSource.HEURISTIC)])
+
+        out = await feedback_db.query(FeedbackQuery(effective_filters=[]))
+
+        assert out[0].effective_scores["plausibility"].value == 1.0

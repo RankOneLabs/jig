@@ -184,8 +184,8 @@ class ScoredResult:
     metadata: dict[str, Any]
     created_at: datetime
     # Populated only when the originating FeedbackQuery opted into effective
-    # resolution (``resolve_effective=True`` or a non-empty
-    # ``effective_filters``); keyed by dimension. None when not requested.
+    # resolution (``resolve_effective=True`` or ``effective_filters`` is set);
+    # keyed by dimension. None when not requested.
     effective_scores: dict[str, EffectiveScore] | None = None
 
 
@@ -228,10 +228,10 @@ class FeedbackQuery:
     # shape or ranking. Implied True whenever effective_filters is set.
     resolve_effective: bool = False
     # Opt-in: inclusive per-dimension gates on the *effective* score,
-    # combined with AND. Applied before similarity/ranking limits are
-    # finalized so a small pre-limit candidate window can't starve an
-    # otherwise-large eligible pool. A result missing an effective score
-    # for a named dimension fails that filter.
+    # combined with AND. Applied within the backend's bounded candidate
+    # window before the final limit; aggressive filters can therefore return
+    # fewer than ``limit`` matches. A result missing an effective score for a
+    # named dimension fails that filter.
     effective_filters: list[EffectiveScoreFilter] | None = None
 
     def __post_init__(self) -> None:

@@ -291,7 +291,11 @@ class SQLiteFeedbackLoop(FeedbackLoop):
                 # Without similarity, the initial ORDER BY created_at DESC already
                 # gave us recency order.
 
-                score_rows: list[tuple[str, str, float, str, str | None, str, int]] = []
+                want_effective = q.resolve_effective or q.effective_filters is not None
+                score_columns = "result_id, dimension, value, source, metadata"
+                if want_effective:
+                    score_columns += ", created_at, rowid"
+                score_rows: list[tuple[Any, ...]] = []
                 if candidates:
                     # Pre-slice candidates before the batch fetch. Two reasons:
                     #  1. SQLite has a bound-parameter limit (commonly 999); a
@@ -303,21 +307,21 @@ class SQLiteFeedbackLoop(FeedbackLoop):
                     # the filter is aggressive enough that we undershoot
                     # q.limit, that's acceptable for v1 — properly chunking
                     # with early exit is a follow-up when corpora grow past
-                    # ~100 results. Effective filters are applied below on
-                    # this same pre-limit window, never after truncating to
-                    # q.limit, so a large qualifying pool is never starved
-                    # by a small candidate window.
+                    # ~100 results. Effective filters are applied below to
+                    # this bounded window before the final q.limit truncation;
+                    # aggressive filters can still undershoot q.limit because
+                    # candidates outside the window are not scanned.
                     window = min(len(candidates), max(q.limit * 10, 50), 900)
                     candidates = candidates[:window]
 
                     # Batch-fetch scores for every surviving candidate with a
                     # single IN-list SELECT. Eliminates the per-row N+1 that
-                    # would grow linearly with corpus size. created_at/rowid
-                    # are only consumed for effective-score resolution.
+                    # would grow linearly with corpus size. Fetch created_at
+                    # and rowid only when effective-score resolution needs them.
                     rids = [rid for _, rid, _, _, _ in candidates]
                     placeholders = ",".join(["?"] * len(rids))
                     score_rows = await (await db.execute(
-                        f"SELECT result_id, dimension, value, source, metadata, created_at, rowid "
+                        f"SELECT {score_columns} "
                         f"FROM scores WHERE result_id IN ({placeholders}) ORDER BY rowid ASC",
                         rids,
                     )).fetchall()
@@ -329,18 +333,19 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         if not candidates:
             return []
 
-        want_effective = q.resolve_effective or bool(q.effective_filters)
         scores_by_rid: dict[str, list[Score]] = {}
         effective_rows_by_rid: dict[
             str, list[tuple[str, float, ScoreSource, dict[str, Any] | None, datetime, int]]
         ] = {}
-        for rid, dim, val, src, score_meta_json, created_str, rowid in score_rows:
+        for row in score_rows:
+            rid, dim, val, src, score_meta_json = row[:5]
             score_meta = json_loads(score_meta_json) if score_meta_json else None
             source = ScoreSource(src)
             scores_by_rid.setdefault(rid, []).append(
                 Score(dimension=dim, value=val, source=source, metadata=score_meta)
             )
             if want_effective:
+                created_str, rowid = row[5:]
                 effective_rows_by_rid.setdefault(rid, []).append(
                     (dim, val, source, score_meta, parse_aware_utc(created_str), rowid)
                 )
