@@ -12,6 +12,8 @@ from jig._embed import ollama_embed
 from jig._sqlite import LazyConnection, json_dumps, json_loads, parse_aware_utc
 from jig.feedback.validation import validate_scores
 from jig.core.types import (
+    EffectiveScore,
+    EffectiveScoreFilter,
     EvalCase,
     FeedbackLoop,
     FeedbackQuery,
@@ -19,6 +21,60 @@ from jig.core.types import (
     ScoreSource,
     ScoredResult,
 )
+
+# Sources recognized in effective-score resolution. Exact-value match only —
+# LLM_JUDGE, GROUND_TRUTH, and any unrecognized source string never become an
+# effective quality judgment; they remain visible only in the full history.
+_EFFECTIVE_SOURCES = (ScoreSource.HUMAN, ScoreSource.HEURISTIC)
+
+
+def _resolve_effective_scores(
+    rows: list[tuple[str, float, ScoreSource, dict[str, Any] | None, datetime, int]],
+) -> dict[str, EffectiveScore]:
+    """Pick the effective score per dimension from one result's score rows.
+
+    Precedence: the newest ``human`` row if any exists; otherwise the
+    newest ``heuristic`` row; otherwise the dimension has no effective
+    score. "Newest" breaks ties on ``created_at`` then rowid, both
+    descending. A human row always outranks every heuristic row for its
+    dimension, even one appended later — human judgment is only ever
+    superseded by a later human judgment.
+    """
+    best: dict[str, tuple[tuple[int, datetime, int], EffectiveScore]] = {}
+    for dim, value, source, metadata, created_at, rowid in rows:
+        if source not in _EFFECTIVE_SOURCES:
+            continue
+        rank = (1 if source is ScoreSource.HUMAN else 0, created_at, rowid)
+        current = best.get(dim)
+        if current is not None and rank <= current[0]:
+            continue
+        best[dim] = (
+            rank,
+            EffectiveScore(
+                dimension=dim,
+                value=value,
+                source=source,
+                created_at=created_at,
+                metadata=metadata,
+            ),
+        )
+    return {dim: es for dim, (_, es) in best.items()}
+
+
+def _passes_effective_filters(
+    effective: dict[str, EffectiveScore],
+    filters: list[EffectiveScoreFilter],
+) -> bool:
+    """AND across all filters; a missing effective dimension fails its filter."""
+    for f in filters:
+        es = effective.get(f.dimension)
+        if es is None:
+            return False
+        if f.min_value is not None and es.value < f.min_value:
+            return False
+        if f.max_value is not None and es.value > f.max_value:
+            return False
+    return True
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS results (
@@ -235,30 +291,38 @@ class SQLiteFeedbackLoop(FeedbackLoop):
                 # Without similarity, the initial ORDER BY created_at DESC already
                 # gave us recency order.
 
-                score_rows: list[tuple[str, str, float, str, str | None]] = []
+                want_effective = q.resolve_effective or q.effective_filters is not None
+                score_columns = "result_id, dimension, value, source, metadata"
+                if want_effective:
+                    score_columns += ", created_at, rowid"
+                score_rows: list[tuple[Any, ...]] = []
                 if candidates:
                     # Pre-slice candidates before the batch fetch. Two reasons:
                     #  1. SQLite has a bound-parameter limit (commonly 999); a
                     #     very large corpus would exceed it.
                     #  2. Most of ``candidates`` past the q.limit-th will get
-                    #     dropped by the min_score filter anyway, so fetching
-                    #     their scores is wasted work.
-                    # The factor-of-10 cushion covers min_score rejections; if
+                    #     dropped by the min_score/effective filters anyway,
+                    #     so fetching their scores is wasted work.
+                    # The factor-of-10 cushion covers filter rejections; if
                     # the filter is aggressive enough that we undershoot
                     # q.limit, that's acceptable for v1 — properly chunking
                     # with early exit is a follow-up when corpora grow past
-                    # ~100 results.
+                    # ~100 results. Effective filters are applied below to
+                    # this bounded window before the final q.limit truncation;
+                    # aggressive filters can still undershoot q.limit because
+                    # candidates outside the window are not scanned.
                     window = min(len(candidates), max(q.limit * 10, 50), 900)
                     candidates = candidates[:window]
 
                     # Batch-fetch scores for every surviving candidate with a
                     # single IN-list SELECT. Eliminates the per-row N+1 that
-                    # would grow linearly with corpus size.
+                    # would grow linearly with corpus size. Fetch created_at
+                    # and rowid only when effective-score resolution needs them.
                     rids = [rid for _, rid, _, _, _ in candidates]
                     placeholders = ",".join(["?"] * len(rids))
                     score_rows = await (await db.execute(
-                        f"SELECT result_id, dimension, value, source, metadata FROM scores "
-                        f"WHERE result_id IN ({placeholders}) ORDER BY rowid ASC",
+                        f"SELECT {score_columns} "
+                        f"FROM scores WHERE result_id IN ({placeholders}) ORDER BY rowid ASC",
                         rids,
                     )).fetchall()
                 await db.commit()
@@ -270,11 +334,21 @@ class SQLiteFeedbackLoop(FeedbackLoop):
             return []
 
         scores_by_rid: dict[str, list[Score]] = {}
-        for rid, dim, val, src, score_meta_json in score_rows:
+        effective_rows_by_rid: dict[
+            str, list[tuple[str, float, ScoreSource, dict[str, Any] | None, datetime, int]]
+        ] = {}
+        for row in score_rows:
+            rid, dim, val, src, score_meta_json = row[:5]
             score_meta = json_loads(score_meta_json) if score_meta_json else None
+            source = ScoreSource(src)
             scores_by_rid.setdefault(rid, []).append(
-                Score(dimension=dim, value=val, source=ScoreSource(src), metadata=score_meta)
+                Score(dimension=dim, value=val, source=source, metadata=score_meta)
             )
+            if want_effective:
+                created_str, rowid = row[5:]
+                effective_rows_by_rid.setdefault(rid, []).append(
+                    (dim, val, source, score_meta, parse_aware_utc(created_str), rowid)
+                )
 
         results: list[ScoredResult] = []
         for _sim, rid, content, meta, created in candidates:
@@ -289,6 +363,14 @@ class SQLiteFeedbackLoop(FeedbackLoop):
             if q.min_score is not None and avg < q.min_score:
                 continue
 
+            effective_scores: dict[str, EffectiveScore] | None = None
+            if want_effective:
+                effective_scores = _resolve_effective_scores(effective_rows_by_rid.get(rid, []))
+                if q.effective_filters and not _passes_effective_filters(
+                    effective_scores, q.effective_filters
+                ):
+                    continue
+
             results.append(ScoredResult(
                 result_id=rid,
                 content=content,
@@ -296,6 +378,7 @@ class SQLiteFeedbackLoop(FeedbackLoop):
                 avg_score=avg,
                 metadata=meta,
                 created_at=created,
+                effective_scores=effective_scores,
             ))
             if len(results) >= q.limit:
                 break
