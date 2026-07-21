@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 import math
+from collections.abc import Mapping
 from typing import Any
 
 from jig.core.types import (
@@ -143,7 +144,7 @@ class ToolRegistry:
                 extra = self._dispatch_payload_extra(tool, call, tool_context)
                 if inspect.isawaitable(extra):
                     extra = await extra
-                if isinstance(extra, dict):
+                if isinstance(extra, Mapping):
                     payload.update(
                         {key: value for key, value in extra.items() if value is not None}
                     )

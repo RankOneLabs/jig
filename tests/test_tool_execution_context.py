@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from datetime import datetime
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -241,6 +242,11 @@ class _AsyncDispatchTool(_DispatchTool):
         return {"async_hook": True, "trace_id": context.trace_id if context else None}
 
 
+class _MappingDispatchTool(_DispatchTool):
+    def dispatch_payload_extra(self, context=None, arguments=None):
+        return MappingProxyType({"mapping_hook": True, "drop_none": None})
+
+
 class _NeverFinishingDispatchTool(_DispatchTool):
     def __init__(self) -> None:
         self.cancelled = asyncio.Event()
@@ -426,6 +432,23 @@ async def test_async_dispatch_payload_extra_is_awaited(monkeypatch: pytest.Monke
 
     assert result.error is None
     assert captured["payload"] == {"x": 1, "async_hook": True, "trace_id": "trace-async"}
+
+
+@pytest.mark.asyncio
+async def test_dispatch_payload_extra_accepts_non_dict_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_dispatch_run(fn_ref, payload=None, **kwargs):
+        captured["payload"] = payload
+        return "ok"
+
+    monkeypatch.setattr("jig.dispatch.run", fake_dispatch_run)
+    result = await ToolRegistry([_MappingDispatchTool()]).execute(
+        ToolCall(id="call", name="dispatch_tool", arguments={"x": 1})
+    )
+
+    assert result.error is None
+    assert captured["payload"] == {"x": 1, "mapping_hook": True}
 
 
 @pytest.mark.asyncio
