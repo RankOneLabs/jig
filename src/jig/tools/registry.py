@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 import math
+from collections.abc import Mapping
 from typing import Any
 
 from jig.core.types import (
@@ -138,24 +139,28 @@ class ToolRegistry:
             }
 
         try:
-            payload = dict(call.arguments)
-            payload.update(self._dispatch_payload_extra(tool, call, tool_context))
-
-            if self._execute_timeout is not None:
-                result = await asyncio.wait_for(
-                    dispatch_run(
-                        tool.dispatch_fn_ref,  # type: ignore[arg-type]
-                        payload,
-                        **kwargs,
-                    ),
-                    timeout=self._execute_timeout,
-                )
-            else:
-                result = await dispatch_run(
+            async def _gate_and_dispatch() -> object:
+                payload = dict(call.arguments)
+                extra = self._dispatch_payload_extra(tool, call, tool_context)
+                if inspect.isawaitable(extra):
+                    extra = await extra
+                if isinstance(extra, Mapping):
+                    payload.update(
+                        {key: value for key, value in extra.items() if value is not None}
+                    )
+                return await dispatch_run(
                     tool.dispatch_fn_ref,  # type: ignore[arg-type]
                     payload,
                     **kwargs,
                 )
+
+            if self._execute_timeout is not None:
+                result = await asyncio.wait_for(
+                    _gate_and_dispatch(),
+                    timeout=self._execute_timeout,
+                )
+            else:
+                result = await _gate_and_dispatch()
         except asyncio.TimeoutError:
             logger.warning("tool.execute dispatch timeout name=%s after=%ss", call.name, self._execute_timeout)
             return ToolResult(
@@ -194,7 +199,7 @@ class ToolRegistry:
         tool: Tool,
         call: ToolCall,
         tool_context: ToolExecutionContext | None,
-    ) -> dict[str, Any]:
+    ) -> Any:
         dispatch_payload_extra = getattr(tool, "dispatch_payload_extra", None)
         if not callable(dispatch_payload_extra):
             return {}
@@ -238,6 +243,4 @@ class ToolRegistry:
             # Unrecognized single-param signature; assume it wants context.
             extra = dispatch_payload_extra(tool_context)
 
-        if not isinstance(extra, dict):
-            return {}
-        return {key: value for key, value in extra.items() if value is not None}
+        return extra
