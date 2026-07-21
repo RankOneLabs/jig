@@ -5,7 +5,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
 
 class Role(str, Enum):
@@ -173,6 +173,108 @@ class EffectiveScoreFilter:
     dimension: str
     min_value: float | None = None
     max_value: float | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class HumanFeedbackPromptConfig:
+    """Opt-in policy for injecting human-graded exemplars into agent prompts.
+
+    Separate from the legacy ``AgentConfig.include_feedback_in_prompt`` /
+    ``feedback.get_signals`` path — that path can inject any source
+    (heuristic, LLM-judge, human) above a single ``min_score`` and carries
+    no safety gate. This path only ever surfaces *human*-sourced effective
+    scores, split into labeled positive/negative sections, gated by
+    ``eligibility_filters`` before a result can enter either section.
+
+    Disabled by default (``enabled=False``): every field below is inert
+    until a caller opts in, so existing agents see no behavior change.
+    """
+
+    enabled: bool = False
+    # Dimensions considered for positive/negative classification. Required
+    # non-empty when enabled — there is no "all dimensions" wildcard, so a
+    # caller must name exactly which rubric axes it wants surfaced.
+    dimensions: tuple[str, ...] = ()
+    # Inclusive thresholds: an effective *human* score >= positive_threshold
+    # qualifies its dimension as a positive signal; <= negative_threshold
+    # qualifies it as negative. Values strictly between are not injected.
+    positive_threshold: float = 0.75
+    negative_threshold: float = 0.25
+    # Per-section cap on the number of examples rendered.
+    positive_limit: int = 2
+    negative_limit: int = 2
+    # Combined character budget for both sections' rendered example bodies.
+    total_character_budget: int = 6000
+    # AND-combined gate on effective scores, applied before similarity
+    # ranking and before positive/negative classification. A result that
+    # fails this can never enter either section, regardless of how it
+    # would otherwise classify — this is the safe-exemplar guard (e.g. a
+    # plausibility floor) and is not itself a classification dimension.
+    eligibility_filters: tuple[EffectiveScoreFilter, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.enabled and not self.dimensions:
+            raise ValueError(
+                "HumanFeedbackPromptConfig.dimensions must be non-empty when enabled=True"
+            )
+        for name, value in (
+            ("positive_threshold", self.positive_threshold),
+            ("negative_threshold", self.negative_threshold),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not (0.0 <= value <= 1.0):
+                raise ValueError(f"HumanFeedbackPromptConfig.{name} must be in [0.0, 1.0], got {value!r}")
+        if self.positive_threshold < self.negative_threshold:
+            raise ValueError(
+                "HumanFeedbackPromptConfig.positive_threshold must be >= negative_threshold "
+                f"(got positive_threshold={self.positive_threshold}, "
+                f"negative_threshold={self.negative_threshold})"
+            )
+        for name, value in (
+            ("positive_limit", self.positive_limit),
+            ("negative_limit", self.negative_limit),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"HumanFeedbackPromptConfig.{name} must be a non-negative int, got {value!r}")
+        if (
+            isinstance(self.total_character_budget, bool)
+            or not isinstance(self.total_character_budget, int)
+            or self.total_character_budget < 0
+        ):
+            raise ValueError(
+                "HumanFeedbackPromptConfig.total_character_budget must be a non-negative int, "
+                f"got {self.total_character_budget!r}"
+            )
+
+
+@dataclass(frozen=True)
+class HumanExampleDimension:
+    """One threshold-crossing dimension that explains an example's classification."""
+
+    dimension: str
+    value: float
+    note: str | None
+
+
+@dataclass(frozen=True)
+class HumanExample:
+    """A task-similar, human-graded exemplar qualified for prompt injection."""
+
+    result_id: str
+    input_text: str
+    output: str
+    classification: Literal["positive", "negative"]
+    # Every selected dimension that crossed the threshold matching
+    # ``classification`` — never a mix of both polarities on one example.
+    dimensions: list[HumanExampleDimension]
+
+
+@dataclass(frozen=True)
+class HumanExampleSet:
+    """Result of :meth:`FeedbackLoop.get_human_examples` — already deduplicated,
+    ranked, and capped to each section's configured limit."""
+
+    positive: list[HumanExample]
+    negative: list[HumanExample]
 
 
 @dataclass
@@ -451,6 +553,23 @@ class FeedbackLoop(ABC):
         max_score: float | None = None,
         limit: int | None = None,
     ) -> list[EvalCase]: ...
+
+    async def get_human_examples(
+        self,
+        task_input: str,
+        config: HumanFeedbackPromptConfig,
+    ) -> HumanExampleSet:
+        """Task-similar human-graded positive/negative exemplars for prompts.
+
+        Concrete method (not abstract) with a no-op default returning an
+        empty set — backends that can't rank by embedding similarity (e.g.
+        :class:`~jig.feedback.null.NullFeedbackLoop`) need no override, and
+        callers that opt into :class:`HumanFeedbackPromptConfig` against
+        such a backend degrade to "no examples" rather than erroring.
+        Backends that support it (:class:`~jig.feedback.loop.SQLiteFeedbackLoop`)
+        override this with real retrieval.
+        """
+        return HumanExampleSet(positive=[], negative=[])
 
 
 class Grader[T](ABC):

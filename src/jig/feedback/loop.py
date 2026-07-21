@@ -17,6 +17,10 @@ from jig.core.types import (
     EvalCase,
     FeedbackLoop,
     FeedbackQuery,
+    HumanExample,
+    HumanExampleDimension,
+    HumanExampleSet,
+    HumanFeedbackPromptConfig,
     Score,
     ScoreSource,
     ScoredResult,
@@ -28,10 +32,15 @@ from jig.core.types import (
 _EFFECTIVE_SOURCES = (ScoreSource.HUMAN, ScoreSource.HEURISTIC)
 
 
-def _resolve_effective_scores(
+def resolve_effective_scores(
     rows: list[tuple[str, float, ScoreSource, dict[str, Any] | None, datetime, int]],
 ) -> dict[str, EffectiveScore]:
     """Pick the effective score per dimension from one result's score rows.
+
+    Public so external callers with their own already-fetched score rows
+    (e.g. a CLI reading ``feedback.db`` directly for full-history display)
+    can reuse the exact same resolution rule ``query()`` uses internally,
+    instead of re-deriving it and risking drift.
 
     Precedence: the newest ``human`` row if any exists; otherwise the
     newest ``heuristic`` row; otherwise the dimension has no effective
@@ -75,6 +84,44 @@ def _passes_effective_filters(
         if f.max_value is not None and es.value > f.max_value:
             return False
     return True
+
+
+def _classify_human_example(
+    effective: dict[str, EffectiveScore],
+    dimensions: tuple[str, ...],
+    positive_threshold: float,
+    negative_threshold: float,
+) -> tuple[str, list[HumanExampleDimension]] | None:
+    """Classify one result as a positive/negative exemplar, or omit it.
+
+    Only ``source=human`` effective entries qualify — a dimension resolved
+    to a heuristic row (no human grade yet) can never qualify a result,
+    even though it's still visible in ``effective`` for other purposes.
+    Negative precedence: any selected dimension at or below
+    ``negative_threshold`` puts the whole result in the negative section,
+    listing only the negative-crossing dimensions (never mixed with
+    positive-crossing ones from the same result). Only when no dimension
+    crosses negative does a positive-crossing dimension qualify the result
+    as positive. A result crossing neither threshold on any dimension is
+    omitted from both sections.
+    """
+    negative_dims: list[HumanExampleDimension] = []
+    positive_dims: list[HumanExampleDimension] = []
+    for dim in dimensions:
+        es = effective.get(dim)
+        if es is None or es.source is not ScoreSource.HUMAN:
+            continue
+        note = (es.metadata or {}).get("note") if es.metadata else None
+        if es.value <= negative_threshold:
+            negative_dims.append(HumanExampleDimension(dimension=dim, value=es.value, note=note))
+        elif es.value >= positive_threshold:
+            positive_dims.append(HumanExampleDimension(dimension=dim, value=es.value, note=note))
+    if negative_dims:
+        return "negative", negative_dims
+    if positive_dims:
+        return "positive", positive_dims
+    return None
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS results (
@@ -365,7 +412,7 @@ class SQLiteFeedbackLoop(FeedbackLoop):
 
             effective_scores: dict[str, EffectiveScore] | None = None
             if want_effective:
-                effective_scores = _resolve_effective_scores(effective_rows_by_rid.get(rid, []))
+                effective_scores = resolve_effective_scores(effective_rows_by_rid.get(rid, []))
                 if q.effective_filters and not _passes_effective_filters(
                     effective_scores, q.effective_filters
                 ):
@@ -384,6 +431,147 @@ class SQLiteFeedbackLoop(FeedbackLoop):
                 break
 
         return results
+
+    async def get_human_examples(
+        self,
+        task_input: str,
+        config: HumanFeedbackPromptConfig,
+    ) -> HumanExampleSet:
+        """Task-similar, human-graded positive/negative exemplars.
+
+        Independent implementation from :meth:`query` rather than a thin
+        wrapper: this needs the raw similarity score (to break exact ties
+        deterministically on score recency, then result_id) and the input
+        text (never returned by ``ScoredResult``), neither of which
+        ``query()`` exposes without changing its public contract for every
+        existing caller.
+
+        Ranking: embedding similarity to ``task_input`` first (rows without
+        a stored embedding are skipped — never substituted with recency).
+        ``config.eligibility_filters`` (the safe-exemplar gate, e.g. a
+        plausibility floor) is applied on the *effective* score before
+        classification, so a result excluded there can never enter either
+        section. Classification then looks only at ``source=human``
+        effective scores for ``config.dimensions`` — see
+        :func:`_classify_human_example` for the negative-precedence rule.
+        Each result lands in at most one section; sections are independently
+        capped at ``config.positive_limit`` / ``config.negative_limit``.
+        """
+        if not config.dimensions:
+            return HumanExampleSet(positive=[], negative=[])
+        if config.positive_limit == 0 and config.negative_limit == 0:
+            # Every result would be sliced away by [:0] regardless of what
+            # qualifies — skip the embed call and full table scan entirely
+            # rather than doing that work just to discard it.
+            return HumanExampleSet(positive=[], negative=[])
+
+        query_emb = await self._embed(task_input)
+        query_norm = float(np.linalg.norm(query_emb))
+        if query_norm == 0:
+            return HumanExampleSet(positive=[], negative=[])
+
+        async with self._get_db_lock():
+            db = await self._get_db()
+            await self._ensure_scores_metadata_column(db)
+            try:
+                await db.execute("BEGIN")
+                rows = await (await db.execute(
+                    "SELECT id, content, input, embedding, created_at FROM results "
+                    "ORDER BY created_at DESC"
+                )).fetchall()
+
+                # (similarity, result_id, output, input_text)
+                candidates: list[tuple[float, str, str, str]] = []
+                for rid, content, inp, emb_bytes, _created_str in rows:
+                    if not emb_bytes:
+                        continue
+                    row_emb = np.frombuffer(emb_bytes, dtype=np.float32)
+                    # A dimension mismatch (older DB row, or a since-changed
+                    # embed model) makes np.dot raise — treat it the same as
+                    # a missing embedding (skip, still gradeable, never a
+                    # prompt example) rather than crashing the agent run.
+                    if row_emb.shape != query_emb.shape:
+                        continue
+                    row_norm = float(np.linalg.norm(row_emb))
+                    if row_norm == 0:
+                        continue
+                    similarity = float(np.dot(query_emb, row_emb) / (query_norm * row_norm))
+                    candidates.append((similarity, rid, content, inp))
+
+                candidates.sort(key=lambda c: c[0], reverse=True)
+
+                # Same bounded-window rationale as query(): most candidates
+                # past a generous multiple of the requested section limits
+                # would be dropped by classification/eligibility anyway.
+                window = min(
+                    len(candidates),
+                    max((config.positive_limit + config.negative_limit) * 10, 50),
+                    900,
+                )
+                candidates = candidates[:window]
+
+                score_rows: list[tuple[str, str, float, str, str | None, str, int]] = []
+                if candidates:
+                    rids = [c[1] for c in candidates]
+                    placeholders = ",".join(["?"] * len(rids))
+                    score_rows = await (await db.execute(
+                        f"SELECT result_id, dimension, value, source, metadata, created_at, rowid "
+                        f"FROM scores WHERE result_id IN ({placeholders}) ORDER BY rowid ASC",
+                        rids,
+                    )).fetchall()
+                await db.commit()
+            except BaseException:
+                await _rollback_safely(db)
+                raise
+
+        effective_rows_by_rid: dict[
+            str, list[tuple[str, float, ScoreSource, dict[str, Any] | None, datetime, int]]
+        ] = {}
+        for rid, dim, val, src, meta_json, created_str, rowid in score_rows:
+            meta = json_loads(meta_json) if meta_json else None
+            effective_rows_by_rid.setdefault(rid, []).append(
+                (dim, val, ScoreSource(src), meta, parse_aware_utc(created_str), rowid)
+            )
+
+        eligibility_filters = list(config.eligibility_filters)
+        # (similarity, score_recency_ts, result_id, HumanExample)
+        positive_ranked: list[tuple[float, float, str, HumanExample]] = []
+        negative_ranked: list[tuple[float, float, str, HumanExample]] = []
+        for similarity, rid, content, inp in candidates:
+            effective = resolve_effective_scores(effective_rows_by_rid.get(rid, []))
+            if eligibility_filters and not _passes_effective_filters(effective, eligibility_filters):
+                continue
+            classified = _classify_human_example(
+                effective, config.dimensions, config.positive_threshold, config.negative_threshold,
+            )
+            if classified is None:
+                continue
+            classification, dims = classified
+            recency_ts = max(effective[d.dimension].created_at for d in dims).timestamp()
+            example = HumanExample(
+                result_id=rid,
+                input_text=inp,
+                output=content,
+                classification=classification,
+                dimensions=dims,
+            )
+            entry = (similarity, recency_ts, rid, example)
+            if classification == "negative":
+                negative_ranked.append(entry)
+            else:
+                positive_ranked.append(entry)
+
+        def _sort_key(entry: tuple[float, float, str, HumanExample]) -> tuple[float, float, str]:
+            similarity, recency_ts, rid, _example = entry
+            return (-similarity, -recency_ts, rid)
+
+        positive_ranked.sort(key=_sort_key)
+        negative_ranked.sort(key=_sort_key)
+
+        return HumanExampleSet(
+            positive=[e[3] for e in positive_ranked[: config.positive_limit]],
+            negative=[e[3] for e in negative_ranked[: config.negative_limit]],
+        )
 
     async def export_eval_set(
         self,
