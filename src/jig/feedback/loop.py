@@ -459,6 +459,11 @@ class SQLiteFeedbackLoop(FeedbackLoop):
         """
         if not config.dimensions:
             return HumanExampleSet(positive=[], negative=[])
+        if config.positive_limit == 0 and config.negative_limit == 0:
+            # Every result would be sliced away by [:0] regardless of what
+            # qualifies — skip the embed call and full table scan entirely
+            # rather than doing that work just to discard it.
+            return HumanExampleSet(positive=[], negative=[])
 
         query_emb = await self._embed(task_input)
         query_norm = float(np.linalg.norm(query_emb))
@@ -481,6 +486,12 @@ class SQLiteFeedbackLoop(FeedbackLoop):
                     if not emb_bytes:
                         continue
                     row_emb = np.frombuffer(emb_bytes, dtype=np.float32)
+                    # A dimension mismatch (older DB row, or a since-changed
+                    # embed model) makes np.dot raise — treat it the same as
+                    # a missing embedding (skip, still gradeable, never a
+                    # prompt example) rather than crashing the agent run.
+                    if row_emb.shape != query_emb.shape:
+                        continue
                     row_norm = float(np.linalg.norm(row_emb))
                     if row_norm == 0:
                         continue

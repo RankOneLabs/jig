@@ -35,21 +35,51 @@ _ROUND_CHUNK_CHARS = 400
 
 _TRUNCATION_MARKER = "\n[... truncated: character budget exhausted ...]"
 
+# Every literal delimiter tag that appears in a rendered example body. Stored
+# input/output/notes are untrusted historical content — if any of them
+# happens to contain one of these exact strings verbatim, it could
+# prematurely close (or forge) a wrapper and escape the intended boundary.
+_DELIMITER_TAGS = (
+    "<UNTRUSTED_EXAMPLE_INPUT>", "</UNTRUSTED_EXAMPLE_INPUT>",
+    "<UNTRUSTED_EXAMPLE_OUTPUT>", "</UNTRUSTED_EXAMPLE_OUTPUT>",
+    "<UNTRUSTED_EXAMPLE_NOTE>", "</UNTRUSTED_EXAMPLE_NOTE>",
+)
+
+
+def _neutralize_delimiter_tags(text: str) -> str:
+    """Escape any literal occurrence of our own delimiter tags in untrusted text.
+
+    HTML-entity-escapes just the angle brackets of a matched tag (e.g.
+    ``</UNTRUSTED_EXAMPLE_OUTPUT>`` -> ``&lt;/UNTRUSTED_EXAMPLE_OUTPUT&gt;``)
+    so stored content can never forge or prematurely close a wrapper, while
+    leaving all other text — including unrelated angle brackets — untouched.
+    """
+    for tag in _DELIMITER_TAGS:
+        if tag in text:
+            text = text.replace(tag, tag.replace("<", "&lt;").replace(">", "&gt;"))
+    return text
+
 
 def _render_example_body(example: HumanExample) -> str:
-    dims = "; ".join(
-        f"{d.dimension}={d.value:.2f}" + (f" (note: {d.note})" if d.note else "")
-        for d in example.dimensions
-    )
-    return (
-        "<UNTRUSTED_EXAMPLE_INPUT>\n"
-        f"{example.input_text}\n"
-        "</UNTRUSTED_EXAMPLE_INPUT>\n"
-        "<UNTRUSTED_EXAMPLE_OUTPUT>\n"
-        f"{example.output}\n"
-        "</UNTRUSTED_EXAMPLE_OUTPUT>\n"
-        f"Human dimensions: {dims}\n"
-    )
+    dims = "; ".join(f"{d.dimension}={d.value:.2f}" for d in example.dimensions)
+    notes = [(d.dimension, d.note) for d in example.dimensions if d.note]
+
+    parts = [
+        "<UNTRUSTED_EXAMPLE_INPUT>\n",
+        _neutralize_delimiter_tags(example.input_text),
+        "\n</UNTRUSTED_EXAMPLE_INPUT>\n",
+        "<UNTRUSTED_EXAMPLE_OUTPUT>\n",
+        _neutralize_delimiter_tags(example.output),
+        "\n</UNTRUSTED_EXAMPLE_OUTPUT>\n",
+        f"Human dimensions: {dims}\n",
+    ]
+    if notes:
+        parts.append("<UNTRUSTED_EXAMPLE_NOTE>\n")
+        parts.append(_neutralize_delimiter_tags(
+            "\n".join(f"{dim}: {note}" for dim, note in notes)
+        ))
+        parts.append("\n</UNTRUSTED_EXAMPLE_NOTE>\n")
+    return "".join(parts)
 
 
 def _round_robin_allocate(bodies: list[str], budget: int) -> list[str]:
@@ -64,19 +94,22 @@ def _round_robin_allocate(bodies: list[str], budget: int) -> list[str]:
     """
     written = [0] * len(bodies)
     remaining_budget = max(budget, 0)
-    active = {i for i, b in enumerate(bodies) if b}
-    while remaining_budget > 0 and active:
-        for i in list(active):
+    # A plain list (not a set) so round order is always the original body
+    # order — set iteration order isn't guaranteed stable across runs, which
+    # would make allocation (and thus which example gets the final partial
+    # chunk) nondeterministic in tight-budget edge cases.
+    pending = [i for i, b in enumerate(bodies) if b]
+    while remaining_budget > 0 and pending:
+        next_pending: list[int] = []
+        for i in pending:
             if remaining_budget <= 0:
                 break
             take = min(_ROUND_CHUNK_CHARS, len(bodies[i]) - written[i], remaining_budget)
-            if take <= 0:
-                active.discard(i)
-                continue
             written[i] += take
             remaining_budget -= take
-            if written[i] >= len(bodies[i]):
-                active.discard(i)
+            if written[i] < len(bodies[i]):
+                next_pending.append(i)
+        pending = next_pending
 
     result: list[str] = []
     for body, count in zip(bodies, written):

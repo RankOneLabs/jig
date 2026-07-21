@@ -385,3 +385,54 @@ async def test_null_feedback_loop_returns_empty_default():
     loop = NullFeedbackLoop()
     out = await loop.get_human_examples("task", CFG)
     assert out == HumanExampleSet(positive=[], negative=[])
+
+
+@pytest.mark.asyncio
+class TestGetHumanExamplesZeroLimitsShortCircuit:
+    async def test_both_limits_zero_skips_embed_call(self, feedback_db):
+        cfg = HumanFeedbackPromptConfig(enabled=True, dimensions=DIMS, positive_limit=0, negative_limit=0)
+        calls = []
+
+        async def _tracking_embed(text: str) -> np.ndarray:
+            calls.append(text)
+            return _vec(1)
+
+        feedback_db._embed = _tracking_embed  # type: ignore[method-assign]
+        out = await feedback_db.get_human_examples("task", cfg)
+        assert out == HumanExampleSet(positive=[], negative=[])
+        assert calls == []
+
+    async def test_one_nonzero_limit_still_runs_retrieval(self, feedback_db):
+        _use_embedding_map(feedback_db, {"task": 1, "in-a": 1})
+        await _store_human(
+            feedback_db, output="out-a", task_input="in-a",
+            dimension="plausibility", value=0.9,
+        )
+        cfg = HumanFeedbackPromptConfig(enabled=True, dimensions=DIMS, positive_limit=1, negative_limit=0)
+        out = await feedback_db.get_human_examples("task", cfg)
+        assert len(out.positive) == 1
+
+
+@pytest.mark.asyncio
+class TestGetHumanExamplesEmbeddingDimensionMismatch:
+    async def test_mismatched_dimension_embedding_is_skipped_not_raised(self, feedback_db):
+        """A stored embedding with a different length than the query
+        embedding (older DB row, or a changed embed model) must be skipped
+        like a missing embedding, never crash the run."""
+        _use_embedding_map(feedback_db, {"task": 1, "in-a": 1})
+        rid = await feedback_db.store_result("out-a", "in-a", {})
+        await feedback_db.score(rid, [
+            Score("plausibility", 0.9, ScoreSource.HUMAN, metadata={"note": "n"}),
+        ])
+        # Overwrite the stored embedding with a shorter vector than the
+        # 128-dim query embedding _vec produces.
+        db = await feedback_db._get_db()
+        short_emb = _vec(1)[:16]
+        await db.execute(
+            "UPDATE results SET embedding = ? WHERE id = ?",
+            (short_emb.tobytes(), rid),
+        )
+        await db.commit()
+
+        out = await feedback_db.get_human_examples("task", CFG)
+        assert out == HumanExampleSet(positive=[], negative=[])
