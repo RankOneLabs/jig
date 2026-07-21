@@ -24,11 +24,13 @@ from jig.core.errors import (
     UnsupportedResponseFormatError,
 )
 from jig.core.grading import grade_and_record
-from jig.core.prompt import build_system_message
+from jig.core.prompt import build_human_feedback_section, build_system_message
 from jig.core.types import (
     CompletionParams,
     FeedbackLoop,
     Grader,
+    HumanExampleSet,
+    HumanFeedbackPromptConfig,
     LLMClient,
     MemoryEntry,
     MemoryStore,
@@ -133,6 +135,13 @@ class AgentConfig[T]:
     feedback_limit: int = 3
     feedback_min_score: float = 0.7
     feedback_source: ScoreSource | None = None
+
+    # --- Human-reviewed feedback prompt injection (opt-in) ---
+    # Independent of the legacy feedback_signals path above: when enabled,
+    # queries feedback.get_human_examples for task-similar, human-only
+    # positive/negative exemplars and appends them to the system message
+    # under labeled, delimited headings. Disabled by default.
+    human_feedback_prompt: HumanFeedbackPromptConfig = HumanFeedbackPromptConfig()
 
     # --- Structured output ---
     # Pydantic model the agent should produce. When set, the runner injects a
@@ -301,6 +310,8 @@ def _serialize_config_snapshot(config: AgentConfig[Any]) -> dict[str, Any]:
         "feedback_limit": config.feedback_limit,
         "feedback_min_score": config.feedback_min_score,
         "feedback_source": config.feedback_source.value if config.feedback_source else None,
+        "human_feedback_prompt_enabled": config.human_feedback_prompt.enabled,
+        "human_feedback_prompt_dimensions": list(config.human_feedback_prompt.dimensions),
         # The LLMClient itself isn't JSON-serializable (live object,
         # gets dropped to ``null`` by _safe_json), so stamp the model
         # slug alongside it. Every shipped adapter sets ``self._model``;
@@ -549,8 +560,28 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                 logger.debug("feedback.get_signals done (signals=%d)", len(feedback_signals))
                 fb_span.finish([s.content[:100] for s in feedback_signals])
 
+        # 4b. Query human-reviewed feedback examples (opt-in, separate from
+        # the legacy signals above).
+        human_examples: HumanExampleSet | None = None
+        if config.human_feedback_prompt.enabled:
+            with span_guard(
+                config.tracer, trace.id, SpanKind.MEMORY_QUERY, "query_human_feedback",
+                input={"query": input},
+            ) as hf_span:
+                human_examples = await config.feedback.get_human_examples(
+                    input, config.human_feedback_prompt,
+                )
+                hf_span.finish({
+                    "positive": len(human_examples.positive),
+                    "negative": len(human_examples.negative),
+                })
+
         # 5. Assemble messages (system prompt is separate, not in messages list)
         system_message = build_system_message(system_prompt, memory_context, feedback_signals)
+        if human_examples is not None:
+            system_message += build_human_feedback_section(
+                human_examples, config.human_feedback_prompt.total_character_budget,
+            )
         is_legacy_structured = (
             config.output_schema is not None and config.structured_output_mode == "legacy"
         )
