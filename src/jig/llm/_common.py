@@ -59,18 +59,23 @@ def merge_completion_kwargs(
 
 
 def openai_tool_payload(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
-    """Serialize ToolDefinition list to the OpenAI function-calling shape."""
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": t.name,
-                "description": t.description,
-                "parameters": t.parameters,
-            },
+    """Serialize ToolDefinition list to the OpenAI function-calling shape.
+
+    Tools that opt into ``strict`` carry ``"strict": true`` so
+    strict-capable backends constrain argument generation to the schema —
+    the same decode-time enforcement ``response_format`` already gets.
+    """
+    payload: list[dict[str, Any]] = []
+    for t in tools:
+        function: dict[str, Any] = {
+            "name": t.name,
+            "description": t.description,
+            "parameters": t.parameters,
         }
-        for t in tools
-    ]
+        if t.strict:
+            function["strict"] = True
+        payload.append({"type": "function", "function": function})
+    return payload
 
 
 def wrap_llm_error(e: Exception, provider_label: str) -> JigLLMError:
