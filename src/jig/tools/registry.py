@@ -137,6 +137,13 @@ class ToolRegistry:
                 "trace_id": tool_context.trace_id,
                 "parent_span_id": tool_context.span_id,
             }
+        # Duck-typed like dispatch_payload_extra: a dispatched tool that
+        # defines on_dispatch_submitted(job_id) gets the smithers job id at
+        # acceptance time, so it can persist the correlation while the job
+        # is still running.
+        on_submitted = getattr(tool, "on_dispatch_submitted", None)
+        if callable(on_submitted):
+            kwargs["on_submitted"] = on_submitted
 
         try:
             async def _gate_and_dispatch() -> object:

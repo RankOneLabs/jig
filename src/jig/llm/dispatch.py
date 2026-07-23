@@ -28,6 +28,7 @@ from jig.core.types import (
     Usage,
 )
 from jig.llm._common import merge_completion_kwargs, start_timer
+from jig.llm._parsing import parse_tool_arguments
 from jig.dispatch.client import (
     DispatchError,
     JobTimeoutError,
@@ -77,18 +78,19 @@ def _safe_cost(value: Any) -> float | None:
 
 def _tools_payload(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
     """Serialize :class:`ToolDefinition` list to the OpenAI-style shape
-    smithers executors (vLLM, Ollama) accept natively."""
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": t.name,
-                "description": t.description,
-                "parameters": t.parameters,
-            },
+    smithers executors (vLLM, Ollama) accept natively. Tools that opt into
+    ``strict`` carry ``"strict": true`` for guided-decoding backends."""
+    payload: list[dict[str, Any]] = []
+    for t in tools:
+        function: dict[str, Any] = {
+            "name": t.name,
+            "description": t.description,
+            "parameters": t.parameters,
         }
-        for t in tools
-    ]
+        if t.strict:
+            function["strict"] = True
+        payload.append({"type": "function", "function": function})
+    return payload
 
 
 def _parse_tool_calls(raw: Any) -> list[ToolCall] | None:
@@ -98,47 +100,34 @@ def _parse_tool_calls(raw: Any) -> list[ToolCall] | None:
 
         [{"id": "...", "function": {"name": "...", "arguments": "{...}"}}]
 
-    where ``arguments`` is a JSON-encoded string. Malformed entries are
-    skipped with a warning; we'd rather lose one tool call than crash
-    the whole completion.
+    Entries with no function name are provider garbage and are skipped
+    with a warning. A *named* call with malformed or non-object arguments
+    is model intent that failed to serialize — that raises a retryable
+    :class:`JigLLMError` via the shared ``parse_tool_arguments`` helper
+    (the same semantics every other adapter has), so the runner's retry
+    path surfaces the failure to the model instead of the call silently
+    vanishing and the turn reading as "no tool calls".
     """
     if not raw or not isinstance(raw, list):
         return None
     calls: list[ToolCall] = []
     for entry in raw:
         if not isinstance(entry, dict):
-            continue
-        fn = entry.get("function") or {}
-        name = fn.get("name")
-        if not name:
-            continue
-        args_raw = fn.get("arguments")
-        if isinstance(args_raw, str):
-            try:
-                parsed = json.loads(args_raw) if args_raw else {}
-            except json.JSONDecodeError:
-                logger.warning(
-                    "Malformed tool-call arguments from dispatch: %r", args_raw,
-                )
-                continue
-        elif isinstance(args_raw, dict):
-            parsed = args_raw
-        else:
-            parsed = {}
-        # ``ToolCall.arguments`` is a ``dict[str, Any]`` — workers that
-        # emit scalar/list JSON (``"1"``, ``"[]"``, ``'"x"'``) would
-        # otherwise sneak a non-dict past the type and blow up deeper in
-        # the tool registry. Drop them with the same warning shape as
-        # a JSON decode failure.
-        if not isinstance(parsed, dict):
             logger.warning(
-                "Non-object tool-call arguments from dispatch: %r", args_raw,
+                "Skipping non-object tool-call entry from dispatch: %r", entry,
+            )
+            continue
+        fn = entry.get("function")
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if not name:
+            logger.warning(
+                "Skipping unnamed tool-call entry from dispatch: %r", entry,
             )
             continue
         calls.append(ToolCall(
             id=entry.get("id") or f"call_{uuid.uuid4().hex[:12]}",
             name=name,
-            arguments=parsed,
+            arguments=parse_tool_arguments(fn.get("arguments"), "dispatch"),
         ))
     return calls or None
 

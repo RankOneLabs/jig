@@ -487,24 +487,41 @@ class TestTraceContextFromDict:
         assert tc.trace_id == "t"
 
 
-class TestParseToolCallsRejectsNonDict:
-    """Non-object JSON in tool-call arguments must be dropped, not passed."""
+class TestParseToolCallsMalformedArgs:
+    """A *named* tool call with malformed or non-object arguments raises a
+    retryable JigLLMError (shared-adapter semantics) instead of being
+    silently dropped — the model must see its failed attempt. Entries with
+    no name are provider garbage and are still skipped."""
 
-    def test_scalar_json_string_dropped(self):
+    def test_scalar_json_string_raises(self):
         from jig.llm.dispatch import _parse_tool_calls
         raw = [{
             "id": "tc-1",
             "function": {"name": "echo", "arguments": "42"},
         }]
-        assert _parse_tool_calls(raw) is None
+        with pytest.raises(JigLLMError) as excinfo:
+            _parse_tool_calls(raw)
+        assert excinfo.value.retryable
 
-    def test_list_json_string_dropped(self):
+    def test_list_json_string_raises(self):
         from jig.llm.dispatch import _parse_tool_calls
         raw = [{
             "id": "tc-1",
             "function": {"name": "echo", "arguments": "[1, 2]"},
         }]
-        assert _parse_tool_calls(raw) is None
+        with pytest.raises(JigLLMError) as excinfo:
+            _parse_tool_calls(raw)
+        assert excinfo.value.retryable
+
+    def test_malformed_json_string_raises(self):
+        from jig.llm.dispatch import _parse_tool_calls
+        raw = [{
+            "id": "tc-1",
+            "function": {"name": "echo", "arguments": "{not json"},
+        }]
+        with pytest.raises(JigLLMError) as excinfo:
+            _parse_tool_calls(raw)
+        assert excinfo.value.retryable
 
     def test_valid_dict_string_accepted(self):
         from jig.llm.dispatch import _parse_tool_calls
@@ -515,6 +532,25 @@ class TestParseToolCallsRejectsNonDict:
         calls = _parse_tool_calls(raw)
         assert calls is not None
         assert calls[0].arguments == {"k": "v"}
+
+    def test_dict_arguments_accepted(self):
+        from jig.llm.dispatch import _parse_tool_calls
+        raw = [{
+            "id": "tc-1",
+            "function": {"name": "echo", "arguments": {"k": "v"}},
+        }]
+        calls = _parse_tool_calls(raw)
+        assert calls is not None
+        assert calls[0].arguments == {"k": "v"}
+
+    def test_unnamed_entry_skipped(self):
+        from jig.llm.dispatch import _parse_tool_calls
+        raw = [{"id": "tc-1", "function": {"arguments": "{}"}}]
+        assert _parse_tool_calls(raw) is None
+
+    def test_non_object_entry_skipped(self):
+        from jig.llm.dispatch import _parse_tool_calls
+        assert _parse_tool_calls(["garbage"]) is None
 
 
 @pytest.mark.asyncio
@@ -594,3 +630,160 @@ class TestSharedHttpLifecycle:
             assert dc._shared_http_loop is asyncio.get_running_loop()
         finally:
             await dc.aclose()
+
+
+@pytest.mark.asyncio
+class TestOnSubmittedHook:
+    """dispatch_run(on_submitted=...) observes the smithers job id at
+    acceptance time, before the terminal wait."""
+
+    async def test_hook_receives_job_id_on_success(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp("j-42")
+        http.get.return_value = _poll_resp(status="complete", result={"value": 1})
+        seen: list[str] = []
+
+        out = await dispatch_run(
+            "m:f", http=http, poll_interval=0.01, on_submitted=seen.append,
+        )
+
+        assert out == 1
+        assert seen == ["j-42"]
+
+    async def test_hook_fires_even_when_job_later_fails(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp("j-42")
+        r = MagicMock(spec=httpx.Response)
+        r.status_code = 200
+        r.json.return_value = {"status": "failed", "error": "boom"}
+        r.raise_for_status = MagicMock()
+        http.get.return_value = r
+        seen: list[str] = []
+
+        with pytest.raises(DispatchError, match="boom"):
+            await dispatch_run(
+                "m:f", http=http, poll_interval=0.01, on_submitted=seen.append,
+            )
+
+        assert seen == ["j-42"]
+
+    async def test_hook_not_called_when_submission_fails(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.side_effect = httpx.ConnectError("nope")
+        seen: list[str] = []
+
+        with pytest.raises(DispatchError):
+            await dispatch_run(
+                "m:f", http=http, poll_interval=0.01, on_submitted=seen.append,
+            )
+
+        assert seen == []
+
+    async def test_hook_exception_does_not_break_dispatch(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.get.return_value = _poll_resp(status="complete", result={"value": "ok"})
+
+        def boom(job_id: str) -> None:
+            raise RuntimeError("hook exploded")
+
+        out = await dispatch_run(
+            "m:f", http=http, poll_interval=0.01, on_submitted=boom,
+        )
+
+        assert out == "ok"
+
+    async def test_success_job_dict_always_carries_job_id(self):
+        from jig.dispatch.client import _submit_and_poll
+
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp("j-7")
+        # Poll body deliberately omits job_id — the client re-attaches it.
+        http.get.return_value = _poll_resp(status="complete", result={"value": 1})
+
+        data = await _submit_and_poll(
+            http=http,
+            dispatch_url="http://test",
+            task_type="function",
+            payload={},
+            poll_config=_PollConfig(
+                timeout_seconds=5,
+                cleanup_grace_seconds=0,
+                poll_interval=0.01,
+                poll_max_interval=0.02,
+            ),
+        )
+
+        assert data["job_id"] == "j-7"
+
+
+class _DispatchedToolWithHook(_DispatchedTool):
+    """Dispatched tool that duck-types on_dispatch_submitted."""
+
+    def __init__(self) -> None:
+        self.seen: list[str] = []
+
+    def on_dispatch_submitted(self, job_id: str) -> None:
+        self.seen.append(job_id)
+
+
+@pytest.mark.asyncio
+class TestRegistryOnSubmittedPlumbed:
+    """A dispatched tool's on_dispatch_submitted must reach dispatch_run as
+    on_submitted; tools without the method add no kwarg."""
+
+    async def test_duck_typed_hook_forwarded(self, monkeypatch):
+        captured: dict[str, Any] = {}
+
+        async def fake_run(fn_ref, payload=None, **kwargs):
+            captured.update(kwargs)
+            return {"value": 1}
+
+        import jig.dispatch
+        monkeypatch.setattr(jig.dispatch, "run", fake_run)
+
+        tool = _DispatchedToolWithHook()
+        reg = ToolRegistry([tool])
+        await reg.execute(ToolCall(id="c1", name="backtest", arguments={}))
+
+        hook = captured.get("on_submitted")
+        assert callable(hook)
+        hook("j-9")
+        assert tool.seen == ["j-9"]
+
+    async def test_absent_hook_omits_kwarg(self, monkeypatch):
+        captured: dict[str, Any] = {}
+
+        async def fake_run(fn_ref, payload=None, **kwargs):
+            captured.update(kwargs)
+            return {"value": 1}
+
+        import jig.dispatch
+        monkeypatch.setattr(jig.dispatch, "run", fake_run)
+
+        reg = ToolRegistry([_DispatchedTool()])
+        await reg.execute(ToolCall(id="c1", name="backtest", arguments={}))
+
+        assert "on_submitted" not in captured
+
+
+class TestStrictToolPayload:
+    """Tools that opt into strict carry "strict": true in both payload
+    builders; non-opted tools serialize exactly as before."""
+
+    def test_strict_flag_serialized_only_when_opted_in(self):
+        from jig.llm._common import openai_tool_payload
+        from jig.llm.dispatch import _tools_payload
+
+        strict_tool = ToolDefinition(
+            name="s", description="d",
+            parameters={"type": "object", "additionalProperties": False},
+            strict=True,
+        )
+        plain_tool = ToolDefinition(
+            name="p", description="d", parameters={"type": "object"},
+        )
+        for builder in (_tools_payload, openai_tool_payload):
+            out = builder([strict_tool, plain_tool])
+            assert out[0]["function"]["strict"] is True
+            assert "strict" not in out[1]["function"]

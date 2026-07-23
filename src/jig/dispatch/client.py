@@ -12,7 +12,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -167,6 +167,9 @@ async def _wait_for_terminal(
                 job_id,
                 (time.time() - started_at) * 1000,
             )
+            # Callback bodies aren't guaranteed to carry the id — make the
+            # success-path job dict always self-identifying.
+            callback_data.setdefault("job_id", job_id)
             return callback_data
         if status == "failed":
             raise DispatchError(
@@ -237,6 +240,7 @@ async def _wait_for_terminal(
                 job_id,
                 (time.time() - started_at) * 1000,
             )
+            data.setdefault("job_id", job_id)
             return data
         if status == "failed":
             raise DispatchError(
@@ -267,8 +271,15 @@ async def _submit_and_poll(
     poll_config: _PollConfig | None = None,
     listener: Any = None,  # CallbackListener | None — typed via Any to keep
                             # jig.dispatch.listener import optional
+    on_submitted: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Submit a job to smithers, wait for a terminal status, return the job data.
+
+    ``on_submitted``, when provided, is invoked with the smithers job id
+    immediately after submission is accepted — before the terminal wait —
+    so callers can durably record the correlation while the job runs.
+    Hook exceptions are logged and swallowed; observing acceptance must
+    never fail the dispatch itself.
 
     When ``listener`` is provided (and its health check passes), the wait
     is an ``asyncio.Future`` resolved by a smithers HTTP callback —
@@ -362,6 +373,15 @@ async def _submit_and_poll(
         ) from e
 
     logger.info("Dispatch job %s submitted (task_type=%s)", job_id, task_type)
+    if on_submitted is not None:
+        try:
+            on_submitted(job_id)
+        except Exception:
+            logger.warning(
+                "on_submitted hook failed for job %s (dispatch continues)",
+                job_id,
+                exc_info=True,
+            )
     wait_timeout_seconds = max(
         0.0,
         cfg.timeout_seconds + cfg.cleanup_grace_seconds,
@@ -479,8 +499,13 @@ async def run(
     poll_interval: float = 0.5,
     poll_max_interval: float = 5.0,
     http: httpx.AsyncClient | None = None,
+    on_submitted: Callable[[str], None] | None = None,
 ) -> Any:
     """Execute ``fn_ref`` on a smithers worker, await the result.
+
+    ``on_submitted``, when provided, receives the smithers job id at
+    acceptance time (before the result wait); hook exceptions are logged,
+    never raised.
 
     ``fn_ref`` is the ``"package.module:function"`` identifier the
     worker's function registry knows (populated via the
@@ -522,6 +547,7 @@ async def run(
             poll_max_interval=poll_max_interval,
         ),
         listener=_current_listener(),
+        on_submitted=on_submitted,
     )
     # Don't ``or {}`` here — that rewrites legitimate falsy returns
     # (``0``, ``False``, ``[]``, ``""``) into an empty dict and breaks

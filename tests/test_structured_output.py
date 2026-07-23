@@ -25,7 +25,7 @@ from jig import (
     Usage,
     run_agent,
 )
-from jig.core.runner import SUBMIT_OUTPUT_TOOL
+from jig.core.runner import SUBMIT_OUTPUT_TOOL, _normalize_strict_schema
 from jig.core.types import (
     MemoryStore,
     Retriever,
@@ -561,7 +561,7 @@ class TestNativeModeHappyPath:
             "type": "json_schema",
             "json_schema": {
                 "name": "StrategyOutput",
-                "schema": StrategyOutput.model_json_schema(),
+                "schema": _normalize_strict_schema(StrategyOutput.model_json_schema()),
                 "strict": True,
             },
         }
@@ -828,3 +828,261 @@ class TestCanonicalOutputHash:
 
         with pytest.raises(ValueError, match="non-string object key"):
             _canonical_output_hash({1: "x"})
+
+
+class TestSubmitOutputStrictness:
+    async def test_submit_output_definition_opts_into_strict(self):
+        """The synthetic submit_output tool must carry the same decode-time
+        strictness response_format gets: strict=True on the definition and
+        a closed (additionalProperties: false) parameter schema."""
+        llm = FakeLLM([_submit_response({"strategy_types": ["x"]})])
+        await run_agent(_config(llm, output_schema=StrategyOutput), "go")
+
+        submit_def = next(
+            t for t in llm.calls[0].tools if t.name == SUBMIT_OUTPUT_TOOL
+        )
+        assert submit_def.strict is True
+        assert submit_def.parameters.get("additionalProperties") is False
+
+
+class _Leg(BaseModel):
+    pair: str
+    size: float = 1.0
+
+
+class _NestedOutput(BaseModel):
+    legs: list[_Leg]
+    label: str = ""
+
+
+class _OpenOutput(BaseModel):
+    model_config = {"extra": "allow"}
+
+    value: int
+
+
+class TestNormalizeStrictSchema:
+    """Strict decoders reject open or partially-required object nodes;
+    _normalize_strict_schema must close every level of the schema, not
+    just the root (PR 82 review)."""
+
+    def test_nested_defs_are_closed_and_fully_required(self):
+        schema = _normalize_strict_schema(_NestedOutput.model_json_schema())
+
+        assert schema["additionalProperties"] is False
+        assert schema["required"] == ["legs", "label"]
+        leg = schema["$defs"]["_Leg"]
+        assert leg["additionalProperties"] is False
+        assert leg["required"] == ["pair", "size"]
+
+    def test_explicit_additional_properties_true_is_overridden(self):
+        raw = _OpenOutput.model_json_schema()
+        assert raw.get("additionalProperties") is True
+
+        schema = _normalize_strict_schema(raw)
+        assert schema["additionalProperties"] is False
+
+    def test_input_schema_is_not_mutated(self):
+        raw = _NestedOutput.model_json_schema()
+        _normalize_strict_schema(raw)
+        assert raw == _NestedOutput.model_json_schema()
+
+    async def test_submit_output_tool_uses_normalized_schema(self):
+        llm = FakeLLM([_submit_response({"legs": [{"pair": "BTC"}]})])
+        await run_agent(_config(llm, output_schema=_NestedOutput), "go")
+
+        submit_def = next(
+            t for t in llm.calls[0].tools if t.name == SUBMIT_OUTPUT_TOOL
+        )
+        leg = submit_def.parameters["$defs"]["_Leg"]
+        assert leg["additionalProperties"] is False
+        assert leg["required"] == ["pair", "size"]
+
+    async def test_response_format_uses_normalized_schema(self):
+        llm = FakeNativeLLM([
+            _content_response({"legs": [{"pair": "BTC", "size": 2.0}]}),
+        ])
+        await run_agent(
+            _config(llm, output_schema=_NestedOutput, structured_output_mode="native"),
+            "go",
+        )
+
+        sent = llm.calls[0].response_format["json_schema"]["schema"]
+        assert sent["required"] == ["legs", "label"]
+        assert sent["$defs"]["_Leg"]["additionalProperties"] is False
+
+
+class TestTwoPhaseMode:
+    """native_two_phase: working turns run unconstrained with tools; the
+    first no-tool-call turn triggers one schema-constrained, tool-free
+    finalize call whose content is the terminal result."""
+
+    _ENVELOPE = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "StrategyOutput",
+            "schema": _normalize_strict_schema(StrategyOutput.model_json_schema()),
+            "strict": True,
+        },
+    }
+
+    async def test_first_no_tool_call_turn_triggers_finalize_call(self):
+        llm = FakeNativeLLM([
+            _content_response("work is done"),
+            _content_response(
+                {"strategy_types": ["mean_reversion"], "best_sharpe": 1.2}
+            ),
+        ])
+        result = await run_agent(
+            _config(
+                llm,
+                output_schema=StrategyOutput,
+                structured_output_mode="native_two_phase",
+            ),
+            "go",
+        )
+
+        assert isinstance(result.parsed, StrategyOutput)
+        assert result.parsed.strategy_types == ["mean_reversion"]
+        assert result.error is None
+        # Working turn: unconstrained.
+        assert llm.calls[0].response_format is None
+        # Finalize turn: tool-free and schema-constrained.
+        assert llm.calls[1].tools is None
+        assert llm.calls[1].response_format == self._ENVELOPE
+
+    async def test_tools_offered_on_working_turns_never_on_finalize(self):
+        class Echo:
+            @property
+            def definition(self):
+                return ToolDefinition(
+                    name="echo",
+                    description="echoes",
+                    parameters={"type": "object", "properties": {}},
+                )
+
+            async def execute(self, args):
+                return "echoed"
+
+        llm = FakeNativeLLM([
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCall(id="t1", name="echo", arguments={})],
+                usage=Usage(1, 1), latency_ms=1, model="fake",
+            ),
+            _content_response("finished the work"),
+            _content_response({"strategy_types": ["x"]}),
+        ])
+        result = await run_agent(
+            _config(
+                llm, output_schema=StrategyOutput,
+                structured_output_mode="native_two_phase", tools=[Echo()],
+            ),
+            "go",
+        )
+
+        assert result.parsed is not None
+        # Working turns: tools offered (never submit_output), unconstrained.
+        assert [t.name for t in llm.calls[0].tools] == ["echo"]
+        assert llm.calls[0].response_format is None
+        assert llm.calls[1].response_format is None
+        # Finalize call: no tools, constrained.
+        assert llm.calls[2].tools is None
+        assert llm.calls[2].response_format == self._ENVELOPE
+
+    async def test_finalize_validation_failure_fails_closed(self):
+        llm = FakeNativeLLM([
+            _content_response("done"),
+            _content_response("not even json"),
+        ])
+        result = await run_agent(
+            _config(
+                llm, output_schema=StrategyOutput,
+                structured_output_mode="native_two_phase",
+            ),
+            "go",
+        )
+
+        assert result.parsed is None
+        assert isinstance(result.error, AgentNativeOutputError)
+        assert "agent terminated" in result.output
+
+    async def test_max_tool_calls_exhaustion_routes_through_finalize(self):
+        class Echo:
+            @property
+            def definition(self):
+                return ToolDefinition(
+                    name="echo",
+                    description="echoes",
+                    parameters={"type": "object", "properties": {}},
+                )
+
+            async def execute(self, args):
+                return "echoed"
+
+        def _tool_turn(call_id):
+            return LLMResponse(
+                content="",
+                tool_calls=[ToolCall(id=call_id, name="echo", arguments={})],
+                usage=Usage(1, 1), latency_ms=1, model="fake",
+            )
+
+        llm = FakeNativeLLM([
+            _tool_turn("t1"),
+            _tool_turn("t2"),           # over budget → cap notice injected
+            _content_response("done"),  # model wraps up
+            _content_response({"strategy_types": ["x"]}),
+        ])
+        config = _config(
+            llm, output_schema=StrategyOutput,
+            structured_output_mode="native_two_phase", tools=[Echo()],
+        ).with_(max_tool_calls=1)
+        result = await run_agent(config, "go")
+
+        assert result.parsed is not None
+        assert result.error is None
+        # The run still ends through the constrained finalize call.
+        assert llm.calls[3].tools is None
+        assert llm.calls[3].response_format == self._ENVELOPE
+
+    async def test_tool_call_on_finalize_turn_nudged_then_fails_closed(self):
+        from jig import AgentAmbiguousTurnError
+
+        def _anomalous_turn(call_id):
+            return LLMResponse(
+                content="",
+                tool_calls=[ToolCall(id=call_id, name="echo", arguments={})],
+                usage=Usage(1, 1), latency_ms=1, model="fake",
+            )
+
+        llm = FakeNativeLLM([
+            _content_response("done"),  # triggers the finalize request
+            _anomalous_turn("a1"),      # tool call on a tools=None turn
+            _anomalous_turn("a2"),      # second anomaly exhausts the budget
+        ])
+        result = await run_agent(
+            _config(
+                llm, output_schema=StrategyOutput,
+                structured_output_mode="native_two_phase", max_parse_retries=1,
+            ),
+            "go",
+        )
+
+        assert result.parsed is None
+        assert isinstance(result.error, AgentAmbiguousTurnError)
+
+    async def test_requires_response_format_support(self):
+        llm = FakeLLM([_content_response("x")])
+        with pytest.raises(UnsupportedResponseFormatError):
+            await run_agent(
+                _config(
+                    llm, output_schema=StrategyOutput,
+                    structured_output_mode="native_two_phase",
+                ),
+                "go",
+            )
+
+    async def test_requires_output_schema(self):
+        llm = FakeNativeLLM([])
+        with pytest.raises(ValueError, match="requires output_schema"):
+            _config(llm, structured_output_mode="native_two_phase")

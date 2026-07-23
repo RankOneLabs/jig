@@ -77,9 +77,13 @@ ROOT_OUTPUT_BYTE_LENGTH_KEY = "output_byte_length"
 # "legacy" injects the synthetic submit_output tool and validates its
 # arguments (the long-standing behavior). "native" omits that tool, converts
 # output_schema into a strict response_format, and parses the schema-
-# constrained terminal assistant content directly. No "auto": callers pick
+# constrained terminal assistant content directly. "native_two_phase" runs
+# every working turn unconstrained (tools offered, no response_format); the
+# first no-tool-call turn triggers one additional schema-constrained,
+# tool-free finalize call whose content is the terminal result — the schema
+# can never bias a turn on which tools are offered. No "auto": callers pick
 # explicitly so benchmark attribution and production guarantees stay knowable.
-StructuredOutputMode = Literal["legacy", "native"]
+StructuredOutputMode = Literal["legacy", "native", "native_two_phase"]
 
 # HTTP status codes that indicate a definitely-permanent LLM failure.
 # 400 / 422 — malformed request; 401 / 403 — auth problem; 404 — bad
@@ -151,8 +155,9 @@ class AgentConfig[T]:
     # ``AgentResult.parsed`` as None.
     output_schema: type[T] | None = None
     max_parse_retries: int = 2
-    # "legacy" (default) or "native" — see StructuredOutputMode. Only
-    # meaningful when output_schema is set; native mode requires it.
+    # "legacy" (default), "native", or "native_two_phase" — see
+    # StructuredOutputMode. Only meaningful when output_schema is set;
+    # both native modes require it.
     structured_output_mode: StructuredOutputMode = "legacy"
 
     def __post_init__(self) -> None:
@@ -174,14 +179,18 @@ class AgentConfig[T]:
             raise ValueError(
                 f"max_parse_retries must be non-negative, got {self.max_parse_retries}."
             )
-        if self.structured_output_mode not in ("legacy", "native"):
+        if self.structured_output_mode not in ("legacy", "native", "native_two_phase"):
             raise ValueError(
-                f"structured_output_mode must be 'legacy' or 'native', "
-                f"got {self.structured_output_mode!r}."
+                f"structured_output_mode must be 'legacy', 'native', or "
+                f"'native_two_phase', got {self.structured_output_mode!r}."
             )
-        if self.structured_output_mode == "native" and self.output_schema is None:
+        if (
+            self.structured_output_mode in ("native", "native_two_phase")
+            and self.output_schema is None
+        ):
             raise ValueError(
-                "structured_output_mode='native' requires output_schema to be set."
+                f"structured_output_mode={self.structured_output_mode!r} "
+                f"requires output_schema to be set."
             )
         if (
             isinstance(self.feedback_limit, bool)
@@ -229,7 +238,53 @@ def _validate_output_schema(schema: type) -> None:
         )
 
 
+def _normalize_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Close a JSON schema for strict decoding, recursively.
+
+    Strict decoders (OpenAI-style ``"strict": true`` on function calls and
+    ``json_schema`` response formats) reject any object node that permits
+    unknown keys or leaves a declared property optional.
+    ``model_json_schema()`` guarantees neither: nested ``$defs`` stay open
+    and defaulted fields are omitted from ``required``. Every object node
+    gets ``additionalProperties: false`` (overriding an explicit ``true``
+    from ``extra="allow"``) and a ``required`` listing every property.
+    A schema-valued ``additionalProperties`` (pydantic's ``dict[str, X]``)
+    is normalized in place rather than clobbered — backends that can't
+    decode it should fail loudly, not silently receive an empty-object
+    constraint.
+    """
+    out = dict(schema)
+    for key in ("$defs", "properties"):
+        value = out.get(key)
+        if isinstance(value, dict):
+            out[key] = {
+                name: _normalize_strict_schema(sub) if isinstance(sub, dict) else sub
+                for name, sub in value.items()
+            }
+    for key in ("items", "contains", "propertyNames", "not"):
+        if isinstance(out.get(key), dict):
+            out[key] = _normalize_strict_schema(out[key])
+    for key in ("anyOf", "oneOf", "allOf", "prefixItems"):
+        value = out.get(key)
+        if isinstance(value, list):
+            out[key] = [
+                _normalize_strict_schema(sub) if isinstance(sub, dict) else sub
+                for sub in value
+            ]
+    if out.get("type") == "object" or "properties" in out:
+        if isinstance(out.get("additionalProperties"), dict):
+            out["additionalProperties"] = _normalize_strict_schema(
+                out["additionalProperties"]
+            )
+        else:
+            out["additionalProperties"] = False
+        if "properties" in out:
+            out["required"] = list(out["properties"])
+    return out
+
+
 def _build_submit_output_tool(schema: type[BaseModel]) -> ToolDefinition:
+    parameters = _normalize_strict_schema(schema.model_json_schema())
     return ToolDefinition(
         name=SUBMIT_OUTPUT_TOOL,
         description=(
@@ -237,7 +292,8 @@ def _build_submit_output_tool(schema: type[BaseModel]) -> ToolDefinition:
             "your result — do not produce a free-form text response as your "
             "final answer."
         ),
-        parameters=schema.model_json_schema(),
+        parameters=parameters,
+        strict=True,
     )
 
 
@@ -251,7 +307,7 @@ def _build_response_format(schema: type[BaseModel]) -> dict[str, Any]:
         "type": "json_schema",
         "json_schema": {
             "name": schema.__name__,
-            "schema": schema.model_json_schema(),
+            "schema": _normalize_strict_schema(schema.model_json_schema()),
             "strict": True,
         },
     }
@@ -264,6 +320,14 @@ def _append_schema_instruction(system_message: str) -> str:
         f"tool with your result matching the provided schema. Do not produce "
         f"a free-form text response as your final answer — always finish by "
         f"calling `{SUBMIT_OUTPUT_TOOL}`."
+    )
+
+
+def _append_two_phase_instruction(system_message: str) -> str:
+    return (
+        f"{system_message}\n\n"
+        f"When your work is complete, reply without tool calls; you will "
+        f"then be asked for a final structured summary."
     )
 
 
@@ -479,11 +543,14 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
     # silently run unconstrained or fall back to legacy. This is a
     # caller-side contract violation, not a provider failure, so it
     # propagates as a raised exception rather than an AgentResult.error.
-    if config.structured_output_mode == "native" and not config.llm.supports_response_format:
+    if (
+        config.structured_output_mode in ("native", "native_two_phase")
+        and not config.llm.supports_response_format
+    ):
         raise UnsupportedResponseFormatError(
             f"LLM client {type(config.llm).__name__} does not declare "
             f"response_format support; cannot run agent {config.name!r} in "
-            f"structured_output_mode='native'."
+            f"structured_output_mode={config.structured_output_mode!r}."
         )
 
     # 1. Start trace. Snapshot the config alongside the input so phase 11
@@ -588,8 +655,14 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
         is_native_structured = (
             config.output_schema is not None and config.structured_output_mode == "native"
         )
+        is_two_phase_structured = (
+            config.output_schema is not None
+            and config.structured_output_mode == "native_two_phase"
+        )
         if is_legacy_structured:
             system_message = _append_schema_instruction(system_message)
+        elif is_two_phase_structured:
+            system_message = _append_two_phase_instruction(system_message)
         messages: list[Message] = []
         if config.session_id and config.store is not None:
             history = await config.store.get_session(config.session_id)
@@ -613,11 +686,20 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
         response_format = (
             _build_response_format(config.output_schema) if is_native_structured else None
         )
+        # Two-phase keeps working turns unconstrained; this envelope is
+        # attached only to the finalize call.
+        finalize_response_format = (
+            _build_response_format(config.output_schema)
+            if is_two_phase_structured else None
+        )
 
         # 6. LLM call + tool loop
         tool_call_count = 0
         consecutive_llm_errors = 0
         parse_retries = 0
+        # native_two_phase only: set when the model's first no-tool-call turn
+        # has requested the schema-constrained, tool-free finalize call.
+        finalize_pending = False
 
         while True:
             if total_usage["llm_calls"] >= config.max_llm_calls:
@@ -641,8 +723,11 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                 params = CompletionParams(
                     messages=messages,
                     system=system_message,
-                    tools=tools_for_llm,
-                    response_format=response_format,
+                    tools=None if finalize_pending else tools_for_llm,
+                    response_format=(
+                        finalize_response_format if finalize_pending
+                        else response_format
+                    ),
                 )
 
                 try:
@@ -651,7 +736,7 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                         total_usage["llm_calls"],
                         config.max_llm_calls,
                         len(messages),
-                        len(tools_for_llm) if tools_for_llm else 0,
+                        len(params.tools) if params.tools else 0,
                     )
                     response = await config.llm.complete(params)
                     logger.debug(
@@ -825,6 +910,73 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                         )
                     )
                     break
+
+            # --- Two-phase structured-output paths ---
+            # Working turns run unconstrained. The first no-tool-call turn
+            # requests one schema-constrained, tool-free finalize call; that
+            # call's content is the terminal result, parsed with the same
+            # decode-time-enforcement rationale as native mode.
+            if is_two_phase_structured and finalize_pending and response.tool_calls:
+                # tools=None was sent on the finalize call — a tool call here
+                # is a provider anomaly. Nudge within the parse budget, then
+                # fail closed (same budget as legacy's ambiguous turns).
+                parse_retries += 1
+                logger.info(
+                    "tool call emitted on finalize turn (%d/%d)",
+                    parse_retries, config.max_parse_retries,
+                )
+                messages.append(
+                    Message(
+                        role=Role.ASSISTANT,
+                        content=response.content,
+                        tool_calls=response.tool_calls,
+                    )
+                )
+                for call in response.tool_calls:
+                    messages.append(
+                        Message(
+                            role=Role.TOOL,
+                            content=(
+                                "[skipped: finalize turn — respond with the "
+                                "final structured output only, no tool calls]"
+                            ),
+                            tool_call_id=call.id,
+                        )
+                    )
+                if parse_retries > config.max_parse_retries:
+                    agent_error = AgentAmbiguousTurnError(parse_retries)
+                    final_output = f"[agent terminated: {agent_error}]"
+                    break
+                continue
+
+            if is_two_phase_structured and not response.tool_calls:
+                if not finalize_pending:
+                    finalize_pending = True
+                    messages.append(
+                        Message(role=Role.ASSISTANT, content=response.content)
+                    )
+                    messages.append(
+                        Message(
+                            role=Role.USER,
+                            content=(
+                                "Produce your final structured output now, "
+                                "matching the required schema."
+                            ),
+                        )
+                    )
+                    continue
+                assert config.output_schema is not None  # guaranteed by __post_init__
+                try:
+                    parsed = config.output_schema.model_validate_json(response.content)
+                except (ValidationError, ValueError) as ve:
+                    agent_error = AgentNativeOutputError(str(ve))
+                    final_output = f"[agent terminated: {agent_error}]"
+                    break
+                final_output = parsed.model_dump_json()
+                # Same rationale as the native path below: persist the
+                # validated value, not the raw content.
+                structured_complete = parsed.model_dump(mode="json")
+                break
 
             # --- Native structured-output termination path ---
             # A schema-constrained turn with no tool calls is the terminal

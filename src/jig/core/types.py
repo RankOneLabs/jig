@@ -63,6 +63,13 @@ class ToolDefinition:
     # calls to this tool, for replay alignment. ``None`` means the tool
     # author has not declared an identity; see jig.replay.align.
     identity_fields: list[str] | None = None
+    # Opt-in decode-time strictness: serialized as ``"strict": true`` in the
+    # OpenAI-compatible function payload so strict-capable backends (OpenAI,
+    # vLLM guided decoding) constrain argument generation to the schema.
+    # Off by default — strict imposes closed-object/all-required constraints
+    # some providers reject, so only tools whose schemas are built for it
+    # (e.g. the runner's submit_output) opt in.
+    strict: bool = False
 
     def __post_init__(self) -> None:
         if self.identity_fields is None:
