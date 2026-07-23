@@ -25,7 +25,7 @@ from jig import (
     Usage,
     run_agent,
 )
-from jig.core.runner import SUBMIT_OUTPUT_TOOL
+from jig.core.runner import SUBMIT_OUTPUT_TOOL, _normalize_strict_schema
 from jig.core.types import (
     MemoryStore,
     Retriever,
@@ -561,7 +561,7 @@ class TestNativeModeHappyPath:
             "type": "json_schema",
             "json_schema": {
                 "name": "StrategyOutput",
-                "schema": StrategyOutput.model_json_schema(),
+                "schema": _normalize_strict_schema(StrategyOutput.model_json_schema()),
                 "strict": True,
             },
         }
@@ -845,6 +845,73 @@ class TestSubmitOutputStrictness:
         assert submit_def.parameters.get("additionalProperties") is False
 
 
+class _Leg(BaseModel):
+    pair: str
+    size: float = 1.0
+
+
+class _NestedOutput(BaseModel):
+    legs: list[_Leg]
+    label: str = ""
+
+
+class _OpenOutput(BaseModel):
+    model_config = {"extra": "allow"}
+
+    value: int
+
+
+class TestNormalizeStrictSchema:
+    """Strict decoders reject open or partially-required object nodes;
+    _normalize_strict_schema must close every level of the schema, not
+    just the root (PR 82 review)."""
+
+    def test_nested_defs_are_closed_and_fully_required(self):
+        schema = _normalize_strict_schema(_NestedOutput.model_json_schema())
+
+        assert schema["additionalProperties"] is False
+        assert schema["required"] == ["legs", "label"]
+        leg = schema["$defs"]["_Leg"]
+        assert leg["additionalProperties"] is False
+        assert leg["required"] == ["pair", "size"]
+
+    def test_explicit_additional_properties_true_is_overridden(self):
+        raw = _OpenOutput.model_json_schema()
+        assert raw.get("additionalProperties") is True
+
+        schema = _normalize_strict_schema(raw)
+        assert schema["additionalProperties"] is False
+
+    def test_input_schema_is_not_mutated(self):
+        raw = _NestedOutput.model_json_schema()
+        _normalize_strict_schema(raw)
+        assert raw == _NestedOutput.model_json_schema()
+
+    async def test_submit_output_tool_uses_normalized_schema(self):
+        llm = FakeLLM([_submit_response({"legs": [{"pair": "BTC"}]})])
+        await run_agent(_config(llm, output_schema=_NestedOutput), "go")
+
+        submit_def = next(
+            t for t in llm.calls[0].tools if t.name == SUBMIT_OUTPUT_TOOL
+        )
+        leg = submit_def.parameters["$defs"]["_Leg"]
+        assert leg["additionalProperties"] is False
+        assert leg["required"] == ["pair", "size"]
+
+    async def test_response_format_uses_normalized_schema(self):
+        llm = FakeNativeLLM([
+            _content_response({"legs": [{"pair": "BTC", "size": 2.0}]}),
+        ])
+        await run_agent(
+            _config(llm, output_schema=_NestedOutput, structured_output_mode="native"),
+            "go",
+        )
+
+        sent = llm.calls[0].response_format["json_schema"]["schema"]
+        assert sent["required"] == ["legs", "label"]
+        assert sent["$defs"]["_Leg"]["additionalProperties"] is False
+
+
 class TestTwoPhaseMode:
     """native_two_phase: working turns run unconstrained with tools; the
     first no-tool-call turn triggers one schema-constrained, tool-free
@@ -854,7 +921,7 @@ class TestTwoPhaseMode:
         "type": "json_schema",
         "json_schema": {
             "name": "StrategyOutput",
-            "schema": StrategyOutput.model_json_schema(),
+            "schema": _normalize_strict_schema(StrategyOutput.model_json_schema()),
             "strict": True,
         },
     }

@@ -238,13 +238,53 @@ def _validate_output_schema(schema: type) -> None:
         )
 
 
+def _normalize_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Close a JSON schema for strict decoding, recursively.
+
+    Strict decoders (OpenAI-style ``"strict": true`` on function calls and
+    ``json_schema`` response formats) reject any object node that permits
+    unknown keys or leaves a declared property optional.
+    ``model_json_schema()`` guarantees neither: nested ``$defs`` stay open
+    and defaulted fields are omitted from ``required``. Every object node
+    gets ``additionalProperties: false`` (overriding an explicit ``true``
+    from ``extra="allow"``) and a ``required`` listing every property.
+    A schema-valued ``additionalProperties`` (pydantic's ``dict[str, X]``)
+    is normalized in place rather than clobbered — backends that can't
+    decode it should fail loudly, not silently receive an empty-object
+    constraint.
+    """
+    out = dict(schema)
+    for key in ("$defs", "properties"):
+        value = out.get(key)
+        if isinstance(value, dict):
+            out[key] = {
+                name: _normalize_strict_schema(sub) if isinstance(sub, dict) else sub
+                for name, sub in value.items()
+            }
+    for key in ("items", "contains", "propertyNames", "not"):
+        if isinstance(out.get(key), dict):
+            out[key] = _normalize_strict_schema(out[key])
+    for key in ("anyOf", "oneOf", "allOf", "prefixItems"):
+        value = out.get(key)
+        if isinstance(value, list):
+            out[key] = [
+                _normalize_strict_schema(sub) if isinstance(sub, dict) else sub
+                for sub in value
+            ]
+    if out.get("type") == "object" or "properties" in out:
+        if isinstance(out.get("additionalProperties"), dict):
+            out["additionalProperties"] = _normalize_strict_schema(
+                out["additionalProperties"]
+            )
+        else:
+            out["additionalProperties"] = False
+        if "properties" in out:
+            out["required"] = list(out["properties"])
+    return out
+
+
 def _build_submit_output_tool(schema: type[BaseModel]) -> ToolDefinition:
-    parameters = schema.model_json_schema()
-    # Mirror _build_response_format's decode-time strictness on the tool
-    # channel: strict function calling needs a closed object schema, so
-    # inject additionalProperties here rather than relying on the caller's
-    # pydantic model config to have emitted it.
-    parameters.setdefault("additionalProperties", False)
+    parameters = _normalize_strict_schema(schema.model_json_schema())
     return ToolDefinition(
         name=SUBMIT_OUTPUT_TOOL,
         description=(
@@ -267,7 +307,7 @@ def _build_response_format(schema: type[BaseModel]) -> dict[str, Any]:
         "type": "json_schema",
         "json_schema": {
             "name": schema.__name__,
-            "schema": schema.model_json_schema(),
+            "schema": _normalize_strict_schema(schema.model_json_schema()),
             "strict": True,
         },
     }
