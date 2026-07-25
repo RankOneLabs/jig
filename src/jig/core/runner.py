@@ -37,6 +37,7 @@ from jig.core.types import (
     Message,
     Retriever,
     Role,
+    RunControl,
     Score,
     ScoreSource,
     ScoredResult,
@@ -160,6 +161,16 @@ class AgentConfig[T]:
     # both native modes require it.
     structured_output_mode: StructuredOutputMode = "legacy"
 
+    # --- Soft deadline (salvage) ---
+    # Wall-clock budget, in seconds, checked at the top of each loop
+    # iteration. Once elapsed time exceeds it, the runner stops granting
+    # working-tool turns — see the loop-top finalize trigger in run_agent,
+    # shared with RunControl.request_finalize (core/types.py). ``None``
+    # (default) disables the check entirely: bit-for-bit today's behavior.
+    # The hard ``asyncio.wait_for`` around the whole call remains the
+    # caller's backstop; this only stops *new* work from being accepted.
+    soft_deadline_s: float | None = None
+
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("AgentConfig.name must be non-empty.")
@@ -178,6 +189,10 @@ class AgentConfig[T]:
         if self.max_parse_retries < 0:
             raise ValueError(
                 f"max_parse_retries must be non-negative, got {self.max_parse_retries}."
+            )
+        if self.soft_deadline_s is not None and self.soft_deadline_s <= 0:
+            raise ValueError(
+                f"soft_deadline_s must be positive, got {self.soft_deadline_s}."
             )
         if self.structured_output_mode not in ("legacy", "native", "native_two_phase"):
             raise ValueError(
@@ -229,6 +244,13 @@ class AgentResult[T]:
     # when the runner gave up. Prefer this over string-matching
     # ``output`` for ``[agent terminated: ...]`` markers.
     error: AgentError | None = None
+    # Set when something requested an early finalize: either a tool via
+    # ``context.control.request_finalize(reason)`` or ``AgentConfig.
+    # soft_deadline_s`` elapsing. ``None`` when the run finished (or
+    # terminated) without either firing. Populated on success and error
+    # paths alike — the single ``AgentResult(`` construction site below
+    # always sets it.
+    finalize_reason: str | None = None
 
 
 def _validate_output_schema(schema: type) -> None:
@@ -700,12 +722,70 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
         # native_two_phase only: set when the model's first no-tool-call turn
         # has requested the schema-constrained, tool-free finalize call.
         finalize_pending = False
+        # Shared per-run channel: a tool can call
+        # context.control.request_finalize(reason) to tell the loop the rest
+        # of the run is pointless. One instance per run_agent call, threaded
+        # into every ToolExecutionContext below.
+        control = RunControl()
+        # Latched once either soft_deadline_s elapses or control.finalize_reason
+        # is set (checked at the top of each iteration below): no further
+        # working-tool turns are granted afterward, but the in-flight/finalize
+        # turn still completes. Never resets once True.
+        finalize_triggered = False
+        finalize_reason: str | None = None
 
         while True:
             if total_usage["llm_calls"] >= config.max_llm_calls:
                 agent_error = AgentMaxLLMCallsError(config.max_llm_calls)
                 final_output = f"[agent terminated: {agent_error}]"
                 break
+
+            # Soft-deadline / RunControl finalize trigger. Checked once per
+            # iteration, at the top, so the tool result from the turn that
+            # requested finalize (appended at the bottom of the previous
+            # iteration) is already in ``messages`` before the nudge below —
+            # the model sees the tool's own explanation of why the run is
+            # wrapping up. Every mode gets the reason in-band: the run is
+            # ending for a cause the model did not choose, and the salvaged
+            # final answer is only as good as the model's understanding of
+            # why it is being asked for now. Only the instruction differs,
+            # matching how each mode actually emits output — legacy calls
+            # submit_output (kept available by the tools= computation further
+            # down), the native modes emit schema-shaped content, plain text
+            # just answers. native_two_phase additionally jumps straight to
+            # its existing finalize_pending machinery, whose natural path
+            # below sends an equivalent instruction.
+            if not finalize_triggered:
+                reason = control.finalize_reason
+                if reason is None and config.soft_deadline_s is not None:
+                    if (time.time() - start) > config.soft_deadline_s:
+                        reason = "soft deadline exceeded"
+                if reason is not None:
+                    finalize_triggered = True
+                    finalize_reason = reason
+                    logger.info("finalize requested: %s", reason)
+                    if is_legacy_structured:
+                        instruction = (
+                            f"call `{SUBMIT_OUTPUT_TOOL}` now with your final answer."
+                        )
+                    elif is_native_structured or is_two_phase_structured:
+                        instruction = (
+                            "produce your final structured output now, matching "
+                            "the required schema."
+                        )
+                    else:
+                        instruction = "give your final answer now."
+                    messages.append(
+                        Message(
+                            role=Role.USER,
+                            content=(
+                                f"[system: {reason}. No further tool calls are "
+                                f"available — {instruction}]"
+                            ),
+                        )
+                    )
+                    if is_two_phase_structured and not finalize_pending:
+                        finalize_pending = True
 
             # Count every attempted round-trip so the cap applies to failures
             # too, not just successes. A flaky LLM would otherwise be able to
@@ -720,10 +800,21 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                 config.tracer, trace.id, SpanKind.LLM_CALL, "completion",
                 metadata={"model": _resolve_model_id(config.llm)},
             ) as llm_span:
+                if finalize_pending:
+                    turn_tools = None
+                elif finalize_triggered:
+                    # Legacy: submit_output only (extra_tools). Native,
+                    # native_two_phase (already finalize_pending by now), and
+                    # plain-text: extra_tools is empty, so this is None —
+                    # withholding all tools, letting the next no-tool-call
+                    # turn terminate.
+                    turn_tools = extra_tools or None
+                else:
+                    turn_tools = tools_for_llm
                 params = CompletionParams(
                     messages=messages,
                     system=system_message,
-                    tools=None if finalize_pending else tools_for_llm,
+                    tools=turn_tools,
                     response_format=(
                         finalize_response_format if finalize_pending
                         else response_format
@@ -1060,6 +1151,7 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                     parent_span_id=tool_span.parent_id,
                     tool_call_id=call.id,
                     metadata={"tool_name": call.name},
+                    control=control,
                 )
                 token = current_tool_context.set(tool_context)
                 try:
@@ -1169,4 +1261,5 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
         duration_ms=(time.time() - start) * 1000,
         parsed=parsed,
         error=agent_error,
+        finalize_reason=finalize_reason,
     )
