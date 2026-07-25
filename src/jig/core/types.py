@@ -414,6 +414,31 @@ class TraceContext:
         return cls(trace_id=tid, parent_span_id=pid)
 
 
+class RunControl:
+    """Mutable per-run channel from tool code back to the runner loop.
+
+    Deliberately not a dataclass: it exists to be mutated. One instance per
+    ``run_agent`` call, shared by every :class:`ToolExecutionContext` of
+    that run. A tool can call ``context.control.request_finalize(reason)``
+    to tell the runner the rest of the run is pointless — no further
+    working-tool turns are granted after that; only the in-flight/finalize
+    turn still completes. See ``core.runner.run_agent``'s loop-top check.
+    """
+
+    __slots__ = ("finalize_reason",)
+
+    def __init__(self) -> None:
+        self.finalize_reason: str | None = None
+
+    def request_finalize(self, reason: str) -> None:
+        """Request the run wrap up after the current turn.
+
+        First reason wins; later calls are no-ops (idempotent).
+        """
+        if self.finalize_reason is None:
+            self.finalize_reason = reason
+
+
 @dataclass(frozen=True, slots=True)
 class ToolExecutionContext:
     """Context available while Jig is executing a tool call."""
@@ -423,6 +448,10 @@ class ToolExecutionContext:
     parent_span_id: str | None
     tool_call_id: str
     metadata: dict[str, Any] | None = None
+    # None only in legacy/hand-built contexts (e.g. constructed directly by
+    # third-party callers that predate RunControl). The runner always
+    # supplies the run's shared RunControl instance here.
+    control: RunControl | None = None
 
 
 current_tool_context: ContextVar[ToolExecutionContext | None] = ContextVar(

@@ -54,7 +54,7 @@ from jig.core import (
 )
 from jig.core.pipeline import map_pipeline, run_pipeline
 from jig.core.runner import SUBMIT_OUTPUT_TOOL, AgentConfig, AgentResult, run_agent
-from jig.core.types import TraceContext
+from jig.core.types import RunControl, TraceContext
 from jig.dispatch import DispatchError, JobTimeoutError
 from jig.dispatch import listen as dispatch_listen
 from jig.dispatch import run as dispatch_run
@@ -148,6 +148,7 @@ __all__ = [
     "ToolResult",
     "TracingLogger",
     "Usage",
+    "RunControl",
     "current_tool_context",
     # Errors
     "AgentAmbiguousTurnError",
