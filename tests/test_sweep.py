@@ -1,6 +1,8 @@
 """Tests for jig.compare and jig.sweep experimentation primitives."""
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import datetime
 from typing import Any
 
@@ -16,6 +18,7 @@ from jig import (
     Score,
     ScoreSource,
     SweepResult,
+    SweepRunInfo,
     Usage,
     compare,
     sweep,
@@ -544,3 +547,373 @@ class TestCompareErrorIsolation:
         assert crash_run.result.error is not None
         good_run = next(r for r in result.runs if r.config_name == "good")
         assert good_run.result.error is None
+
+
+# --- sweep run-lifecycle callbacks (on_run_complete / on_run_error / on_run_abandoned) ---
+
+
+@pytest.mark.asyncio
+class TestSweepRunLifecycleCallbacks:
+    async def test_on_run_complete_fires_sync_with_correct_info(self):
+        seen: list[tuple[SweepRunInfo, Any]] = []
+
+        def on_complete(info, result):
+            seen.append((info, result))
+
+        result = await sweep(["c0", "c1"], [_config("a")], on_run_complete=on_complete)
+
+        assert len(seen) == 2
+        for info, res in seen:
+            assert isinstance(info, SweepRunInfo)
+            assert info.sweep_id == result.sweep_id
+            assert info.config_name == "a"
+            assert info.seed_index == 0
+            assert res.error is None
+        assert sorted(info.case_index for info, _ in seen) == [0, 1]
+        assert sorted(info.case for info, _ in seen) == ["c0", "c1"]
+
+    async def test_on_run_complete_fires_async(self):
+        seen: list[SweepRunInfo] = []
+
+        async def on_complete(info, result):
+            await asyncio.sleep(0)
+            seen.append(info)
+
+        await sweep(["c0"], [_config("a")], on_run_complete=on_complete)
+
+        assert len(seen) == 1
+        assert seen[0].config_name == "a"
+        assert seen[0].case_index == 0
+
+    async def test_on_run_error_fires_for_budget_exhaustion_sync(self):
+        """3 cases, concurrency=1, budget covers exactly one call — the
+        other two must each raise on_run_error with the JigBudgetError."""
+        from jig import BudgetedLLMClient, BudgetTracker
+
+        budget = BudgetTracker(limit_usd=0.001)
+        llm = _FakeLLM("ok", cost=0.001)
+        budgeted_llm = BudgetedLLMClient(inner=llm, budget=budget, estimate_cost_usd=0.001)
+        cfg = AgentConfig(
+            name="budget-cfg", description="x", system_prompt="x",
+            llm=budgeted_llm, store=_FakeMem(), retriever=None,
+            feedback=_FakeFB(), tracer=_FakeTracer(), tools=ToolRegistry(),
+        )
+
+        seen: list[tuple[SweepRunInfo, BaseException]] = []
+
+        def on_error(info, exc):
+            seen.append((info, exc))
+
+        result = await sweep(["c1", "c2", "c3"], [cfg], concurrency=1, on_run_error=on_error)
+
+        assert len(seen) == 2
+        errors = [r.result.error for r in result.runs if r.result.error is not None]
+        assert len(errors) == 2
+        for info, exc in seen:
+            assert isinstance(info, SweepRunInfo)
+            assert info.config_name == "budget-cfg"
+            assert isinstance(exc, Exception)
+
+    async def test_on_run_error_fires_for_infrastructure_error_async(self):
+        call_count = 0
+
+        class _FlakyLLM(LLMClient):
+            async def complete(self, params):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    raise RuntimeError("boom")
+                return LLMResponse(
+                    content="ok", tool_calls=None,
+                    usage=Usage(1, 1, cost=0.0), latency_ms=1.0, model="fake",
+                )
+
+        cfg = AgentConfig(
+            name="flaky", description="x", system_prompt="x", llm=_FlakyLLM(),
+            store=_FakeMem(), retriever=None, feedback=_FakeFB(), tracer=_FakeTracer(),
+            tools=ToolRegistry(),
+        )
+
+        seen: list[tuple[SweepRunInfo, BaseException]] = []
+
+        async def on_error(info, exc):
+            seen.append((info, exc))
+
+        await sweep(["c1"], [cfg], concurrency=1, on_run_error=on_error)
+
+        assert len(seen) == 1
+        info, exc = seen[0]
+        assert info.config_name == "flaky"
+        assert str(exc) == "boom"
+
+    async def test_warning_logged_on_run_error_even_without_callback(self, caplog):
+        """The forensic fix: the log level bump is unconditional, not
+        gated on a callback being registered."""
+        class _AlwaysFailsLLM(LLMClient):
+            async def complete(self, params):
+                raise RuntimeError("infra dead")
+
+        cfg = AgentConfig(
+            name="dies", description="x", system_prompt="x", llm=_AlwaysFailsLLM(),
+            store=_FakeMem(), retriever=None, feedback=_FakeFB(), tracer=_FakeTracer(),
+            tools=ToolRegistry(),
+        )
+
+        with caplog.at_level(logging.WARNING, logger="jig.sweep"):
+            result = await sweep(["c1"], [cfg])
+
+        assert result.runs[0].result.error is not None
+        records = [
+            r for r in caplog.records
+            if r.name == "jig.sweep" and r.levelno == logging.WARNING
+        ]
+        assert any("infrastructure error" in r.getMessage() for r in records), [
+            r.getMessage() for r in records
+        ]
+
+    async def test_compare_also_warns_on_run_error(self, caplog):
+        """compare() carried the identical silent-death pattern: a
+        pre-trace death left no spans and only a debug line. It gets no
+        callbacks in this PR, but the visibility fix applies there too —
+        otherwise "the forensic trap is fixed" would only be true for
+        one of the two public multi-run entry points."""
+        class _AlwaysFailsLLM(LLMClient):
+            async def complete(self, params):
+                raise RuntimeError("infra dead")
+
+        cfg = AgentConfig(
+            name="dies", description="x", system_prompt="x", llm=_AlwaysFailsLLM(),
+            store=_FakeMem(), retriever=None, feedback=_FakeFB(), tracer=_FakeTracer(),
+            tools=ToolRegistry(),
+        )
+
+        with caplog.at_level(logging.WARNING, logger="jig.sweep"):
+            result = await compare("probe", [cfg])
+
+        assert result.runs[0].result.error is not None
+        records = [
+            r for r in caplog.records
+            if r.name == "jig.sweep" and r.levelno == logging.WARNING
+        ]
+        assert any("compare config=dies" in r.getMessage() for r in records), [
+            r.getMessage() for r in records
+        ]
+
+    async def test_callback_exception_swallowed_sync_siblings_unaffected(self, caplog):
+        def bad_on_complete(info, result):
+            raise RuntimeError("callback bug")
+
+        with caplog.at_level(logging.WARNING, logger="jig.sweep"):
+            result = await sweep(
+                ["c0", "c1", "c2"], [_config("a")], on_run_complete=bad_on_complete,
+            )
+
+        assert len(result.runs) == 3
+        assert all(r.result.error is None for r in result.runs)
+        warnings = [
+            r for r in caplog.records
+            if r.name == "jig.sweep" and "callback raised" in r.getMessage()
+        ]
+        assert len(warnings) == 3
+
+    async def test_callback_exception_swallowed_async_siblings_unaffected(self, caplog):
+        async def bad_on_error(info, exc):
+            raise RuntimeError("async callback bug")
+
+        class _AlwaysFailsLLM(LLMClient):
+            async def complete(self, params):
+                raise RuntimeError("infra dead")
+
+        cfg = AgentConfig(
+            name="dies", description="x", system_prompt="x", llm=_AlwaysFailsLLM(),
+            store=_FakeMem(), retriever=None, feedback=_FakeFB(), tracer=_FakeTracer(),
+            tools=ToolRegistry(),
+        )
+
+        with caplog.at_level(logging.WARNING, logger="jig.sweep"):
+            result = await sweep(["c1"], [cfg], on_run_error=bad_on_error)
+
+        assert len(result.runs) == 1
+        assert result.runs[0].result.error is not None
+        warnings = [
+            r for r in caplog.records
+            if r.name == "jig.sweep" and "callback raised" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+
+
+@pytest.mark.asyncio
+class TestOnRunAbandoned:
+    async def test_never_scheduled_when_setup_fails_before_loop_starts(self):
+        """An invalid dispatch value makes _dispatch_listener raise before
+        any worker ever runs — every slot is abandoned as
+        never_scheduled, driven by a genuine setup failure rather than
+        monkeypatching internal state."""
+        seen: list[tuple[SweepRunInfo, str]] = []
+
+        def on_abandoned(info, reason):
+            seen.append((info, reason))
+
+        with pytest.raises(ValueError, match="Unknown dispatch backend"):
+            await sweep(
+                ["c0", "c1"], [_config("a")], dispatch="not-a-real-backend",
+                on_run_abandoned=on_abandoned,
+            )
+
+        assert len(seen) == 2
+        for info, reason in seen:
+            assert reason == "never_scheduled"
+            assert info.config_name == "a"
+        assert sorted(info.case_index for info, _ in seen) == [0, 1]
+
+    async def test_cancelled_vs_never_scheduled_under_real_cancellation(self):
+        """concurrency=1 against 4 cases: the in-flight slot is cancelled
+        mid run_agent (reason 'cancelled'); the rest never got a worker
+        turn at all (reason 'never_scheduled'). Driven by a real
+        asyncio.Task.cancel() against a run that's genuinely in flight —
+        not by faking internal state into an impossible configuration.
+        """
+        started = asyncio.Event()
+
+        class _SlowLLM(LLMClient):
+            async def complete(self, params):
+                started.set()
+                await asyncio.sleep(10)
+                raise AssertionError("should have been cancelled before this returns")
+
+        cfg = AgentConfig(
+            name="slow", description="x", system_prompt="x", llm=_SlowLLM(),
+            store=_FakeMem(), retriever=None, feedback=_FakeFB(), tracer=_FakeTracer(),
+            tools=ToolRegistry(),
+        )
+
+        seen: list[tuple[SweepRunInfo, str]] = []
+
+        def on_abandoned(info, reason):
+            seen.append((info, reason))
+
+        task = asyncio.create_task(
+            sweep(
+                ["c0", "c1", "c2", "c3"], [cfg], concurrency=1,
+                on_run_abandoned=on_abandoned,
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert len(seen) == 4
+        by_case = {info.case_index: reason for info, reason in seen}
+        assert by_case[0] == "cancelled"
+        assert by_case[1] == "never_scheduled"
+        assert by_case[2] == "never_scheduled"
+        assert by_case[3] == "never_scheduled"
+
+    async def test_normal_completion_never_fires_abandoned(self):
+        seen: list[tuple[SweepRunInfo, str]] = []
+
+        def on_abandoned(info, reason):
+            seen.append((info, reason))
+
+        await sweep(["c0", "c1"], [_config("a")], on_run_abandoned=on_abandoned)
+        assert seen == []
+
+
+# --- close_configs ---
+
+
+class _CloseCountingLLM(_FakeLLM):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.close_count = 0
+
+    async def aclose(self) -> None:
+        self.close_count += 1
+
+
+class _CloseCountingTracer(_FakeTracer):
+    def __init__(self) -> None:
+        self.close_count = 0
+
+    async def aclose(self) -> None:
+        self.close_count += 1
+
+
+def _closeable_config(name: str, llm: Any, tracer: Any) -> AgentConfig:
+    return AgentConfig(
+        name=name,
+        description=f"{name} agent",
+        system_prompt="be brief",
+        llm=llm,
+        store=_FakeMem(), retriever=None,
+        feedback=_FakeFB(),
+        tracer=tracer,
+        tools=ToolRegistry(),
+    )
+
+
+@pytest.mark.asyncio
+class TestCloseConfigs:
+    async def test_default_closes_nothing(self):
+        llm = _CloseCountingLLM("ok")
+        tracer = _CloseCountingTracer()
+        cfg = _closeable_config("a", llm, tracer)
+
+        await sweep(["c0"], [cfg])
+
+        assert llm.close_count == 0
+        assert tracer.close_count == 0
+
+    async def test_true_closes_every_config_resource(self):
+        llm = _CloseCountingLLM("ok")
+        tracer = _CloseCountingTracer()
+        cfg = _closeable_config("a", llm, tracer)
+
+        await sweep(["c0"], [cfg], close_configs=True)
+
+        assert llm.close_count == 1
+        assert tracer.close_count == 1
+
+    async def test_dedupes_shared_resources_across_with_derived_configs(self):
+        """The scenario the spec calls out explicitly: gecko calls
+        with_() per attempt and appends every derived copy to the
+        sweep's config list. Those copies share the same underlying
+        llm/tracer; close_configs=True must close each shared resource
+        exactly once, not once per config that references it."""
+        llm = _CloseCountingLLM("ok")
+        tracer = _CloseCountingTracer()
+        base = _closeable_config("base", llm, tracer)
+        variants = [base.with_(name=f"attempt-{i}") for i in range(5)]
+
+        await sweep(["c0"], variants, close_configs=True)
+
+        assert llm.close_count == 1
+        assert tracer.close_count == 1
+
+    async def test_one_resource_failing_to_close_does_not_block_others(self):
+        class _BoomLLM(_FakeLLM):
+            async def aclose(self) -> None:
+                raise RuntimeError("llm close boom")
+
+        llm = _BoomLLM("ok")
+        tracer = _CloseCountingTracer()
+        cfg = _closeable_config("a", llm, tracer)
+
+        result = await sweep(["c0"], [cfg], close_configs=True)  # must not raise
+
+        assert result.runs[0].result.error is None
+        assert tracer.close_count == 1
+
+    async def test_runs_even_when_sweep_setup_raises(self):
+        """Teardown happens in sweep()'s finally — a setup failure (bad
+        dispatch value) must not skip resource cleanup."""
+        llm = _CloseCountingLLM("ok")
+        tracer = _CloseCountingTracer()
+        cfg = _closeable_config("a", llm, tracer)
+
+        with pytest.raises(ValueError, match="Unknown dispatch backend"):
+            await sweep(["c0"], [cfg], dispatch="bogus", close_configs=True)
+
+        assert llm.close_count == 1
+        assert tracer.close_count == 1

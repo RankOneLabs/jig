@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -94,6 +95,44 @@ StructuredOutputMode = Literal["legacy", "native", "native_two_phase"]
 # want to short-circuit when we're confident the next call would fail
 # identically.
 _PERMANENT_LLM_STATUS_CODES = frozenset({400, 401, 403, 404, 422})
+
+# AgentConfig fields duck-typed as closeable resources. Order matches the
+# spec (llm, tracer, store, feedback, retriever); not all configs set
+# store/retriever, and not every LLMClient/TracingLogger/FeedbackLoop
+# implementation owns a closeable resource in the first place — the
+# aclose()/close() duck-type probe in _close_resource handles that.
+_CLOSEABLE_CONFIG_FIELDS = ("llm", "tracer", "store", "feedback", "retriever")
+
+
+async def _close_resource(resource: object) -> None:
+    """Best-effort close of a single duck-typed resource.
+
+    Prefers async ``aclose()`` over sync ``close()`` — the convention
+    already used by every LLM adapter in this codebase (anthropic.py,
+    openai.py, ollama.py, google.py, llm/dispatch.py all expose
+    ``aclose``). Awaits the result if it's awaitable either way (some
+    ``close()`` implementations, e.g. ``aiosqlite.Connection``, are
+    themselves coroutines). Logs and swallows any exception: one
+    resource failing to close must never stop the rest from being
+    attempted, and a caller tearing down N resources shouldn't have to
+    wrap each one in its own try/except.
+    """
+    close = getattr(resource, "aclose", None)
+    if not callable(close):
+        close = getattr(resource, "close", None)
+    if not callable(close):
+        return
+    try:
+        outcome = close()
+        if inspect.isawaitable(outcome):
+            await outcome
+    except Exception:
+        logger.warning(
+            "AgentConfig.aclose: %s.%s() raised",
+            type(resource).__name__,
+            getattr(close, "__name__", "close"),
+            exc_info=True,
+        )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -215,6 +254,14 @@ class AgentConfig[T]:
             raise ValueError(
                 f"feedback_limit must be a positive int, got {self.feedback_limit!r}."
             )
+        # Not a dataclass field (frozen dataclasses can still carry
+        # instance attributes outside their declared fields via
+        # object.__setattr__), and deliberately not one: dataclasses.replace()
+        # re-runs __post_init__ on every with_() derivative, so each
+        # derived config starts with its own fresh "not yet closed" state
+        # rather than inheriting the parent's. See aclose()'s docstring
+        # for why that's the right scope for this flag.
+        object.__setattr__(self, "_aclose_done", False)
 
     def with_(self, **overrides: Any) -> AgentConfig[T]:
         """Return a new config with the given fields replaced.
@@ -229,6 +276,43 @@ class AgentConfig[T]:
         ``__post_init__`` validation runs on the new instance.
         """
         return dataclasses.replace(self, **overrides)
+
+    async def aclose(self) -> None:
+        """Close every closeable resource this config owns: llm, tracer,
+        store, feedback, retriever. Duck-types ``aclose()``/``close()``
+        per resource, awaits the result if awaitable, and logs-and-
+        continues on a per-resource basis — one resource failing to
+        close never prevents the others from being attempted.
+
+        Not called automatically by ``run_agent``: configs are reused
+        across runs within a sweep, so closing on every run would break
+        any multi-case sweep. Ownership sits with the caller — a single
+        script calling this directly when it's done with a config, or
+        ``sweep(..., close_configs=True)`` for a whole config list.
+
+        **Idempotent for repeat calls on this instance**: a second
+        ``await cfg.aclose()`` on the same object is a no-op. That
+        idempotency is intentionally scoped to *this instance* and does
+        not extend across configs that share a resource — ``with_()``
+        derivatives (e.g. gecko deriving one config per attempt off a
+        shared ``llm``/``tracer``/``store``) each get their own fresh
+        "not yet closed" flag from ``__post_init__``, because a config
+        has no way to know another config was handed the same
+        underlying resource. Calling ``aclose()`` independently on
+        several configs that share a resource will still invoke that
+        resource's own ``close()``/``aclose()`` once per config;
+        de-duplicating across a whole config list so a shared resource
+        closes exactly once is what ``sweep(close_configs=True)`` does
+        instead of looping ``cfg.aclose()`` per config — see
+        ``jig.sweep._close_all_configs``.
+        """
+        if self._aclose_done:  # type: ignore[attr-defined]
+            return
+        object.__setattr__(self, "_aclose_done", True)
+        for field_name in _CLOSEABLE_CONFIG_FIELDS:
+            resource = getattr(self, field_name)
+            if resource is not None:
+                await _close_resource(resource)
 
 
 @dataclass

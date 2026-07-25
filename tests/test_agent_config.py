@@ -325,3 +325,113 @@ class TestFailSoftAutoGrade:
         assert result.error is None
         assert result.scores is None
         feedback.store_result.assert_not_awaited()
+
+
+class TestAclose:
+    """AgentConfig.aclose() — duck-typed teardown of llm/tracer/store/
+    feedback/retriever. Resources here are bare AsyncMocks rather than the
+    functional fakes used elsewhere: aclose() only ever probes for an
+    aclose/close attribute and calls it, so it never touches any of the
+    other methods a real LLMClient/TracingLogger/etc. would need."""
+
+    async def test_closes_every_resource(self):
+        llm, tracer, store, feedback, retriever = (
+            AsyncMock(), AsyncMock(), AsyncMock(), AsyncMock(), AsyncMock()
+        )
+        config = _base(llm=llm, tracer=tracer, store=store, feedback=feedback, retriever=retriever)
+        await config.aclose()
+        llm.aclose.assert_awaited_once()
+        tracer.aclose.assert_awaited_once()
+        store.aclose.assert_awaited_once()
+        feedback.aclose.assert_awaited_once()
+        retriever.aclose.assert_awaited_once()
+
+    async def test_none_optional_resources_are_skipped_without_error(self):
+        config = _base(store=None, retriever=None)
+        await config.aclose()  # must not raise (llm/tracer/feedback are the default fakes)
+
+    async def test_second_call_on_same_instance_is_a_noop(self):
+        """Idempotent: repeat awaits on the same config don't re-invoke
+        a resource's own aclose()."""
+        llm = AsyncMock()
+        config = _base(llm=llm)
+        await config.aclose()
+        await config.aclose()
+        await config.aclose()
+        llm.aclose.assert_awaited_once()
+
+    async def test_with_derived_config_gets_its_own_fresh_close_state(self):
+        """A with_() derivative doesn't inherit the parent's "already
+        closed" flag — each config instance tracks its own aclose() call
+        independently. (Cross-config de-duplication of a *shared*
+        resource is sweep(close_configs=True)'s job, not this method's —
+        see test_sweep.py's TestCloseConfigs.)
+        """
+        llm = AsyncMock()
+        base = _base(llm=llm)
+        await base.aclose()
+        llm.aclose.assert_awaited_once()
+
+        variant = base.with_(name="variant")
+        await variant.aclose()
+        # variant.aclose() had never run on *this* instance before, so it
+        # re-invokes the (shared) llm's aclose — two configs, two calls.
+        assert llm.aclose.await_count == 2
+
+    async def test_one_resource_failing_to_close_does_not_block_the_others(self):
+        llm = AsyncMock()
+        llm.aclose.side_effect = RuntimeError("llm close boom")
+        tracer = AsyncMock()
+        store = AsyncMock()
+        config = _base(llm=llm, tracer=tracer, store=store)
+
+        await config.aclose()  # must not raise
+
+        llm.aclose.assert_awaited_once()
+        tracer.aclose.assert_awaited_once()
+        store.aclose.assert_awaited_once()
+
+    async def test_logs_warning_on_resource_close_failure(self, caplog):
+        import logging as _logging
+
+        llm = AsyncMock()
+        llm.aclose.side_effect = RuntimeError("llm close boom")
+        config = _base(llm=llm)
+
+        with caplog.at_level(_logging.WARNING, logger="jig.core.runner"):
+            await config.aclose()
+
+        messages = [r.getMessage() for r in caplog.records if r.name == "jig.core.runner"]
+        assert any("aclose" in m for m in messages), messages
+
+    async def test_prefers_async_aclose_over_sync_close(self):
+        calls: list[str] = []
+
+        class _Both:
+            def close(self):
+                calls.append("close")
+
+            async def aclose(self):
+                calls.append("aclose")
+
+        resource = _Both()
+        config = _base(store=resource)
+        await config.aclose()
+        assert calls == ["aclose"]
+
+    async def test_falls_back_to_sync_close_when_aclose_absent(self):
+        class _SyncOnly:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        resource = _SyncOnly()
+        config = _base(store=resource)
+        await config.aclose()
+        assert resource.closed is True
+
+    async def test_resource_without_close_or_aclose_is_skipped(self):
+        config = _base(store=object())
+        await config.aclose()  # must not raise

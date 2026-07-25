@@ -13,16 +13,23 @@ land in phase 8 — for now, concurrency is local via ``asyncio.Semaphore``.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import uuid
 from collections import Counter
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from jig.core.errors import AgentBudgetError, AgentError, JigBudgetError
-from jig.core.runner import AgentConfig, AgentResult, run_agent
+from jig.core.runner import (
+    AgentConfig,
+    AgentResult,
+    _CLOSEABLE_CONFIG_FIELDS,
+    _close_resource,
+    run_agent,
+)
 from jig.core.types import EvalCase
 
 logger = logging.getLogger(__name__)
@@ -201,6 +208,81 @@ class SweepResult[T]:
         return out
 
 
+@dataclass(frozen=True, slots=True)
+class SweepRunInfo:
+    """Identifies one (case, config, seed) slot for the run-lifecycle
+    callbacks below. Passed to ``on_run_complete``/``on_run_error``/
+    ``on_run_abandoned`` so a callback can correlate the notification
+    with its own bookkeeping without re-deriving the slot's coordinates.
+
+    ``case`` is typed ``EvalCase | str`` rather than just ``EvalCase``:
+    ``sweep()`` accepts plain strings as cases (see ``_case_to_input``),
+    and this carries the case exactly as passed in, unconverted.
+    """
+
+    sweep_id: str
+    case_index: int
+    case: EvalCase | str
+    config_name: str
+    seed_index: int
+
+
+async def _fire_callback(
+    hook: Callable[..., Awaitable[None] | None] | None,
+    *args: Any,
+    hook_name: str,
+) -> None:
+    """Best-effort invocation of a sweep run-lifecycle callback.
+
+    Sync or async; awaited either way. Exceptions raised by the hook are
+    logged at warning and swallowed — bookkeeping (this is purely a
+    notification, not part of the run's outcome) must never take down
+    the worker processing it or any sibling run.
+    """
+    if hook is None:
+        return
+    try:
+        outcome = hook(*args)
+        if inspect.isawaitable(outcome):
+            await outcome
+    except Exception:
+        logger.warning("sweep %s callback raised", hook_name, exc_info=True)
+
+
+async def _close_all_configs(configs: Sequence[AgentConfig[Any]]) -> None:
+    """Close every distinct resource across every config in ``configs``,
+    each exactly once.
+
+    ``AgentConfig.with_()`` derivatives commonly share the same
+    underlying ``llm``/``tracer``/``store``/``feedback``/``retriever``
+    object — e.g. gecko derives one config per attempt off a shared base
+    config and appends every copy to the sweep's config list. Looping
+    ``await cfg.aclose()`` once per config would invoke a shared
+    resource's own ``aclose()``/``close()`` once per config that
+    references it; not every resource tolerates (or silently no-ops on)
+    a repeat close. ``AgentConfig.aclose()`` itself can't fix this — two
+    separate config *instances* have no way to know they share a
+    resource with each other; that de-duplication has to happen here,
+    across the whole list, before anything is closed.
+
+    Each config is also marked closed as it is collected — before
+    anything is actually closed, matching ``AgentConfig.aclose()``'s own
+    ordering. Without that, ``close_configs=True`` would close every
+    resource while leaving every config still claiming it had not been
+    closed, so a later ``await cfg.aclose()`` would re-close precisely
+    the shared resources this de-duplication exists to protect.
+    """
+    seen: dict[int, object] = {}
+    for cfg in configs:
+        object.__setattr__(cfg, "_aclose_done", True)
+        for field_name in _CLOSEABLE_CONFIG_FIELDS:
+            resource = getattr(cfg, field_name)
+            if resource is not None:
+                seen.setdefault(id(resource), resource)
+    for resource in seen.values():
+        await _close_resource(resource)
+
+
 def _case_to_input(case: EvalCase | str) -> str:
     return case if isinstance(case, str) else case.input
 
@@ -293,13 +375,19 @@ async def compare[T](
         async with sem:
             try:
                 result = await run_agent(cfg, input)
+            # warning, not debug, for the same reason as the sweep worker
+            # loop below: a run that dies pre-trace produces no spans, so
+            # a debug-level line is the only evidence it ever ran, and it
+            # is invisible at default log levels. compare() gets no
+            # callbacks in this PR — only the visibility fix, since the
+            # silent-death trap is identical here.
             except JigBudgetError as exc:
-                logger.debug(
+                logger.warning(
                     "compare config=%s budget exhausted: %s", cfg.name, exc
                 )
                 result = _budget_error_result(exc)
             except Exception as exc:
-                logger.debug(
+                logger.warning(
                     "compare config=%s infrastructure error: %s", cfg.name, exc
                 )
                 result = _infra_error_result(exc)
@@ -322,6 +410,10 @@ async def sweep[T](
     sweep_id: str | None = None,
     dispatch: str | None = None,
     seeds: int = 1,
+    on_run_complete: Callable[[SweepRunInfo, AgentResult[T]], Awaitable[None] | None] | None = None,
+    on_run_error: Callable[[SweepRunInfo, BaseException], Awaitable[None] | None] | None = None,
+    on_run_abandoned: Callable[[SweepRunInfo, str], Awaitable[None] | None] | None = None,
+    close_configs: bool = False,
 ) -> SweepResult[T]:
     """Run every (case, config) pair; return a SweepResult for rollup.
 
@@ -350,6 +442,43 @@ async def sweep[T](
     set) and are preserved alongside successes — workers continue
     after isolated per-case failures. Only global setup errors (dispatch
     startup, cancellation) abort the sweep without partial results.
+
+    **Run-lifecycle callbacks** (all optional, default ``None``; sync or
+    async, awaited either way; a raising callback is logged at warning
+    and swallowed — bookkeeping must never kill a sibling run):
+
+    - ``on_run_complete(info, result)`` — fires once ``run_agent``
+      returns successfully for a slot (before that slot's result is
+      recorded).
+    - ``on_run_error(info, exc)`` — fires whenever ``run_agent`` raises
+      ``JigBudgetError`` or any other ``Exception`` for a slot, i.e. on
+      exactly the two paths that today are downgraded to a synthesized
+      error :class:`SweepRun` (see below). Regardless of whether a
+      callback is registered, the log line for both of those paths is
+      now emitted at **warning** (previously ``debug``) — a run that
+      dies before opening a trace used to leave no spans and no visible
+      log line; this is the unconditional fix for that, not something
+      callers opt into.
+    - ``on_run_abandoned(info, reason)`` — fires from this function's
+      ``finally`` for every slot that is still unfilled once the sweep
+      exits, whether by normal completion, exception, or cancellation.
+      ``reason`` is ``"cancelled"`` when a worker had already dequeued
+      that slot's work item (and so was inside ``run_agent``, or
+      between it and recording the result) when a ``BaseException`` —
+      in practice ``asyncio.CancelledError`` from the sweep itself being
+      cancelled — cut the run short; ``"never_scheduled"`` when no
+      worker ever got to it at all (still queued, still with the
+      producer, or the whole worker loop never started because e.g.
+      ``dispatch`` failed to set up). A normal, uninterrupted sweep
+      fills every slot, so this never fires.
+
+    ``close_configs=True`` closes every distinct resource (``llm``,
+    ``tracer``, ``store``, ``feedback``, ``retriever``) across every
+    config in ``configs`` — each exactly once, even when several configs
+    share the same underlying object (the common ``with_()`` pattern) —
+    once the sweep is done, success or not. Default ``False`` closes
+    nothing, same as today. See :func:`_close_all_configs` for why this
+    doesn't simply loop ``cfg.aclose()``.
     """
     if concurrency <= 0:
         raise ValueError(f"concurrency must be positive, got {concurrency}")
@@ -369,6 +498,22 @@ async def sweep[T](
     # measurable spike).
     total = len(cases) * len(configs) * seeds
     runs: list[SweepRun[T] | None] = [None] * total
+    # Slot -> (case_index, config_index, seed_index, case, config), built
+    # once up front so the (case, config, seed) mapping is available for
+    # on_run_abandoned even for a slot whose coroutine never got a queue.get()
+    # turn — including the total-setup-failure case where the worker loop
+    # never starts at all (e.g. an invalid `dispatch` value). Also the single
+    # source of truth _produce() enqueues from, so the two can't disagree.
+    slot_meta: list[tuple[int, int, int, EvalCase | str, AgentConfig[T]]] = []
+    for ci, case in enumerate(cases):
+        for gi, cfg in enumerate(configs):
+            for si in range(seeds):
+                slot_meta.append((ci, gi, si, case, cfg))
+    # Slots a worker has dequeued (and so is either inside run_agent or
+    # between it and recording the result) — distinguishes "cancelled"
+    # (started, never finished) from "never_scheduled" (no worker ever
+    # reached it) among slots left unfilled in the finally below.
+    started: set[int] = set()
     # Bound the queue to ``concurrency`` so the producer can't run
     # ahead of the workers and pre-materialize every coroutine.
     queue: asyncio.Queue[tuple[int, int, int, int, EvalCase | str, AgentConfig[T]] | None] = (
@@ -383,6 +528,14 @@ async def sweep[T](
                 queue.task_done()
                 return
             slot, case_idx, cfg_idx, seed_idx, case, cfg = item
+            started.add(slot)
+            info = SweepRunInfo(
+                sweep_id=resolved_sweep_id,
+                case_index=case_idx,
+                case=case,
+                config_name=cfg.name,
+                seed_index=seed_idx,
+            )
             try:
                 input_text = _case_to_input(case)
                 logger.debug(
@@ -392,17 +545,26 @@ async def sweep[T](
                 try:
                     result = await run_agent(cfg, input_text)
                 except JigBudgetError as exc:
-                    logger.debug(
+                    # Unconditional debug->warning bump (not gated on a
+                    # callback being registered): a run that dies before
+                    # opening a trace used to leave no spans and no visible
+                    # log line, which cost a full forensic session more than
+                    # once. See on_run_error below for the callback.
+                    logger.warning(
                         "sweep worker %d slot=%d cfg=%s budget exhausted: %s",
                         worker_id, slot, cfg.name, exc,
                     )
                     result = _budget_error_result(exc)
+                    await _fire_callback(on_run_error, info, exc, hook_name="on_run_error")
                 except Exception as exc:
-                    logger.debug(
+                    logger.warning(
                         "sweep worker %d slot=%d cfg=%s infrastructure error: %s",
                         worker_id, slot, cfg.name, exc,
                     )
                     result = _infra_error_result(exc)
+                    await _fire_callback(on_run_error, info, exc, hook_name="on_run_error")
+                else:
+                    await _fire_callback(on_run_complete, info, result, hook_name="on_run_complete")
                 logger.debug(
                     "sweep worker %d completed slot=%d cfg=%s",
                     worker_id, slot, cfg.name,
@@ -419,36 +581,53 @@ async def sweep[T](
                 queue.task_done()
 
     async def _produce() -> None:
-        slot = 0
-        for ci, case in enumerate(cases):
-            for gi, cfg in enumerate(configs):
-                for si in range(seeds):
-                    await queue.put((slot, ci, gi, si, case, cfg))
-                    slot += 1
+        for slot, (ci, gi, si, case, cfg) in enumerate(slot_meta):
+            await queue.put((slot, ci, gi, si, case, cfg))
         for _ in range(n_workers):
             await queue.put(None)
 
-    async with _dispatch_listener(dispatch):
-        # Cap the worker count at the actual workload — spinning up
-        # more workers than items just wastes scheduler overhead.
-        n_workers = min(concurrency, total) if total > 0 else 0
-        logger.debug(
-            "sweep starting: total=%d concurrency=%d workers=%d cases=%d configs=%d seeds=%d",
-            total, concurrency, n_workers, len(cases), len(configs), seeds,
-        )
-        worker_tasks = [asyncio.create_task(_worker(i)) for i in range(n_workers)]
-        producer_task = asyncio.create_task(_produce())
-        try:
-            await asyncio.gather(producer_task, *worker_tasks)
-        except BaseException:
-            # On cancellation or unexpected worker/producer failure, cancel
-            # everything so neither a blocked producer nor idle workers outlive
-            # the sweep call.
-            producer_task.cancel()
-            for w in worker_tasks:
-                w.cancel()
-            await asyncio.gather(producer_task, *worker_tasks, return_exceptions=True)
-            raise
+    try:
+        async with _dispatch_listener(dispatch):
+            # Cap the worker count at the actual workload — spinning up
+            # more workers than items just wastes scheduler overhead.
+            n_workers = min(concurrency, total) if total > 0 else 0
+            logger.debug(
+                "sweep starting: total=%d concurrency=%d workers=%d cases=%d configs=%d seeds=%d",
+                total, concurrency, n_workers, len(cases), len(configs), seeds,
+            )
+            worker_tasks = [asyncio.create_task(_worker(i)) for i in range(n_workers)]
+            producer_task = asyncio.create_task(_produce())
+            try:
+                await asyncio.gather(producer_task, *worker_tasks)
+            except BaseException:
+                # On cancellation or unexpected worker/producer failure, cancel
+                # everything so neither a blocked producer nor idle workers outlive
+                # the sweep call.
+                producer_task.cancel()
+                for w in worker_tasks:
+                    w.cancel()
+                await asyncio.gather(producer_task, *worker_tasks, return_exceptions=True)
+                raise
+    finally:
+        # Runs regardless of how the sweep exits — normal completion,
+        # an exception from setup (e.g. a bad `dispatch` value, in which
+        # case the loop above never started and every slot is unfilled),
+        # or cancellation partway through. A normal sweep fills every
+        # slot, so this is a no-op unless something above didn't finish.
+        for slot, (ci, gi, si, case, cfg) in enumerate(slot_meta):
+            if runs[slot] is not None:
+                continue
+            reason = "cancelled" if slot in started else "never_scheduled"
+            info = SweepRunInfo(
+                sweep_id=resolved_sweep_id,
+                case_index=ci,
+                case=case,
+                config_name=cfg.name,
+                seed_index=si,
+            )
+            await _fire_callback(on_run_abandoned, info, reason, hook_name="on_run_abandoned")
+        if close_configs:
+            await _close_all_configs(configs)
 
     # Filter None slots (empty sweep) and cast for type checker.
     return SweepResult(
