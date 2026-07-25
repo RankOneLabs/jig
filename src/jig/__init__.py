@@ -95,6 +95,7 @@ from jig.sweep import (
     CompareRun,
     SweepResult,
     SweepRun,
+    SweepRunInfo,
     compare,
     sweep,
 )
@@ -194,6 +195,7 @@ __all__ = [
     "RegressionReport",
     "SweepResult",
     "SweepRun",
+    "SweepRunInfo",
     "WinRate",
     "compare",
     "detect_regressions",
