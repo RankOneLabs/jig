@@ -56,6 +56,12 @@ def _call(arguments: dict[str, Any] | None = None) -> ToolCall:
     return ToolCall(id="call-1", name="dispatched", arguments=arguments or {})
 
 
+async def _unreachable_run(fn_ref, payload=None, **kwargs):
+    """Stand-in for jig.dispatch.run in tests asserting a pre-dispatch
+    rejection: reaching it at all is the failure."""
+    raise AssertionError("dispatch_run was entered but should not have been")
+
+
 # --- §1.1 Tool.on_dispatch_result -------------------------------------------
 
 
@@ -210,6 +216,57 @@ class TestOnDispatchErrorHook:
         assert "timed out" in result.error
         assert len(tool.seen) == 1
         assert isinstance(tool.seen[0], asyncio.TimeoutError)
+
+    async def test_does_not_fire_when_gate_hangs_and_nothing_shipped(self, monkeypatch):
+        """on_dispatch_error is a *post*-dispatch hook. pre_dispatch runs
+        inside the same wait_for as the dispatch itself, so a hung gate
+        surfaces as asyncio.TimeoutError — but nothing shipped, so the
+        hook must stay silent. The error still reaches the model."""
+        dispatch_calls = 0
+
+        async def fake_run(fn_ref, payload=None, **kwargs):
+            nonlocal dispatch_calls
+            dispatch_calls += 1
+            return {"unreachable": True}
+
+        monkeypatch.setattr(jig.dispatch, "run", fake_run)
+
+        async def hanging_gate(arguments, context):
+            await asyncio.Future()  # never resolves
+
+        class _HangingGateTool(_OnErrorTool):
+            pre_dispatch = staticmethod(hanging_gate)
+
+        tool = _HangingGateTool()
+        result = await ToolRegistry([tool], execute_timeout=0.01).execute(_call())
+
+        assert dispatch_calls == 0
+        assert "timed out" in result.error
+        assert tool.seen == []
+
+    async def test_does_not_fire_when_payload_shaping_raises(self, monkeypatch):
+        """Same guard, non-timeout branch: a dispatch_payload_extra that
+        raises anything other than JigToolError lands in the generic
+        handler with nothing shipped."""
+        dispatch_calls = 0
+
+        async def fake_run(fn_ref, payload=None, **kwargs):
+            nonlocal dispatch_calls
+            dispatch_calls += 1
+            return {"unreachable": True}
+
+        monkeypatch.setattr(jig.dispatch, "run", fake_run)
+
+        class _BadPayloadTool(_OnErrorTool):
+            def dispatch_payload_extra(self, context, arguments):
+                raise ValueError("cannot shape payload")
+
+        tool = _BadPayloadTool()
+        result = await ToolRegistry([tool]).execute(_call())
+
+        assert dispatch_calls == 0
+        assert result.error == "ValueError: cannot shape payload"
+        assert tool.seen == []
 
     async def test_fires_on_generic_exception(self, monkeypatch):
         async def boom(fn_ref, payload=None, **kwargs):
@@ -402,6 +459,28 @@ class TestJigToolErrorPhaseWiring:
         )
         assert result.output == ""
         assert result.error == "serialize: bad output shape"
+
+    async def test_empty_message_fallback_does_not_repeat_the_phase(self, monkeypatch):
+        """The phase is already the error's prefix, so the no-message
+        fallback must not restate it ("gate: gate raised without ...")."""
+        class _Tool(_DispatchedTool):
+            def pre_dispatch(self, arguments, context):
+                raise JigToolError("", tool_name="dispatched", phase="gate")
+
+        monkeypatch.setattr(jig.dispatch, "run", _unreachable_run)
+        result = await ToolRegistry([_Tool()]).execute(_call())
+
+        assert result.error == "gate: tool raised without message"
+
+    async def test_local_execute_empty_message_fallback(self):
+        class _Tool(_LocalToolRaisingJigToolError):
+            async def execute(self, arguments):
+                raise JigToolError("", tool_name="local", phase="serialize")
+
+        result = await ToolRegistry([_Tool()]).execute(
+            ToolCall(id="c", name="local", arguments={}),
+        )
+        assert result.error == "serialize: tool raised without message"
 
     async def test_dispatch_payload_extra_raising_jig_tool_error_carries_phase(self, monkeypatch):
         """dispatch_payload_extra (not pre_dispatch) raising JigToolError

@@ -20,11 +20,6 @@ from jig.core.types import (
 
 logger = logging.getLogger(__name__)
 
-# Reserved key a dispatched result Mapping can carry to report a business
-# (not infrastructure) failure without raising — see jig.dispatch.tool_error
-# and the coercion block in _execute_dispatched.
-_TOOL_ERROR_KEY = "__jig_tool_error__"
-
 
 class ToolRegistry:
     def __init__(
@@ -108,7 +103,9 @@ class ToolRegistry:
                 # a future validate_arguments pass) can tag *where* in the
                 # lifecycle it failed; the phase rides along in the
                 # model-visible error instead of being lost in the log.
-                msg = str(e) or f"{e.phase} raised without message"
+                # No phase in the fallback: it is already the error's
+                # prefix, so repeating it reads "gate: gate raised ...".
+                msg = str(e) or "tool raised without message"
                 error = f"{e.phase}: {msg}"
                 logger.warning("tool.execute error name=%s err=%s", call.name, error, exc_info=True)
                 return ToolResult(call_id=call.id, output="", error=error)
@@ -167,7 +164,12 @@ class ToolRegistry:
         max_tool_calls. Imported lazily to avoid a runtime dep on httpx
         for callers who don't use dispatch.
         """
-        from jig.dispatch import DispatchBusinessError, DispatchError, run as dispatch_run
+        from jig.dispatch import (
+            TOOL_ERROR_KEY,
+            DispatchBusinessError,
+            DispatchError,
+            run as dispatch_run,
+        )
 
         kwargs: dict[str, object] = {}
         if self._dispatch_url is not None:
@@ -193,8 +195,20 @@ class ToolRegistry:
         if callable(on_submitted):
             kwargs["on_submitted"] = on_submitted
 
+        # Everything inside _gate_and_dispatch runs under the wait_for
+        # below, including the two pre-dispatch steps — so a *hung* gate or
+        # payload shaper surfaces as asyncio.TimeoutError even though
+        # nothing shipped. on_dispatch_error is a post-dispatch hook, so it
+        # must not fire on that path; this records whether dispatch_run was
+        # actually entered. (The timeout's model-visible message is left
+        # as-is: it predates these hooks and is pinned by
+        # test_async_dispatch_hook_timeout_cancels_without_dispatch.)
+        dispatch_entered = False
+
         try:
             async def _gate_and_dispatch() -> object:
+                nonlocal dispatch_entered
+
                 # pre_dispatch runs first and can reject the call before
                 # dispatch_payload_extra ever builds a payload or
                 # anything ships to smithers.
@@ -208,6 +222,7 @@ class ToolRegistry:
                     payload.update(
                         {key: value for key, value in extra.items() if value is not None}
                     )
+                dispatch_entered = True
                 return await dispatch_run(
                     tool.dispatch_fn_ref,  # type: ignore[arg-type]
                     payload,
@@ -228,13 +243,15 @@ class ToolRegistry:
             # dispatched, so on_dispatch_error — a *post*-dispatch hook —
             # deliberately does not fire here; the ToolResult.error is
             # the only signal, same as a gate rejection has always been.
-            msg = str(e) or f"{e.phase} raised without message"
+            # No phase in the fallback: it is already the error's prefix.
+            msg = str(e) or "tool raised without message"
             error = f"{e.phase}: {msg}"
             logger.warning("tool.execute %s error name=%s err=%s", e.phase, call.name, error)
             return ToolResult(call_id=call.id, output="", error=error)
         except asyncio.TimeoutError as e:
             logger.warning("tool.execute dispatch timeout name=%s after=%ss", call.name, self._execute_timeout)
-            await _fire_dispatch_error_hook(tool, e, tool_context)
+            if dispatch_entered:
+                await _fire_dispatch_error_hook(tool, e, tool_context)
             return ToolResult(
                 call_id=call.id,
                 output="",
@@ -244,17 +261,22 @@ class ToolRegistry:
             msg = str(e)
             error = f"{type(e).__name__}: {msg}" if msg else f"{type(e).__name__}: tool raised without message"
             logger.warning("tool.execute dispatch error name=%s err=%s", call.name, error)
-            await _fire_dispatch_error_hook(tool, e, tool_context)
+            if dispatch_entered:
+                await _fire_dispatch_error_hook(tool, e, tool_context)
             return ToolResult(
                 call_id=call.id,
                 output="",
                 error=error,
             )
         except Exception as e:
+            # Same guard as the timeout branch, for the same reason: a
+            # dispatch_payload_extra that raises anything other than
+            # JigToolError lands here with nothing shipped.
             msg = str(e)
             error = f"{type(e).__name__}: {msg}" if msg else f"{type(e).__name__}: tool raised without message"
             logger.warning("tool.execute dispatch error name=%s err=%s", call.name, error, exc_info=True)
-            await _fire_dispatch_error_hook(tool, e, tool_context)
+            if dispatch_entered:
+                await _fire_dispatch_error_hook(tool, e, tool_context)
             return ToolResult(call_id=call.id, output="", error=error)
 
         # A dispatched function has, up to this point, exactly two
@@ -270,9 +292,9 @@ class ToolRegistry:
         # hook implementation sees every dispatch failure the same way,
         # and on_dispatch_result never observes a
         # ``__jig_tool_error__``-bearing result.
-        if isinstance(result, Mapping) and _TOOL_ERROR_KEY in result:
-            err_payload = result[_TOOL_ERROR_KEY]
-            rest = {key: value for key, value in result.items() if key != _TOOL_ERROR_KEY}
+        if isinstance(result, Mapping) and TOOL_ERROR_KEY in result:
+            err_payload = result[TOOL_ERROR_KEY]
+            rest = {key: value for key, value in result.items() if key != TOOL_ERROR_KEY}
             if isinstance(err_payload, str):
                 message = err_payload
             elif isinstance(err_payload, Mapping):

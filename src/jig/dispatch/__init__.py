@@ -21,6 +21,14 @@ from jig.dispatch.client import (
 )
 
 
+#: Reserved result key marking a dispatched function's business failure.
+#: Single source of truth for the wire contract — ``tool_error`` writes it
+#: and ``ToolRegistry._execute_dispatched`` reads it, so it must not be
+#: spelled as a literal in either place. Exported for worker-side tooling
+#: that needs to recognize the shape without importing the registry.
+TOOL_ERROR_KEY = "__jig_tool_error__"
+
+
 def tool_error(message: str, **payload: object) -> dict:
     """Return value for a dispatched function whose business outcome failed.
 
@@ -41,7 +49,7 @@ def tool_error(message: str, **payload: object) -> dict:
     reconciliation hook sees this the same way it sees a timeout or a
     submission failure.
     """
-    return {"__jig_tool_error__": message, **payload}
+    return {TOOL_ERROR_KEY: message, **payload}
 
 
 async def listen(**kwargs):
@@ -81,6 +89,7 @@ __all__ = [
     "DispatchError",
     "JobTimeoutError",
     "ListenerError",
+    "TOOL_ERROR_KEY",
     "aclose",
     "listen",
     "run",
