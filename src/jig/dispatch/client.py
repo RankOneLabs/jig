@@ -70,6 +70,34 @@ class JobTimeoutError(DispatchError):
         self.timeout_seconds = timeout_seconds
 
 
+class DispatchBusinessError(JigError):
+    """A dispatched function ran to completion and reported its own
+    domain-level failure via the reserved ``__jig_tool_error__`` result
+    key (see :func:`jig.dispatch.tool_error`).
+
+    Deliberately **not** a :class:`DispatchError` subclass: ``DispatchError``
+    and :class:`JobTimeoutError` mean the job itself never produced a
+    result (submission failed, the worker crashed, the poll timed out).
+    This means the opposite — the job returned normally and the *business
+    outcome* it reports is a failure. ``ToolRegistry`` synthesizes this
+    exception so both kinds can flow through the same
+    ``Tool.on_dispatch_error`` hook (a single reconciliation
+    implementation can handle both), while
+    ``isinstance(error, DispatchBusinessError)`` lets a consumer branch on
+    which one actually happened — exactly the distinction gecko's attempt
+    reconciliation needs between "the study never ran" and "the study ran
+    and failed".
+    """
+
+    def __init__(self, message: str, *, payload: dict[str, Any]):
+        super().__init__(message)
+        # The sibling fields the worker attached alongside the reserved
+        # key (e.g. a partial summary) — same dict ``ToolResult.output``
+        # is built from, so a consumer that wants more than the message
+        # doesn't have to re-parse JSON.
+        self.payload = payload
+
+
 @dataclass
 class _PollConfig:
     """Knobs for the polling loop — tests override these to run fast."""

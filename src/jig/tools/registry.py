@@ -8,6 +8,7 @@ import math
 from collections.abc import Mapping
 from typing import Any
 
+from jig.core.errors import JigToolError
 from jig.core.types import (
     Tool,
     ToolCall,
@@ -18,6 +19,11 @@ from jig.core.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Reserved key a dispatched result Mapping can carry to report a business
+# (not infrastructure) failure without raising — see jig.dispatch.tool_error
+# and the coercion block in _execute_dispatched.
+_TOOL_ERROR_KEY = "__jig_tool_error__"
 
 
 class ToolRegistry:
@@ -97,6 +103,15 @@ class ToolRegistry:
                     output="",
                     error=f"TimeoutError: Tool {call.name} timed out after {self._execute_timeout}s",
                 )
+            except JigToolError as e:
+                # Caught ahead of the generic handler below so a tool (or
+                # a future validate_arguments pass) can tag *where* in the
+                # lifecycle it failed; the phase rides along in the
+                # model-visible error instead of being lost in the log.
+                msg = str(e) or f"{e.phase} raised without message"
+                error = f"{e.phase}: {msg}"
+                logger.warning("tool.execute error name=%s err=%s", call.name, error, exc_info=True)
+                return ToolResult(call_id=call.id, output="", error=error)
             except Exception as e:
                 msg = str(e)
                 error = f"{type(e).__name__}: {msg}" if msg else f"{type(e).__name__}: tool raised without message"
@@ -104,6 +119,39 @@ class ToolRegistry:
                 return ToolResult(call_id=call.id, output="", error=error)
         finally:
             current_tool_context.reset(token)
+
+    async def _pre_dispatch(
+        self,
+        tool: Tool,
+        call: ToolCall,
+        tool_context: ToolExecutionContext | None,
+    ) -> None:
+        """Explicit pre-dispatch gate: duck-typed ``Tool.pre_dispatch``,
+        called before ``dispatch_payload_extra`` so a tool no longer has
+        to smuggle gating logic into payload shaping. Sync or async;
+        absent hook is a no-op.
+
+        Any exception raised here — including a tool-raised
+        ``JigToolError`` with its own explicit ``phase`` — is normalized
+        to a ``JigToolError``, defaulting to ``phase="gate"`` when the
+        tool didn't pick one, so ``_execute_dispatched``'s single
+        ``JigToolError`` handler formats the model-visible error the
+        same way regardless of which pre-dispatch step rejected the call.
+        """
+        pre_dispatch = getattr(tool, "pre_dispatch", None)
+        if not callable(pre_dispatch):
+            return
+        try:
+            outcome = _call_context_hook(
+                pre_dispatch, tool_context=tool_context, arguments=call.arguments,
+            )
+            if inspect.isawaitable(outcome):
+                await outcome
+        except JigToolError:
+            raise
+        except Exception as e:
+            msg = str(e) or "pre_dispatch raised without message"
+            raise JigToolError(msg, tool_name=call.name, phase="gate") from e
 
     async def _execute_dispatched(
         self,
@@ -119,7 +167,7 @@ class ToolRegistry:
         max_tool_calls. Imported lazily to avoid a runtime dep on httpx
         for callers who don't use dispatch.
         """
-        from jig.dispatch import DispatchError, run as dispatch_run
+        from jig.dispatch import DispatchBusinessError, DispatchError, run as dispatch_run
 
         kwargs: dict[str, object] = {}
         if self._dispatch_url is not None:
@@ -147,6 +195,11 @@ class ToolRegistry:
 
         try:
             async def _gate_and_dispatch() -> object:
+                # pre_dispatch runs first and can reject the call before
+                # dispatch_payload_extra ever builds a payload or
+                # anything ships to smithers.
+                await self._pre_dispatch(tool, call, tool_context)
+
                 payload = dict(call.arguments)
                 extra = self._dispatch_payload_extra(tool, call, tool_context)
                 if inspect.isawaitable(extra):
@@ -168,8 +221,20 @@ class ToolRegistry:
                 )
             else:
                 result = await _gate_and_dispatch()
-        except asyncio.TimeoutError:
+        except JigToolError as e:
+            # Raised by pre_dispatch (normalized to phase="gate" there
+            # unless the tool picked a different phase itself) or by a
+            # tool's own dispatch_payload_extra. Either way nothing was
+            # dispatched, so on_dispatch_error — a *post*-dispatch hook —
+            # deliberately does not fire here; the ToolResult.error is
+            # the only signal, same as a gate rejection has always been.
+            msg = str(e) or f"{e.phase} raised without message"
+            error = f"{e.phase}: {msg}"
+            logger.warning("tool.execute %s error name=%s err=%s", e.phase, call.name, error)
+            return ToolResult(call_id=call.id, output="", error=error)
+        except asyncio.TimeoutError as e:
             logger.warning("tool.execute dispatch timeout name=%s after=%ss", call.name, self._execute_timeout)
+            await _fire_dispatch_error_hook(tool, e, tool_context)
             return ToolResult(
                 call_id=call.id,
                 output="",
@@ -179,6 +244,7 @@ class ToolRegistry:
             msg = str(e)
             error = f"{type(e).__name__}: {msg}" if msg else f"{type(e).__name__}: tool raised without message"
             logger.warning("tool.execute dispatch error name=%s err=%s", call.name, error)
+            await _fire_dispatch_error_hook(tool, e, tool_context)
             return ToolResult(
                 call_id=call.id,
                 output="",
@@ -188,7 +254,63 @@ class ToolRegistry:
             msg = str(e)
             error = f"{type(e).__name__}: {msg}" if msg else f"{type(e).__name__}: tool raised without message"
             logger.warning("tool.execute dispatch error name=%s err=%s", call.name, error, exc_info=True)
+            await _fire_dispatch_error_hook(tool, e, tool_context)
             return ToolResult(call_id=call.id, output="", error=error)
+
+        # A dispatched function has, up to this point, exactly two
+        # outcomes: return (this branch) or raise (caught above). The
+        # reserved-key business-failure check below adds a third: the
+        # worker ran to completion but is reporting its own domain-level
+        # failure (jig.dispatch.tool_error). It is checked here, on the
+        # *raw* result, before on_dispatch_result fires — a business
+        # failure is not a success to reconcile, so it must never reach
+        # that hook. Instead it is synthesized into a
+        # DispatchBusinessError and routed through on_dispatch_error,
+        # exactly like a DispatchError or a timeout, so one reconciliation
+        # hook implementation sees every dispatch failure the same way,
+        # and on_dispatch_result never observes a
+        # ``__jig_tool_error__``-bearing result.
+        if isinstance(result, Mapping) and _TOOL_ERROR_KEY in result:
+            err_payload = result[_TOOL_ERROR_KEY]
+            rest = {key: value for key, value in result.items() if key != _TOOL_ERROR_KEY}
+            if isinstance(err_payload, str):
+                message = err_payload
+            elif isinstance(err_payload, Mapping):
+                message = str(err_payload.get("message", err_payload))
+            else:
+                message = str(err_payload)
+            logger.warning("tool.execute dispatch business_error name=%s err=%s", call.name, message)
+            await _fire_dispatch_error_hook(
+                tool, DispatchBusinessError(message, payload=rest), tool_context,
+            )
+            if rest:
+                try:
+                    output = json.dumps(rest)
+                except (TypeError, ValueError):
+                    output = str(rest)
+            else:
+                output = ""
+            return ToolResult(call_id=call.id, output=output, error=message)
+
+        on_dispatch_result = getattr(tool, "on_dispatch_result", None)
+        if callable(on_dispatch_result):
+            # Runs outside the execute_timeout wait_for above: that
+            # budget is for the remote job, and local reconciliation
+            # (e.g. persisting a completion row) must not be clipped by
+            # it. Unlike on_dispatch_submitted, exceptions here are NOT
+            # swallowed — a failed reconciliation means downstream state
+            # is unrecorded, and the model must not proceed as if the
+            # result were usable.
+            try:
+                replacement = on_dispatch_result(result, tool_context)
+                if inspect.isawaitable(replacement):
+                    replacement = await replacement
+                if replacement is not None:
+                    result = replacement
+            except Exception as e:
+                msg = str(e) or "on_dispatch_result raised without message"
+                logger.warning("tool.on_dispatch_result error name=%s err=%s", call.name, msg)
+                return ToolResult(call_id=call.id, output="", error=f"{type(e).__name__}: {msg}")
 
         # Workers can return any JSON-serializable shape; coerce to string
         # so the agent loop's Message(role=TOOL) content is always a string.
@@ -210,44 +332,88 @@ class ToolRegistry:
         dispatch_payload_extra = getattr(tool, "dispatch_payload_extra", None)
         if not callable(dispatch_payload_extra):
             return {}
-
-        sig = inspect.signature(dispatch_payload_extra)
-        params = sig.parameters
-        has_var_kwargs = any(
-            param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+        return _call_context_hook(
+            dispatch_payload_extra, tool_context=tool_context, arguments=call.arguments,
         )
 
-        positional: list[object] = []
-        kwargs: dict[str, object] = {}
-        for name, param in params.items():
-            if param.kind in (
-                inspect.Parameter.VAR_KEYWORD,
-                inspect.Parameter.VAR_POSITIONAL,
-            ):
-                continue
 
-            if name in ("context", "tool_context", "ctx"):
-                value: object = tool_context
-            elif name in ("arguments", "args"):
-                value = call.arguments
-            else:
-                continue
+def _call_context_hook(
+    fn: Any,
+    *,
+    tool_context: ToolExecutionContext | None,
+    arguments: dict[str, Any] | None,
+) -> Any:
+    """Call a duck-typed hook whose signature may name its parameters
+    ``context``/``tool_context``/``ctx`` and ``arguments``/``args``, in
+    either order, positional-only or keyword, or take none at all.
+    Shared by ``dispatch_payload_extra`` and ``pre_dispatch`` so hook
+    authors don't have to match jig's exact parameter names or order.
 
-            if param.kind == inspect.Parameter.POSITIONAL_ONLY:
-                positional.append(value)
-            else:
-                kwargs[name] = value
+    Does not await the result — some callers (``dispatch_payload_extra``)
+    defer that to their own caller, so this only performs the call and
+    lets ``inspect.isawaitable`` be checked at each call site.
+    """
+    sig = inspect.signature(fn)
+    params = sig.parameters
+    has_var_kwargs = any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+    )
 
-        if has_var_kwargs:
-            kwargs.setdefault("context", tool_context)
-            kwargs.setdefault("arguments", call.arguments)
+    positional: list[object] = []
+    kwargs: dict[str, object] = {}
+    for name, param in params.items():
+        if param.kind in (
+            inspect.Parameter.VAR_KEYWORD,
+            inspect.Parameter.VAR_POSITIONAL,
+        ):
+            continue
 
-        if positional or kwargs:
-            extra = dispatch_payload_extra(*positional, **kwargs)
-        elif not params:
-            extra = dispatch_payload_extra()
+        if name in ("context", "tool_context", "ctx"):
+            value: object = tool_context
+        elif name in ("arguments", "args"):
+            value = arguments
         else:
-            # Unrecognized single-param signature; assume it wants context.
-            extra = dispatch_payload_extra(tool_context)
+            continue
 
-        return extra
+        if param.kind == inspect.Parameter.POSITIONAL_ONLY:
+            positional.append(value)
+        else:
+            kwargs[name] = value
+
+    if has_var_kwargs:
+        kwargs.setdefault("context", tool_context)
+        kwargs.setdefault("arguments", arguments)
+
+    if positional or kwargs:
+        return fn(*positional, **kwargs)
+    if not params:
+        return fn()
+    # Unrecognized single-param signature; assume it wants context.
+    return fn(tool_context)
+
+
+async def _fire_dispatch_error_hook(
+    tool: Tool, error: BaseException, tool_context: ToolExecutionContext | None,
+) -> None:
+    """Best-effort invocation of ``Tool.on_dispatch_error``.
+
+    Shared by every dispatch-failure branch in ``_execute_dispatched``:
+    the timeout, ``DispatchError``, generic-exception, and business-
+    failure (``__jig_tool_error__``) cases all funnel through here. Sync
+    or async hook, awaited either way. Hook exceptions are logged and
+    swallowed — the error ``ToolResult`` already being returned to the
+    model is the signal regardless of whether a hook ran; a buggy hook
+    must not mask or replace the original dispatch failure.
+    """
+    hook = getattr(tool, "on_dispatch_error", None)
+    if not callable(hook):
+        return
+    try:
+        outcome = hook(error, tool_context)
+        if inspect.isawaitable(outcome):
+            await outcome
+    except Exception:
+        logger.warning(
+            "tool.on_dispatch_error hook raised; original error was %s: %s",
+            type(error).__name__, error, exc_info=True,
+        )

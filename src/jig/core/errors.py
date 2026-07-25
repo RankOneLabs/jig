@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-ToolErrorPhase = Literal["schema", "execute", "serialize"]
+ToolErrorPhase = Literal["schema", "execute", "serialize", "gate", "dispatch"]
 
 
 class JigError(Exception):
@@ -89,9 +89,17 @@ class JigToolError(JigError):
 
     ``phase`` marks *where* in the tool lifecycle the error occurred:
     ``"schema"`` (arg validation before execute), ``"execute"`` (the
-    tool's own code), or ``"serialize"`` (encoding the result back).
-    The ``Literal`` typing keeps the contract honest at the type-checker
+    tool's own code), ``"serialize"`` (encoding the result back),
+    ``"gate"`` (a ``Tool.pre_dispatch`` rejection, before a dispatched
+    call ships), or ``"dispatch"`` (a dispatch-payload-shaping failure —
+    e.g. ``dispatch_payload_extra`` — before the job ships). The
+    ``Literal`` typing keeps the contract honest at the type-checker
     level without adding runtime overhead.
+
+    ``ToolRegistry.execute()`` and ``_execute_dispatched`` both catch
+    this ahead of their generic ``except Exception`` handler and format
+    the model-visible error as ``f"{phase}: {message}"`` so the phase
+    reaches the model, not just the log.
     """
 
     def __init__(

@@ -172,6 +172,13 @@ class TestJigToolError:
         for phase in ("schema", "execute", "serialize"):
             JigToolError("x", tool_name="t", phase=phase)
 
+    def test_phase_accepts_gate_and_dispatch(self):
+        # Added for jig lifecycle-hooks PR 1a (Tool.pre_dispatch): "gate"
+        # is a pre_dispatch rejection, "dispatch" a dispatch-payload-shaping
+        # failure — both before a dispatched call ships.
+        for phase in ("gate", "dispatch"):
+            JigToolError("x", tool_name="t", phase=phase)
+
 
 class TestAgentErrorCategories:
     """Each subclass should have a stable, distinct category tag."""

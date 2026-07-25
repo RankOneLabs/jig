@@ -118,4 +118,67 @@ the active tool execution context to the dispatch client as
 Tools can also add payload fields by overriding
 `dispatch_payload_extra(context, arguments)`.
 
+## Tool lifecycle hooks
+
+A dispatched tool can observe and intervene at four points. All are
+duck-typed — define the method to opt in, omit it and nothing changes.
+
+| hook | when | raising |
+|---|---|---|
+| `pre_dispatch(arguments, context)` | before `dispatch_payload_extra`, before anything ships | rejects the call; message becomes `ToolResult.error` prefixed `gate:` |
+| `on_dispatch_submitted(job_id)` | after the job is accepted, before the terminal wait | logged and swallowed |
+| `on_dispatch_result(result, context)` | after the job returns successfully | becomes `ToolResult.error` — **not** swallowed |
+| `on_dispatch_error(error, context)` | after the job fails | logged and swallowed |
+
+`pre_dispatch`, `on_dispatch_result`, and `on_dispatch_error` may be sync
+or async; the registry awaits an awaitable return. `on_dispatch_submitted`
+is called synchronously by the dispatch client and its return value is
+never awaited, so defining it `async` silently does nothing.
+
+`pre_dispatch` shares `dispatch_payload_extra`'s flexible calling
+convention: its parameters may be named `context`/`tool_context`/`ctx` and
+`arguments`/`args`, in either order, or omitted entirely. The other three
+take fixed positional arguments as shown.
+
+`on_dispatch_result` receives the **raw** worker return value, not the
+string `ToolResult.output` is coerced from — the hook exists precisely
+because that coercion loses structure. Return `None` to pass the result
+through, or a value to replace it. It runs *outside* the registry's
+`execute_timeout`: that budget belongs to the remote job, and local
+reconciliation must not be clipped by it. Its exceptions are deliberately
+not swallowed — if reconciliation failed, downstream state is unrecorded
+and the model must not proceed as though the result were usable.
+
+`on_dispatch_error` fires for every way a dispatched call can fail after
+shipping: `DispatchError`, `JobTimeoutError`, `asyncio.TimeoutError`, any
+other exception, and business failures (below). It does **not** fire for a
+`pre_dispatch` rejection — nothing was dispatched — nor when
+`on_dispatch_result` itself raises, which is a reconciliation failure
+rather than a dispatch failure.
+
+### Business failures
+
+A dispatched function that runs to completion but whose *outcome* failed
+has no way to say so by returning: any return is a success, and raising
+loses the partial payload. `jig.dispatch.tool_error` reserves a key for it:
+
+```python
+from jig.dispatch import tool_error
+
+def run_study(**kwargs):
+    ...
+    return tool_error("no trades generated", trials=200, best_sharpe=None)
+```
+
+The registry converts this into `ToolResult.error` (the message) while the
+sibling fields survive into `ToolResult.output`, and synthesizes a
+`DispatchBusinessError` through `on_dispatch_error` so one reconciliation
+implementation handles every failure mode. `DispatchBusinessError` is
+deliberately **not** a `DispatchError` subclass: `DispatchError` means the
+job never produced a result, this means it did and the result is a
+failure. Branch on `isinstance` when that distinction matters.
+
+`on_dispatch_result` never sees a business failure — it is a success hook,
+and a business failure is not a success.
+
 [smithers]: https://github.com/rankonelabs/smithers
