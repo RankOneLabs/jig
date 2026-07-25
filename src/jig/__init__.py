@@ -55,10 +55,11 @@ from jig.core import (
 from jig.core.pipeline import map_pipeline, run_pipeline
 from jig.core.runner import SUBMIT_OUTPUT_TOOL, AgentConfig, AgentResult, run_agent
 from jig.core.types import RunControl, TraceContext
-from jig.dispatch import DispatchError, JobTimeoutError
+from jig.dispatch import DispatchBusinessError, DispatchError, JobTimeoutError
 from jig.dispatch import listen as dispatch_listen
 from jig.dispatch import run as dispatch_run
 from jig.dispatch import stop as dispatch_stop
+from jig.dispatch import tool_error as dispatch_tool_error
 from jig.feedback import (
     CommitteeJudge,
     NullFeedbackLoop,
@@ -200,12 +201,14 @@ __all__ = [
     "sweep",
     "win_rate",
     # Dispatch
+    "DispatchBusinessError",
     "DispatchError",
     "JobTimeoutError",
     "TraceContext",
     "dispatch_listen",
     "dispatch_run",
     "dispatch_stop",
+    "dispatch_tool_error",
     # Replay
     "ReplayError",
     "ReplayConfigMissingError",
