@@ -765,23 +765,30 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                     finalize_reason = reason
                     logger.info("finalize requested: %s", reason)
                     if is_legacy_structured:
+                        # Not "no further tool calls": submit_output is still
+                        # granted below, and telling the model its tools are
+                        # gone while asking it to call one invites a plain-text
+                        # reply — which in legacy mode is no structured output
+                        # at all, i.e. exactly the salvage this path exists for.
+                        availability = (
+                            f"only `{SUBMIT_OUTPUT_TOOL}` remains available"
+                        )
                         instruction = (
                             f"call `{SUBMIT_OUTPUT_TOOL}` now with your final answer."
                         )
                     elif is_native_structured or is_two_phase_structured:
+                        availability = "no further tool calls are available"
                         instruction = (
                             "produce your final structured output now, matching "
                             "the required schema."
                         )
                     else:
+                        availability = "no further tool calls are available"
                         instruction = "give your final answer now."
                     messages.append(
                         Message(
                             role=Role.USER,
-                            content=(
-                                f"[system: {reason}. No further tool calls are "
-                                f"available — {instruction}]"
-                            ),
+                            content=f"[system: {reason}. {availability} — {instruction}]",
                         )
                     )
                     if is_two_phase_structured and not finalize_pending:

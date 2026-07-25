@@ -355,6 +355,15 @@ class TestFinalizeAcrossModes:
         )
         assert tool_result_idx < nudge_idx
 
+        # The nudge must not claim tools are gone while asking for a tool call:
+        # submit_output IS still offered (asserted above), and a model that
+        # believes otherwise answers in plain text — which in legacy mode is no
+        # structured output at all. The tools= computation and the sentence
+        # describing it have to agree; this pins the sentence.
+        nudge = finalize_messages[nudge_idx].content
+        assert "no further tool calls are available" not in nudge.lower()
+        assert f"only `{SUBMIT_OUTPUT_TOOL}` remains available" in nudge
+
     async def test_plain_text_mode(self):
         """No output_schema at all: withholding tools is what ends the run,
         but the model still gets told why so its final answer accounts for
@@ -372,11 +381,14 @@ class TestFinalizeAcrossModes:
         assert result.error is None
         assert result.finalize_reason == "done"
         assert llm.calls[1].tools is None
-        assert any(
-            m.role == Role.USER and "done" in m.content
+        nudge = next(
+            m.content for m in llm.calls[1].messages
+            if m.role == Role.USER and "done" in m.content
             and "final answer" in m.content
-            for m in llm.calls[1].messages
         )
+        # Here the claim is true — tools really are withheld (asserted above).
+        # The legacy counterpart deliberately says something different.
+        assert "no further tool calls are available" in nudge.lower()
 
     async def test_native_mode(self):
         tool = _FinalizeTool()
@@ -402,11 +414,13 @@ class TestFinalizeAcrossModes:
         assert llm.calls[1].response_format is not None
         # The reason reaches the model, not just the log and AgentResult: the
         # run is ending for a cause the model did not choose.
-        assert any(
-            m.role == Role.USER and "done" in m.content
+        nudge = next(
+            m.content for m in llm.calls[1].messages
+            if m.role == Role.USER and "done" in m.content
             and "structured output" in m.content
-            for m in llm.calls[1].messages
         )
+        # True here (tools withheld above); the legacy nudge says otherwise.
+        assert "no further tool calls are available" in nudge.lower()
 
     async def test_native_two_phase_mode(self):
         tool = _FinalizeTool()
@@ -440,11 +454,12 @@ class TestFinalizeAcrossModes:
         # its own instruction, so the triggered path must too. This is the
         # mode gecko's sweep runs in, where the reason ("attempt concluded,
         # submit kind='stopped'") is the whole point of the request.
-        assert any(
-            m.role == Role.USER and "done" in m.content
+        nudge = next(
+            m.content for m in llm.calls[1].messages
+            if m.role == Role.USER and "done" in m.content
             and "structured output" in m.content
-            for m in llm.calls[1].messages
         )
+        assert "no further tool calls are available" in nudge.lower()
 
 
 class TestFinalizeLogging:
