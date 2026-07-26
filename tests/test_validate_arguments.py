@@ -276,3 +276,70 @@ async def test_import_error_when_jsonschema_missing_is_actionable(monkeypatch):
 
     with pytest.raises(ImportError, match=r"jig\[validate\]"):
         ToolRegistry([tool], validate_arguments=True)
+
+
+# --- a broken tool schema must not take the agent loop down -----------------
+
+
+class _DanglingRefTool(Tool):
+    """Tool whose schema $refs a definition that does not exist. Registers
+    fine: Draft202012Validator resolves refs lazily, and check_schema()
+    passes a dangling $ref as syntactically valid JSON Schema — so this
+    only detonates at validation time, inside execute()."""
+
+    def __init__(self) -> None:
+        self.executed_with: list[dict[str, Any]] = []
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="dangling",
+            description="d",
+            parameters={"type": "object", "properties": {"n": {"$ref": "#/$defs/Missing"}}},
+        )
+
+    async def execute(self, args: dict[str, Any]) -> str:
+        self.executed_with.append(args)
+        return "ran"
+
+
+async def test_broken_schema_fails_open_and_still_runs_the_tool(caplog):
+    """A validator that raises says nothing about whether the *arguments*
+    are valid — the tool's schema is what's broken, and the model cannot
+    fix that. So validation is skipped for the call and the tool runs
+    exactly as it would with validate_arguments=False, keeping the promise
+    that enabling this opt-in flag never breaks a tool that worked without
+    it. Failing closed would hand the model an unfixable error to retry
+    against, which is the terminal trap §1.5 exists to prevent.
+    """
+    tool = _DanglingRefTool()
+    registry = ToolRegistry([tool], validate_arguments=True)
+
+    with caplog.at_level("WARNING"):
+        result = await registry.execute(_call("dangling", {"n": 1}))
+
+    # Did not raise out of execute(), and did not swallow the call either.
+    assert result.error is None
+    assert result.output == "ran"
+    assert tool.executed_with == [{"n": 1}]
+
+    # Loud for operators, invisible to the model: the model-visible
+    # ToolResult carries no hint of the failure, the log does.
+    assert "schema_validation_failed" in caplog.text
+    assert "dangling" in caplog.text
+
+
+async def test_broken_schema_does_not_disable_validation_for_other_tools():
+    """The fail-open path is scoped to the offending tool, not the registry
+    — a sibling tool with a sound schema still rejects bad arguments."""
+    broken, sound = _DanglingRefTool(), _LocalTool()
+    registry = ToolRegistry([broken, sound], validate_arguments=True)
+
+    assert (await registry.execute(_call("dangling", {"n": 1}))).output == "ran"
+
+    result = await registry.execute(_call("local", {"max_drawdown_pct": -30}))
+    assert result.error == (
+        "schema: -30 is less than or equal to the minimum of 0 "
+        "at max_drawdown_pct — Never negative."
+    )
+    assert sound.executed_with == []

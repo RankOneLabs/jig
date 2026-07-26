@@ -105,10 +105,35 @@ class ToolRegistry:
         # prefix already baked in also sidesteps double-prefixing it.
         validator = self._schema_validators.get(call.name)
         if validator is not None:
-            error = _schema_validation_error(validator, call.arguments)
-            if error is not None:
-                logger.debug("tool.execute schema_invalid name=%s err=%s", call.name, error)
-                return ToolResult(call_id=call.id, output="", error=error)
+            try:
+                error = _schema_validation_error(validator, call.arguments)
+            except Exception:
+                # Fail *open*: the validator itself broke, which says nothing
+                # about whether call.arguments are valid. The common cause is
+                # a tool schema with an unresolvable $ref — note that
+                # register() cannot catch that, because Draft202012Validator
+                # resolves refs lazily at validation time and check_schema()
+                # passes a dangling $ref as syntactically valid JSON Schema.
+                #
+                # Skipping validation here keeps the promise this opt-in flag
+                # has to make: turning it on never breaks a tool that worked
+                # with it off. Failing closed would instead hand the model an
+                # error it cannot act on — its arguments may be fine, the
+                # tool's schema is what's broken — so it would retry and burn
+                # the run down, which is the terminal-trap shape this feature
+                # exists to prevent, arriving from the other direction.
+                # Loud in the log for operators, invisible to the model.
+                logger.warning(
+                    "tool.execute schema_validation_failed name=%s — validating "
+                    "this tool's arguments is disabled for this call; check its "
+                    "parameters schema",
+                    call.name,
+                    exc_info=True,
+                )
+            else:
+                if error is not None:
+                    logger.debug("tool.execute schema_invalid name=%s err=%s", call.name, error)
+                    return ToolResult(call_id=call.id, output="", error=error)
 
         tool_context = current_tool_context.get()
         token = current_tool_context.set(tool_context)
