@@ -44,8 +44,17 @@ honcho = ["honcho>=0.1"]
 zep = ["zep-python>=2.0"]
 callback = ["aiohttp>=3.9"]
 eval = ["pyyaml>=6.0"]
-all = ["jig[anthropic,openai,openrouter,google,ollama,honcho,zep,callback,eval]"]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pyyaml>=6.0"]
+# 4.18 is the referencing-rewrite boundary (jsonschema<4.18 vendors its own
+# $ref resolution; >=4.18 delegates to the separate `referencing` package).
+validate = ["jsonschema>=4.18"]
+all = ["jig[anthropic,openai,openrouter,google,ollama,honcho,zep,callback,eval,validate]"]
+# jsonschema is here for the same reason pyyaml is: it is an optional
+# extra's runtime dependency (validate / eval respectively) that the test
+# suite needs regardless, because tests/test_validate_arguments.py guards on
+# `importorskip("jsonschema")`. Without it in dev, CI's `uv sync --extra dev
+# --extra callback` would skip that module wholesale and the feature would
+# ship with zero coverage while the run still read green.
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pyyaml>=6.0", "jsonschema>=4.18"]
 
 [build-system]
 requires = ["hatchling"]
