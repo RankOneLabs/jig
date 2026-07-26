@@ -27,6 +27,7 @@ class ToolRegistry:
         tools: list[Tool] | None = None,
         execute_timeout: float | None = None,
         dispatch_url: str | None = None,
+        validate_arguments: bool = False,
     ):
         """Register tools for agent use.
 
@@ -34,12 +35,30 @@ class ToolRegistry:
         any registered tool with ``dispatch=True``. Leave as None to
         use :func:`jig.dispatch.run`'s default (the ``JIG_DISPATCH_URL``
         environment variable, or ``http://localhost:8900``).
+
+        ``validate_arguments`` opt-in: when True, ``call.arguments`` is
+        checked against ``tool.definition.parameters`` (its JSON Schema)
+        before local execute *and* before ``pre_dispatch``, so a
+        malformed call fails fast with a model-visible message instead
+        of failing deep in execution — worst case, on a dispatched
+        worker, where it's a terminal trap under an attempt state
+        machine. Default False; existing registries are unaffected and
+        never pay the ``jsonschema`` import cost. See
+        :func:`_build_schema_validator`.
         """
         if execute_timeout is not None and execute_timeout <= 0:
             raise ValueError(f"execute_timeout must be > 0 when provided, got {execute_timeout}")
         self._tools: dict[str, Tool] = {}
         self._execute_timeout = execute_timeout
         self._dispatch_url = dispatch_url
+        self._validate_arguments = validate_arguments
+        # Keyed by tool name, built once at register() time rather than
+        # per execute() call, so repeated calls to the same tool reuse one
+        # validator (and the $ref resolutions it caches as it goes).
+        # Construction itself is lazy — Draft202012Validator does not walk
+        # or resolve the schema up front; a dangling $ref constructs fine
+        # and only raises at validation time.
+        self._schema_validators: dict[str, Any] = {}
         for tool in tools or []:
             self.register(tool)
 
@@ -53,6 +72,10 @@ class ToolRegistry:
                 f"point at a smithers-registered function."
             )
         self._tools[tool.definition.name] = tool
+        if self._validate_arguments:
+            self._schema_validators[tool.definition.name] = _build_schema_validator(
+                tool.definition.parameters
+            )
 
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
@@ -65,6 +88,27 @@ class ToolRegistry:
         if not tool:
             logger.debug("tool.execute unknown name=%s", call.name)
             return ToolResult(call_id=call.id, output="", error=f"Unknown tool: {call.name}")
+
+        # Single insertion point ahead of the dispatch branch below, so one
+        # check covers both the local-execute path and the dispatched path
+        # (which also runs pre_dispatch). Looked up by dict membership
+        # rather than re-checking self._validate_arguments here too:
+        # _schema_validators is only ever populated in register() when the
+        # registry was constructed with validate_arguments=True, so the
+        # dict itself is the single source of truth. Returned directly as
+        # a ToolResult rather than raised as a JigToolError(phase="schema"):
+        # the existing JigToolError -> "{phase}: {msg}" handler a few lines
+        # down only wraps the non-dispatch inner try, so a raise here would
+        # escape it (and _execute_dispatched's handler too) and propagate
+        # out of execute() uncaught — a behavior change bigger than this
+        # feature should make. Building the message with the "schema: "
+        # prefix already baked in also sidesteps double-prefixing it.
+        validator = self._schema_validators.get(call.name)
+        if validator is not None:
+            error = _schema_validation_error(validator, call.arguments)
+            if error is not None:
+                logger.debug("tool.execute schema_invalid name=%s err=%s", call.name, error)
+                return ToolResult(call_id=call.id, output="", error=error)
 
         tool_context = current_tool_context.get()
         token = current_tool_context.set(tool_context)
@@ -357,6 +401,70 @@ class ToolRegistry:
         return _call_context_hook(
             dispatch_payload_extra, tool_context=tool_context, arguments=call.arguments,
         )
+
+
+def _build_schema_validator(parameters: dict[str, Any]) -> Any:
+    """Compile a ``jsonschema`` validator for one tool's parameter schema.
+
+    Imported lazily, inside this function rather than at module scope:
+    ``jig.tools.registry`` is imported unconditionally from ``jig``'s
+    top-level ``__init__``, so a module-scope import would force the
+    ``jsonschema`` dependency (and its install-time cost) onto every jig
+    caller, not just registries that opt into ``validate_arguments``.
+    """
+    try:
+        from jsonschema import Draft202012Validator
+    except ImportError as exc:
+        raise ImportError(
+            "ToolRegistry(validate_arguments=True) requires jsonschema. "
+            "Install with: pip install 'jig[validate]'"
+        ) from exc
+    return Draft202012Validator(parameters)
+
+
+def _schema_validation_error(validator: Any, arguments: dict[str, Any] | None) -> str | None:
+    """Render the first schema violation as a model-visible message, or
+    ``None`` when ``arguments`` is valid.
+
+    Deliberately consults *two* jsonschema error objects instead of one —
+    do not "simplify" this back to a single call, it silently regresses
+    the exact schemas this feature exists for:
+
+    - ``next(iter_errors(...))`` alone reads fine for a plain constrained
+      field, but for an ``anyOf`` schema (e.g. an ``int | None`` param) or
+      a ``$ref`` (a nested pydantic model) it reports the failure against
+      the *union* itself — e.g. "-1 is not valid under any of the given
+      schemas" — which tells the model nothing about what was actually
+      wrong.
+    - ``best_match`` descends into the specific failing branch and gives
+      a precise message ("-1 is less than the minimum of 0"), but in
+      doing so it also descends past the property-level schema, losing
+      both the property path and its ``description`` — and the
+      description is the entire point of this feature (spec §1.5: it's
+      how the model learns *why* a bound exists, not just that one was
+      violated).
+
+    So: anchor the property path and description on the top-level error
+    (``top``, from ``iter_errors``), and take only the message from
+    ``best_match``'s deeper, more specific error.
+    """
+    from jsonschema.exceptions import best_match
+
+    top = next(iter(validator.iter_errors(arguments or {})), None)
+    if top is None:
+        return None
+    deepest = best_match([top]) or top
+    # top.path is empty (deque()) for root-level errors, e.g. a missing
+    # required property — guard against a dangling "... at " with nothing
+    # after it.
+    where = "/".join(map(str, top.path))
+    msg = f"schema: {deepest.message}"
+    if where:
+        msg = f"{msg} at {where}"
+    hint = top.schema.get("description") if isinstance(top.schema, dict) else None
+    if hint:
+        msg = f"{msg} — {hint}"
+    return msg
 
 
 def _call_context_hook(
