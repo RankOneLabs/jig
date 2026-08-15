@@ -151,6 +151,58 @@ class TestDispatchRun:
             "parent_span_id": "s-xyz",
         }
 
+    async def test_idempotency_key_in_submission(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.get.return_value = _poll_resp(status="complete", result={"value": 1})
+
+        await dispatch_run(
+            "m:f",
+            http=http,
+            idempotency_key="validation:workflow-1",
+            poll_interval=0.01,
+        )
+
+        body = http.post.call_args.kwargs["json"]
+        assert body["idempotency_key"] == "validation:workflow-1"
+
+    async def test_idempotency_key_is_optional(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.get.return_value = _poll_resp(status="complete", result={"value": 1})
+
+        await dispatch_run("m:f", http=http, poll_interval=0.01)
+
+        body = http.post.call_args.kwargs["json"]
+        assert "idempotency_key" not in body
+
+    async def test_retry_after_response_loss_polls_existing_job(self):
+        """A repeated key lets smithers return the first accepted job."""
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.side_effect = [
+            httpx.ReadError("response lost"),
+            _submit_resp("j-existing"),
+        ]
+        http.get.return_value = _poll_resp(
+            status="complete", result={"value": "recovered"},
+        )
+
+        kwargs = {
+            "http": http,
+            "idempotency_key": "validation:workflow-1",
+            "poll_interval": 0.01,
+        }
+        with pytest.raises(DispatchError) as exc_info:
+            await dispatch_run("m:f", **kwargs)
+        assert exc_info.value.retryable is True
+
+        assert await dispatch_run("m:f", **kwargs) == "recovered"
+        assert [call.kwargs["json"]["idempotency_key"] for call in http.post.await_args_list] == [
+            "validation:workflow-1",
+            "validation:workflow-1",
+        ]
+        http.get.assert_awaited_once_with("http://localhost:8900/jobs/j-existing")
+
 
 # --- Tool(dispatch=True) routing ---
 
