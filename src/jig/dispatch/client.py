@@ -296,6 +296,7 @@ async def _submit_and_poll(
     model: str | None = None,
     machine: str | None = None,
     trace_context: dict[str, Any] | None = None,
+    idempotency_key: str | None = None,
     poll_config: _PollConfig | None = None,
     listener: Any = None,  # CallbackListener | None — typed via Any to keep
                             # jig.dispatch.listener import optional
@@ -355,6 +356,8 @@ async def _submit_and_poll(
     if trace_context is not None:
         # Phase 9 has workers read this and reparent their spans.
         submission["trace_context"] = trace_context
+    if idempotency_key is not None:
+        submission["idempotency_key"] = idempotency_key
     if listener is not None and callback_nonce is not None:
         submission["callback_url"] = listener.url_for(callback_nonce)
 
@@ -521,6 +524,7 @@ async def run(
     requester: str = "jig",
     machine: str | None = None,
     trace_context: dict[str, Any] | None = None,
+    idempotency_key: str | None = None,
     timeout_seconds: int = 300,
     cleanup_grace_seconds: float = 10.0,
     cancel_on_timeout: bool = True,
@@ -534,6 +538,11 @@ async def run(
     ``on_submitted``, when provided, receives the smithers job id at
     acceptance time (before the result wait); hook exceptions are logged,
     never raised.
+
+    ``idempotency_key`` identifies this logical submission to smithers. If a
+    transient response loss makes the caller retry with the same key, smithers
+    returns the existing job and Jig resumes polling it instead of creating a
+    duplicate. Omitting it preserves the original submission behavior.
 
     ``fn_ref`` is the ``"package.module:function"`` identifier the
     worker's function registry knows (populated via the
@@ -567,6 +576,7 @@ async def run(
         requester=requester,
         machine=machine,
         trace_context=trace_context,
+        idempotency_key=idempotency_key,
         poll_config=_PollConfig(
             timeout_seconds=timeout_seconds,
             cleanup_grace_seconds=max(0.0, cleanup_grace_seconds),
