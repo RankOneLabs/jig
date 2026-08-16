@@ -8,11 +8,14 @@ fixes to one path benefit both.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -300,15 +303,17 @@ async def _submit_and_poll(
     poll_config: _PollConfig | None = None,
     listener: Any = None,  # CallbackListener | None — typed via Any to keep
                             # jig.dispatch.listener import optional
-    on_submitted: Callable[[str], None] | None = None,
+    on_submitted: Callable[[str], None | Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     """Submit a job to smithers, wait for a terminal status, return the job data.
 
     ``on_submitted``, when provided, is invoked with the smithers job id
     immediately after submission is accepted — before the terminal wait —
     so callers can durably record the correlation while the job runs.
-    Hook exceptions are logged and swallowed; observing acceptance must
-    never fail the dispatch itself.
+    The hook may be synchronous or asynchronous.  It completes before Jig
+    begins waiting for the result.  If it rejects, Jig cancels the accepted
+    remote job before propagating the hook exception, providing a safe
+    record-or-cancel boundary for durable correlation stores.
 
     When ``listener`` is provided (and its health check passes), the wait
     is an ``asyncio.Future`` resolved by a smithers HTTP callback —
@@ -406,13 +411,16 @@ async def _submit_and_poll(
     logger.info("Dispatch job %s submitted (task_type=%s)", job_id, task_type)
     if on_submitted is not None:
         try:
-            on_submitted(job_id)
-        except Exception:
-            logger.warning(
-                "on_submitted hook failed for job %s (dispatch continues)",
-                job_id,
-                exc_info=True,
-            )
+            hook_result = on_submitted(job_id)
+            if inspect.isawaitable(hook_result):
+                await hook_result
+        except BaseException:
+            # Acceptance already happened.  Do not leave uncorrelated work
+            # running when its durable registration fence rejects.
+            await asyncio.shield(_cancel_remote_job(http, url, job_id))
+            if listener is not None and callback_nonce is not None:
+                listener.unregister(callback_nonce)
+            raise
     wait_timeout_seconds = max(
         0.0,
         cfg.timeout_seconds + cfg.cleanup_grace_seconds,
@@ -477,6 +485,189 @@ def _get_shared_http() -> httpx.AsyncClient:
     return _shared_http
 
 
+async def get_job(
+    job_id: str,
+    *,
+    dispatch_url: str | None = None,
+    http: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """Return the current smithers representation of ``job_id``.
+
+    This performs one ``GET`` and does not wait for a terminal state.
+    """
+    transport = http or _get_shared_http()
+    url = (dispatch_url or default_dispatch_url()).rstrip("/")
+    try:
+        response = await transport.get(f"{url}/jobs/{job_id}")
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code
+        raise DispatchError(
+            f"Dispatch job {job_id} status request failed: {code} {exc.response.text}",
+            job_id=job_id,
+            status="not_found" if code == 404 else None,
+            retryable=code >= 500,
+        ) from exc
+    except httpx.RequestError as exc:
+        raise DispatchError(
+            f"Dispatch job {job_id} status request failed: {exc}",
+            job_id=job_id,
+            retryable=True,
+        ) from exc
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise DispatchError(
+            f"Dispatch job {job_id} returned malformed JSON", job_id=job_id,
+        ) from exc
+    if not isinstance(data, dict):
+        raise DispatchError(
+            f"Dispatch job {job_id} returned a non-object response", job_id=job_id,
+        )
+    return data
+
+
+async def cancel_job(
+    job_id: str,
+    *,
+    dispatch_url: str | None = None,
+    http: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """Cancel ``job_id`` and return smithers' acknowledged job state.
+
+    Smithers only succeeds after an active worker acknowledges cancellation.
+    A 409 means the job was already terminal; a 503 means it remains active.
+    """
+    transport = http or _get_shared_http()
+    url = (dispatch_url or default_dispatch_url()).rstrip("/")
+    try:
+        response = await transport.delete(f"{url}/jobs/{job_id}")
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code
+        status = (
+            "not_found" if code == 404
+            else "already_terminal" if code == 409
+            else None
+        )
+        raise DispatchError(
+            f"Dispatch job {job_id} cancellation failed: {code} {exc.response.text}",
+            job_id=job_id,
+            status=status,
+            retryable=code >= 500,
+        ) from exc
+    except httpx.RequestError as exc:
+        raise DispatchError(
+            f"Dispatch job {job_id} cancellation failed: {exc}",
+            job_id=job_id,
+            retryable=True,
+        ) from exc
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise DispatchError(
+            f"Dispatch job {job_id} cancellation returned malformed JSON",
+            job_id=job_id,
+        ) from exc
+    if not isinstance(data, dict):
+        raise DispatchError(
+            f"Dispatch job {job_id} cancellation returned a non-object response",
+            job_id=job_id,
+        )
+    return data
+
+
+async def get_job_by_idempotency_key(
+    idempotency_key: str,
+    *,
+    dispatch_url: str | None = None,
+    http: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """Return the job associated with ``idempotency_key``.
+
+    This is a single status read. The key is URL-encoded as one path segment;
+    a missing job is reported as ``DispatchError(status="not_found")``.
+    """
+    transport = http or _get_shared_http()
+    url = (dispatch_url or default_dispatch_url()).rstrip("/")
+    encoded_key = quote(idempotency_key, safe="")
+    try:
+        response = await transport.get(f"{url}/jobs/by-idempotency/{encoded_key}")
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code
+        raise DispatchError(
+            f"Dispatch idempotency key {idempotency_key!r} status request failed: "
+            f"{code} {exc.response.text}",
+            status="not_found" if code == 404 else None,
+            retryable=code >= 500,
+        ) from exc
+    except httpx.RequestError as exc:
+        raise DispatchError(
+            f"Dispatch idempotency key {idempotency_key!r} status request failed: {exc}",
+            retryable=True,
+        ) from exc
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise DispatchError(
+            f"Dispatch idempotency key {idempotency_key!r} returned malformed JSON",
+        ) from exc
+    if not isinstance(data, dict):
+        raise DispatchError(
+            f"Dispatch idempotency key {idempotency_key!r} returned a non-object response",
+        )
+    return data
+
+
+async def cancel_or_fence(
+    idempotency_key: str,
+    *,
+    dispatch_url: str | None = None,
+    http: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """Durably prevent work for ``idempotency_key`` from remaining active.
+
+    Smithers records a cancellation tombstone even when no matching job is
+    visible yet. A 200 response means cancellation completed (and may include
+    a ``job_id``). A 409 means the job was already terminal, but the tombstone
+    is still durable, so its response is also returned as a successful fence.
+    A 503 means worker cancellation was not acknowledged and is retryable.
+    """
+    transport = http or _get_shared_http()
+    url = (dispatch_url or default_dispatch_url()).rstrip("/")
+    encoded_key = quote(idempotency_key, safe="")
+    try:
+        response = await transport.delete(
+            f"{url}/jobs/by-idempotency/{encoded_key}",
+        )
+        if response.status_code != 409:
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code
+        raise DispatchError(
+            f"Dispatch idempotency key {idempotency_key!r} fencing failed: "
+            f"{code} {exc.response.text}",
+            retryable=code >= 500,
+        ) from exc
+    except httpx.RequestError as exc:
+        raise DispatchError(
+            f"Dispatch idempotency key {idempotency_key!r} fencing failed: {exc}",
+            retryable=True,
+        ) from exc
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise DispatchError(
+            f"Dispatch idempotency key {idempotency_key!r} fencing returned malformed JSON",
+        ) from exc
+    if not isinstance(data, dict):
+        raise DispatchError(
+            f"Dispatch idempotency key {idempotency_key!r} fencing returned a non-object response",
+        )
+    return data
+
+
 async def aclose() -> None:
     """Close the shared httpx client and the callback listener, if any.
 
@@ -531,13 +722,14 @@ async def run(
     poll_interval: float = 0.5,
     poll_max_interval: float = 5.0,
     http: httpx.AsyncClient | None = None,
-    on_submitted: Callable[[str], None] | None = None,
+    on_submitted: Callable[[str], None | Awaitable[None]] | None = None,
 ) -> Any:
     """Execute ``fn_ref`` on a smithers worker, await the result.
 
     ``on_submitted``, when provided, receives the smithers job id at
-    acceptance time (before the result wait); hook exceptions are logged,
-    never raised.
+    acceptance time (before the result wait). Async hooks are awaited. If
+    the hook rejects, the accepted job is cancelled before that exception
+    is propagated.
 
     ``idempotency_key`` identifies this logical submission to smithers. If a
     transient response loss makes the caller retry with the same key, smithers
