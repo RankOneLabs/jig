@@ -303,7 +303,7 @@ async def _submit_and_poll(
     poll_config: _PollConfig | None = None,
     listener: Any = None,  # CallbackListener | None — typed via Any to keep
                             # jig.dispatch.listener import optional
-    on_submitted: Callable[[str], None | Awaitable[None]] | None = None,
+    on_submitted: Callable[[str], Awaitable[None] | None] | None = None,
 ) -> dict[str, Any]:
     """Submit a job to smithers, wait for a terminal status, return the job data.
 
@@ -722,7 +722,7 @@ async def run(
     poll_interval: float = 0.5,
     poll_max_interval: float = 5.0,
     http: httpx.AsyncClient | None = None,
-    on_submitted: Callable[[str], None | Awaitable[None]] | None = None,
+    on_submitted: Callable[[str], Awaitable[None] | None] | None = None,
 ) -> Any:
     """Execute ``fn_ref`` on a smithers worker, await the result.
 
