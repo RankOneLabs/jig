@@ -274,15 +274,11 @@ class TestGeminiResponseFormatRejected:
 
 @pytest.mark.asyncio
 class TestAnthropicResponseFormatRejected:
-    """anthropic.py isn't in this transport's scoped files — it gets
-    rejection for free from merge_completion_kwargs's default
-    supports_response_format=False, but complete()'s existing
-    ``except Exception`` wraps that into JigLLMError rather than letting
-    UnsupportedResponseFormatError itself propagate. This test documents
-    that known, acceptable-for-now gap: the call still fails before any
-    request is made, just without the precise typed error."""
+    """AnthropicClient rejects response_format with the typed error before
+    any request is made. Its request-preparation wrapper used to swallow it
+    into JigLLMError; the typed contract errors now pass through."""
 
-    async def test_rejected_but_wrapped_in_jig_llm_error(self):
+    async def test_rejected_with_typed_error(self):
         client = AnthropicClient.__new__(AnthropicClient)
         client._client = MagicMock()
         client._model = "claude-test"
@@ -291,7 +287,7 @@ class TestAnthropicResponseFormatRejected:
             messages=[Message(role=Role.USER, content="hi")],
             response_format=_RESPONSE_FORMAT,
         )
-        with pytest.raises(JigLLMError) as exc_info:
+        with pytest.raises(UnsupportedResponseFormatError) as exc_info:
             await client.complete(params)
 
         assert "response_format" in str(exc_info.value)

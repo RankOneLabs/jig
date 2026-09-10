@@ -60,15 +60,22 @@ class OpenAIClient(LLMClient):
     # ``CompletionParams.reasoning`` is rejected here. OpenRouter opts in.
     supports_reasoning = False
 
-    def _apply_extra_kwargs(
-        self, kwargs: dict[str, Any], params: CompletionParams | None = None
-    ) -> None:
+    def _apply_extra_kwargs(self, kwargs: dict[str, Any]) -> None:
         """Subclass hook: inject defaults into the chat.completions.create()
         kwargs dict. Mutates ``kwargs`` in place rather than returning a dict
         to update with, so subclasses can deep-merge nested fields like
         ``extra_body`` instead of replacing caller-supplied values wholesale.
-        ``params`` is the original request, for fields whose wire shape is
-        gateway-specific (OpenRouter's ``reasoning``). Default is a no-op.
+        Default is a no-op.
+        """
+        return None
+
+    def _apply_reasoning_kwargs(self, kwargs: dict[str, Any], params: CompletionParams) -> None:
+        """Subclass hook: translate ``params.reasoning`` into the request.
+
+        Only called when the subclass declares ``supports_reasoning = True``
+        (``merge_completion_kwargs`` has already rejected a non-None value
+        otherwise). Separate from ``_apply_extra_kwargs`` so existing
+        one-argument overrides of that hook keep working. Default is a no-op.
         """
         return None
 
@@ -138,7 +145,9 @@ class OpenAIClient(LLMClient):
                 supports_response_format=True,
                 supports_reasoning=self.supports_reasoning,
             )
-            self._apply_extra_kwargs(kwargs, params)
+            self._apply_extra_kwargs(kwargs)
+            if self.supports_reasoning:
+                self._apply_reasoning_kwargs(kwargs, params)
         except JigLLMError:
             raise
         except UnsupportedReasoningError:
@@ -264,7 +273,9 @@ class OpenAIClient(LLMClient):
             supports_response_format=True,
             supports_reasoning=self.supports_reasoning,
         )
-        self._apply_extra_kwargs(kwargs, params)
+        self._apply_extra_kwargs(kwargs)
+        if self.supports_reasoning:
+            self._apply_reasoning_kwargs(kwargs, params)
 
         response = await self._client.chat.completions.create(**kwargs)
         async for chunk in response:

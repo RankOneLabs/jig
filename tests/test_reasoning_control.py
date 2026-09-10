@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import jig
-from jig.core.errors import JigLLMError, UnsupportedReasoningError
+from jig.core.errors import UnsupportedReasoningError
 from jig.core.types import CompletionParams, Message, Role
 from jig.llm.anthropic import AnthropicClient
 from jig.llm.google import GeminiClient
@@ -133,8 +133,6 @@ class TestRejectingAdapters:
             instance = mock_anthropic.AsyncAnthropic.return_value
             instance.messages.create = AsyncMock()
             client = AnthropicClient(model="claude-sonnet-5", api_key="k")
-            # AnthropicClient wraps request-preparation errors in JigLLMError
-            # (documented in the README for response_format as well).
-            with pytest.raises((UnsupportedReasoningError, JigLLMError)):
+            with pytest.raises(UnsupportedReasoningError):
                 await client.complete(_params(False))
             instance.messages.create.assert_not_called()
