@@ -6,7 +6,7 @@ import math
 import uuid
 from typing import Any
 
-from jig.core.errors import JigLLMError, UnsupportedResponseFormatError
+from jig.core.errors import JigLLMError, UnsupportedReasoningError, UnsupportedResponseFormatError
 from jig.core.types import (
     CompletionParams,
     LLMClient,
@@ -151,6 +151,10 @@ class GeminiClient(LLMClient):
                 raise UnsupportedResponseFormatError(
                     "The Gemini adapter does not support response_format"
                 )
+            if params.reasoning is not None:
+                raise UnsupportedReasoningError(
+                    "The Gemini adapter does not support reasoning control"
+                )
             contents = self._convert_messages(params)
 
             config_kwargs: dict[str, Any] = {}
@@ -168,7 +172,7 @@ class GeminiClient(LLMClient):
             config = genai_types.GenerateContentConfig(**config_kwargs)
         except JigLLMError:
             raise
-        except UnsupportedResponseFormatError:
+        except (UnsupportedReasoningError, UnsupportedResponseFormatError):
             raise
         except Exception as e:
             msg = str(e)

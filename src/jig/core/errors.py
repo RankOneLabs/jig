@@ -64,6 +64,17 @@ class UnsupportedResponseFormatError(ValueError):
     """
 
 
+class UnsupportedReasoningError(ValueError):
+    """A CompletionParams.reasoning value the adapter cannot honor.
+
+    Raised before any request is built when ``reasoning`` is not None on
+    an adapter with no reasoning-mode control. A ``ValueError`` subclass
+    for the same reason as ``UnsupportedResponseFormatError``: this is a
+    caller-side contract violation, not a provider failure, and it must
+    fail loudly rather than silently run with the provider's default.
+    """
+
+
 class JigMemoryError(JigError):
     """Raised by memory backends (store, retriever, session)."""
 

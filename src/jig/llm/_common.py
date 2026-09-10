@@ -7,7 +7,7 @@ from __future__ import annotations
 import time
 from typing import Any, Callable
 
-from jig.core.errors import JigLLMError, UnsupportedResponseFormatError
+from jig.core.errors import JigLLMError, UnsupportedReasoningError, UnsupportedResponseFormatError
 from jig.core.types import CompletionParams, ToolDefinition
 
 
@@ -26,6 +26,7 @@ def merge_completion_kwargs(
     params: CompletionParams,
     *,
     supports_response_format: bool = False,
+    supports_reasoning: bool = False,
 ) -> None:
     """Apply temperature, max_tokens, response_format, and provider_params
     to kwargs in-place.
@@ -43,7 +44,16 @@ def merge_completion_kwargs(
     ``UnsupportedResponseFormatError`` before any request is built, so an
     unsupported constraint fails loudly instead of silently running
     unconstrained.
+
+    ``reasoning`` is never written into kwargs here — its wire shape is
+    adapter-specific, so an adapter that passes ``supports_reasoning=True``
+    translates it itself. A non-None value on an adapter that hasn't opted
+    in raises ``UnsupportedReasoningError`` before any request is built.
     """
+    if params.reasoning is not None and not supports_reasoning:
+        raise UnsupportedReasoningError(
+            "This adapter does not support reasoning control"
+        )
     if params.temperature is not None:
         kwargs["temperature"] = params.temperature
     if params.max_tokens is not None:

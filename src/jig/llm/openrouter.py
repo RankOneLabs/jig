@@ -21,6 +21,7 @@ import logging
 import os
 from typing import Any
 
+from jig.core.types import CompletionParams
 from jig.llm.openai import OpenAIClient
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,13 @@ class OpenRouterClient(OpenAIClient):
             **client_kwargs,
         )
 
-    def _apply_extra_kwargs(self, kwargs: dict[str, Any]) -> None:
+    # OpenRouter's unified ``reasoning`` request field carries an
+    # ``enabled`` switch that it translates per upstream provider.
+    supports_reasoning = True
+
+    def _apply_extra_kwargs(
+        self, kwargs: dict[str, Any], params: CompletionParams | None = None
+    ) -> None:
         # Deep-merge with setdefault so caller-supplied extra_body fields
         # (e.g. ``models`` for fallback routing, ``provider`` preferences,
         # ``transforms``) survive. We only inject ``usage.include=True``,
@@ -72,6 +79,9 @@ class OpenRouterClient(OpenAIClient):
             kwargs["extra_body"] = extra_body
         usage = extra_body.setdefault("usage", {})
         usage.setdefault("include", True)
+        if params is not None and params.reasoning is not None:
+            reasoning = extra_body.setdefault("reasoning", {})
+            reasoning.setdefault("enabled", params.reasoning)
 
     def _inline_cost(self, response: Any) -> float | None:
         usage = getattr(response, "usage", None)

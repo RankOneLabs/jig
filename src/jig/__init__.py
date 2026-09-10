@@ -48,6 +48,7 @@ from jig.core import (
     ToolExecutionContext,
     ToolResult,
     TracingLogger,
+    UnsupportedReasoningError,
     UnsupportedResponseFormatError,
     Usage,
     current_tool_context,
@@ -169,6 +170,7 @@ __all__ = [
     "JigLLMError",
     "JigMemoryError",
     "JigToolError",
+    "UnsupportedReasoningError",
     "UnsupportedResponseFormatError",
     # Runner
     "AgentConfig",

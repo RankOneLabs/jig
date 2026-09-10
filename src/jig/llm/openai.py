@@ -4,7 +4,7 @@ import json
 import logging
 from typing import Any, AsyncIterator
 
-from jig.core.errors import JigLLMError
+from jig.core.errors import JigLLMError, UnsupportedReasoningError
 from jig.core.types import (
     CompletionParams,
     LLMClient,
@@ -55,12 +55,20 @@ class OpenAIClient(LLMClient):
             await self._client.close()
             self._closed = True
 
-    def _apply_extra_kwargs(self, kwargs: dict[str, Any]) -> None:
+    # The OpenAI chat API has no portable on/off switch for reasoning
+    # (``reasoning_effort`` has no "off" value), so a non-None
+    # ``CompletionParams.reasoning`` is rejected here. OpenRouter opts in.
+    supports_reasoning = False
+
+    def _apply_extra_kwargs(
+        self, kwargs: dict[str, Any], params: CompletionParams | None = None
+    ) -> None:
         """Subclass hook: inject defaults into the chat.completions.create()
         kwargs dict. Mutates ``kwargs`` in place rather than returning a dict
         to update with, so subclasses can deep-merge nested fields like
         ``extra_body`` instead of replacing caller-supplied values wholesale.
-        Default is a no-op.
+        ``params`` is the original request, for fields whose wire shape is
+        gateway-specific (OpenRouter's ``reasoning``). Default is a no-op.
         """
         return None
 
@@ -124,9 +132,16 @@ class OpenAIClient(LLMClient):
                 kwargs["tools"] = self._convert_tools(params.tools)
             # OpenAI and OpenRouter (a subclass) both speak the same
             # OpenAI-compatible response_format envelope natively.
-            merge_completion_kwargs(kwargs, params, supports_response_format=True)
-            self._apply_extra_kwargs(kwargs)
+            merge_completion_kwargs(
+                kwargs,
+                params,
+                supports_response_format=True,
+                supports_reasoning=self.supports_reasoning,
+            )
+            self._apply_extra_kwargs(kwargs, params)
         except JigLLMError:
+            raise
+        except UnsupportedReasoningError:
             raise
         except Exception as e:
             raise JigLLMError(
@@ -243,8 +258,13 @@ class OpenAIClient(LLMClient):
         # Same OpenAI-compatible response_format support as complete() —
         # without this, streaming callers would hit
         # UnsupportedResponseFormatError for a value complete() accepts.
-        merge_completion_kwargs(kwargs, params, supports_response_format=True)
-        self._apply_extra_kwargs(kwargs)
+        merge_completion_kwargs(
+            kwargs,
+            params,
+            supports_response_format=True,
+            supports_reasoning=self.supports_reasoning,
+        )
+        self._apply_extra_kwargs(kwargs, params)
 
         response = await self._client.chat.completions.create(**kwargs)
         async for chunk in response:

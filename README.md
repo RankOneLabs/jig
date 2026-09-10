@@ -184,8 +184,21 @@ CompletionParams(
         "type": "json_schema",
         "json_schema": {"name": "answer", "schema": {"type": "object", "...": "..."}},
     },
+    reasoning=False,                # optional, portable reasoning on/off switch
 )
 ```
+
+### Reasoning control (`reasoning`)
+
+`reasoning` is a portable on/off switch for a model's reasoning ("thinking")
+mode. `None` (the default) leaves the provider's own default untouched and the
+request byte-identical to today. `True` / `False` is translated per adapter:
+
+| Adapter | Behavior |
+| --- | --- |
+| Ollama | Sent as the top-level `think` field. Models that advertise the `thinking` capability reason by default, so `False` is the only way to get a non-reasoning run — and the only way to compare a local quantised model against a hosted run of the same weights on equal terms. |
+| OpenRouter | Sent as `extra_body.reasoning.enabled`, which OpenRouter translates for the upstream provider. |
+| OpenAI, Anthropic, Gemini, Dispatch | Rejected — a non-`None` value raises `UnsupportedReasoningError` (a `ValueError` subclass, exported from `jig`) before any request is made. The OpenAI chat API has no "off" value for `reasoning_effort`; the others are not wired yet. |
 
 ### Structured output (`response_format`)
 
