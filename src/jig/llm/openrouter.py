@@ -66,9 +66,7 @@ class OpenRouterClient(OpenAIClient):
     # ``enabled`` switch that it translates per upstream provider.
     supports_reasoning = True
 
-    def _apply_extra_kwargs(
-        self, kwargs: dict[str, Any], params: CompletionParams | None = None
-    ) -> None:
+    def _apply_extra_kwargs(self, kwargs: dict[str, Any]) -> None:
         # Deep-merge with setdefault so caller-supplied extra_body fields
         # (e.g. ``models`` for fallback routing, ``provider`` preferences,
         # ``transforms``) survive. We only inject ``usage.include=True``,
@@ -79,9 +77,14 @@ class OpenRouterClient(OpenAIClient):
             kwargs["extra_body"] = extra_body
         usage = extra_body.setdefault("usage", {})
         usage.setdefault("include", True)
-        if params is not None and params.reasoning is not None:
-            reasoning = extra_body.setdefault("reasoning", {})
-            reasoning.setdefault("enabled", params.reasoning)
+
+    def _apply_reasoning_kwargs(self, kwargs: dict[str, Any], params: CompletionParams) -> None:
+        # Runs after _apply_extra_kwargs, so extra_body already exists.
+        # setdefault keeps a caller-supplied ``reasoning`` block intact.
+        if params.reasoning is None:
+            return
+        reasoning = kwargs["extra_body"].setdefault("reasoning", {})
+        reasoning.setdefault("enabled", params.reasoning)
 
     def _inline_cost(self, response: Any) -> float | None:
         usage = getattr(response, "usage", None)
