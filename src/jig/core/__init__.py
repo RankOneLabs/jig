@@ -12,6 +12,7 @@ from jig.core.errors import (
     JigError,
     JigLLMError,
     JigMemoryError,
+    UnsupportedReasoningError,
     JigToolError,
 )
 from jig.core.pipeline import MapResult, PipelineConfig, PipelineResult, Step
@@ -64,6 +65,7 @@ __all__ = [
     "JigError",
     "JigLLMError",
     "JigMemoryError",
+    "UnsupportedReasoningError",
     "JigToolError",
     "LLMClient",
     "LLMResponse",

@@ -18,6 +18,7 @@ from jig.core import (
     JigError,
     JigLLMError,
     JigMemoryError,
+    UnsupportedReasoningError,
     JigToolError,
     LLMClient,
     LLMResponse,
@@ -149,6 +150,7 @@ __all__ = [
     "JigError",
     "JigLLMError",
     "JigMemoryError",
+    "UnsupportedReasoningError",
     "JigToolError",
     # Runner
     "AgentConfig",

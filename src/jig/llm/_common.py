@@ -7,7 +7,7 @@ from __future__ import annotations
 import time
 from typing import Any, Callable
 
-from jig.core.errors import JigLLMError
+from jig.core.errors import JigLLMError, UnsupportedReasoningError
 from jig.core.types import CompletionParams, ToolDefinition
 
 
@@ -21,14 +21,26 @@ def start_timer() -> Callable[[], float]:
     return lambda: (time.monotonic() - t) * 1000
 
 
-def merge_completion_kwargs(kwargs: dict[str, Any], params: CompletionParams) -> None:
+def merge_completion_kwargs(
+    kwargs: dict[str, Any],
+    params: CompletionParams,
+    *,
+    supports_reasoning: bool = False,
+) -> None:
     """Apply temperature, max_tokens, and provider_params to kwargs in-place.
 
     provider_params is merged last so caller-supplied values win over defaults.
     Only sets temperature/max_tokens when those fields are not None; pre-set
     defaults (e.g. Anthropic's ``max_tokens or 4096``) are left untouched when
     ``params.temperature`` or ``params.max_tokens`` is None.
+
+    ``reasoning`` is never written into kwargs here — its wire shape is
+    adapter-specific, so an adapter that passes ``supports_reasoning=True``
+    translates it itself. A non-None value on an adapter that hasn't opted
+    in raises ``UnsupportedReasoningError`` before any request is built.
     """
+    if params.reasoning is not None and not supports_reasoning:
+        raise UnsupportedReasoningError("This adapter does not support reasoning control")
     if params.temperature is not None:
         kwargs["temperature"] = params.temperature
     if params.max_tokens is not None:

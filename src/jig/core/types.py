@@ -110,6 +110,13 @@ class CompletionParams:
     temperature: float | None = None
     max_tokens: int | None = None
     provider_params: dict[str, Any] | None = None
+    # Portable reasoning / "thinking" switch. None leaves the provider's own
+    # default untouched (the request is byte-identical to today); True or
+    # False asks the adapter to turn the model's reasoning mode on or off.
+    # Each adapter translates it to its native field (Ollama ``think``,
+    # OpenRouter ``reasoning.enabled``) or rejects a non-None value with
+    # UnsupportedReasoningError before any request is made.
+    reasoning: bool | None = None
 
 
 @dataclass
