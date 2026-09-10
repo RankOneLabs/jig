@@ -130,6 +130,11 @@ class OllamaClient(LLMClient):
 
             if params.response_format is not None:
                 kwargs["format"] = _translate_response_format(params.response_format)
+            # Ollama's top-level ``think`` switch (not a model option): models
+            # that advertise the ``thinking`` capability reason by default,
+            # so an explicit False is the only way to get a non-reasoning run.
+            if params.reasoning is not None:
+                kwargs["think"] = params.reasoning
         except JigLLMError:
             raise
         except UnsupportedResponseFormatError:
@@ -224,6 +229,8 @@ class OllamaClient(LLMClient):
             options.update(params.provider_params)
         if options:
             kwargs["options"] = options
+        if params.reasoning is not None:
+            kwargs["think"] = params.reasoning
 
         response = await self._client.chat(**kwargs)
         async for chunk in response:

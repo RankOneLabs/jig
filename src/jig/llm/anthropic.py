@@ -3,7 +3,11 @@ from __future__ import annotations
 import logging
 from typing import Any, AsyncIterator
 
-from jig.core.errors import JigLLMError
+from jig.core.errors import (
+    JigLLMError,
+    UnsupportedReasoningError,
+    UnsupportedResponseFormatError,
+)
 from jig.core.types import (
     CompletionParams,
     LLMClient,
@@ -110,6 +114,8 @@ class AnthropicClient(LLMClient):
                 kwargs["tools"] = self._convert_tools(params.tools)
             merge_completion_kwargs(kwargs, params)
         except JigLLMError:
+            raise
+        except (UnsupportedReasoningError, UnsupportedResponseFormatError):
             raise
         except Exception as e:
             raise JigLLMError(

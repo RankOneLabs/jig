@@ -14,6 +14,7 @@ from jig.core.errors import (
     JigLLMError,
     JigMemoryError,
     JigToolError,
+    UnsupportedReasoningError,
     UnsupportedResponseFormatError,
 )
 from jig.core.pipeline import MapResult, PipelineConfig, PipelineResult, Step
@@ -100,6 +101,7 @@ __all__ = [
     "ToolExecutionContext",
     "ToolResult",
     "TracingLogger",
+    "UnsupportedReasoningError",
     "UnsupportedResponseFormatError",
     "Usage",
     "current_tool_context",
