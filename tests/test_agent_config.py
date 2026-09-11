@@ -9,20 +9,33 @@ from unittest.mock import AsyncMock
 import pytest
 from pydantic import BaseModel
 
-from jig import AgentConfig, LLMResponse, Message, Score, ScoreSource, Usage, run_agent
+from jig import (
+    AgentConfig,
+    FeedbackFailed,
+    GradingFailed,
+    GradingSucceeded,
+    LLMResponse,
+    Message,
+    Score,
+    ScoreSource,
+    Usage,
+    run_agent,
+)
 from jig.core.types import (
-    MemoryStore,
-    Retriever,
     CompletionParams,
     FeedbackLoop,
     Grader,
     LLMClient,
     MemoryEntry,
+    MemoryStore,
+    Retriever,
     ScoredResult,
-    ScoreSource as _ScoreSource,
     Span,
     SpanKind,
     TracingLogger,
+)
+from jig.core.types import (
+    ScoreSource as _ScoreSource,
 )
 from jig.tools import ToolRegistry
 
@@ -290,6 +303,9 @@ class TestFailSoftAutoGrade:
         assert result.output == "done"
         assert result.error is None
         assert result.scores is None
+        assert isinstance(result.grading, GradingFailed)
+        assert result.grading.error.stage == "grade"
+        assert result.grading.error.type == "RuntimeError"
         feedback.store_result.assert_not_awaited()
 
     async def test_feedback_persistence_failure_retains_scores(self):
@@ -307,6 +323,9 @@ class TestFailSoftAutoGrade:
         assert result.error is None
         assert result.scores is not None
         assert result.scores[0].value == 0.8
+        assert isinstance(result.grading, GradingSucceeded)
+        assert isinstance(result.grading.feedback, FeedbackFailed)
+        assert result.grading.feedback.error.stage == "feedback_store"
 
     async def test_grader_returning_non_list_leaves_output_intact_and_scores_absent(self):
         """A misbehaving grader returning None/non-list must not crash
@@ -324,7 +343,30 @@ class TestFailSoftAutoGrade:
         assert result.output == "done"
         assert result.error is None
         assert result.scores is None
+        assert isinstance(result.grading, GradingFailed)
+        assert result.grading.error.stage == "validate"
+        assert result.grading.error.type == "TypeError"
         feedback.store_result.assert_not_awaited()
+
+    async def test_feedback_score_failure_preserves_partial_result_id(self):
+        feedback = AsyncMock()
+        feedback.store_result = AsyncMock(return_value="stored-before-score")
+        feedback.score = AsyncMock(side_effect=RuntimeError("score exploded"))
+
+        class _FixedGrader(Grader):
+            async def grade(self, input, output, context=None):
+                return [Score(dimension="q", value=0.8, source=_ScoreSource.HEURISTIC)]
+
+        result = await run_agent(
+            _base(llm=_FixedLLM(), feedback=feedback, grader=_FixedGrader()),
+            "hello",
+        )
+
+        assert result.scores is not None
+        assert isinstance(result.grading, GradingSucceeded)
+        assert isinstance(result.grading.feedback, FeedbackFailed)
+        assert result.grading.feedback.error.stage == "feedback_score"
+        assert result.grading.feedback.result_id == "stored-before-score"
 
 
 class TestAclose:

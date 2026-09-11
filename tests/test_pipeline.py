@@ -3,7 +3,14 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+import pytest
+
 from jig import (
+    FeedbackFailed,
+    FeedbackSkipped,
+    FeedbackStored,
+    GradingFailed,
+    GradingSucceeded,
     PipelineConfig,
     Score,
     ScoreSource,
@@ -12,8 +19,14 @@ from jig import (
     map_pipeline,
     run_pipeline,
 )
-from jig.core.types import EvalCase, FeedbackLoop, Grader, ScoredResult, Span, TracingLogger
-
+from jig.core.types import (
+    EvalCase,
+    FeedbackLoop,
+    Grader,
+    ScoredResult,
+    Span,
+    TracingLogger,
+)
 
 # --- Fakes ---
 
@@ -481,6 +494,7 @@ async def test_pipeline_flushes_tracer_on_success():
     completed spans without a separate flush call."""
     import os
     import tempfile
+
     from jig.tracing import SQLiteTracer
 
     with tempfile.TemporaryDirectory() as d:
@@ -508,6 +522,7 @@ async def test_pipeline_flushes_tracer_on_exception():
     """run_pipeline flushes and closes the root span even when a step raises."""
     import os
     import tempfile
+
     from jig.tracing import SQLiteTracer
 
     async def boom(ctx: dict[str, Any]) -> str:
@@ -545,6 +560,7 @@ async def test_map_pipeline_closes_parent_on_exception():
     """map_pipeline closes the parent batch span and flushes on exception."""
     import os
     import tempfile
+
     from jig.tracing import SQLiteTracer
 
     async def boom(ctx: dict[str, Any]) -> str:
@@ -618,6 +634,8 @@ async def test_per_step_grading_failure_does_not_stop_later_steps():
     )
     assert result.step_outputs == {"add_one": 2, "double": 4, "to_string": "4"}
     assert "add_one" not in result.step_scores
+    assert isinstance(result.step_grading["add_one"], GradingFailed)
+    assert result.step_grading["add_one"].error.stage == "grade"
     assert not result.short_circuited
     assert result.error_step is None
 
@@ -653,17 +671,143 @@ async def test_pipeline_level_grading_failure_does_not_fail_run_pipeline():
     )
     assert result.output == 2
     assert result.scores is None
+    assert isinstance(result.grading, GradingFailed)
 
 
 async def test_batch_grading_failure_does_not_discard_item_results():
     tracer = FakeTracer()
+    feedback = FakeFeedback()
     result = await map_pipeline(
-        PipelineConfig(name="p", steps=[Step(name="add_one", fn=add_one)], tracer=tracer),
+        PipelineConfig(
+            name="p", steps=[Step(name="add_one", fn=add_one)],
+            tracer=tracer, feedback=feedback,
+        ),
         items=[1, 2, 3],
         batch_grader=BrokenGrader(),
     )
     assert [r.output for r in result.results] == [2, 3, 4]
     assert result.scores is None
+    assert isinstance(result.grading, GradingFailed)
+    assert feedback.stored == []
+    assert feedback.scored == []
+
+
+@pytest.mark.parametrize("custom_serializer", [False, True])
+async def test_batch_feedback_stores_aggregate_with_batch_metadata(custom_serializer):
+    tracer = FakeTracer()
+    feedback = FakeFeedback()
+    serialized = []
+
+    def serialize(value):
+        serialized.append(value)
+        return f"custom:{value}"
+
+    result = await map_pipeline(
+        PipelineConfig(
+            name="p", steps=[Step(name="add_one", fn=add_one)], tracer=tracer,
+            feedback=feedback,
+            feedback_serializer=serialize if custom_serializer else None,
+            metadata={
+                "source": "experiment", "tags": ["batch"], "model": "worker-v1",
+                "kind": "spoofed", "trace_id": "spoofed", "item_count": 99,
+            },
+        ),
+        items=[1, 2, 3], batch_grader=FixedGrader(value=0.9),
+    )
+    assert [r.output for r in result.results] == [2, 3, 4]
+    assert isinstance(result.grading, GradingSucceeded)
+    assert isinstance(result.grading.feedback, FeedbackStored)
+    assert result.grading.feedback.result_id == "r-1"
+    prefix = "custom:" if custom_serializer else ""
+    assert feedback.stored == [
+        (prefix + "[2, 3, 4]", prefix + "[1, 2, 3]", {
+            "kind": "pipeline_batch_result", "pipeline_name": "p",
+            "trace_id": result.trace_id, "item_count": 3,
+            "source": "experiment", "tags": ["batch"], "model": "worker-v1",
+        }),
+    ]
+    assert feedback.scored == [("r-1", result.scores)]
+    assert serialized == ([[2, 3, 4], [1, 2, 3]] if custom_serializer else [])
+    grade_span = next(s for s in tracer.spans if s.name == "batch_grade")
+    assert grade_span.output["feedback_result_id"] == "r-1"
+    assert grade_span.error is None
+
+
+@pytest.mark.parametrize("stage", ["feedback_store", "feedback_score"])
+async def test_batch_feedback_failures_preserve_scores_outputs_and_trace_identity(stage):
+    class BrokenScoreFeedback(FakeFeedback):
+        async def score(self, result_id, scores):
+            raise RuntimeError("feedback score exploded")
+
+    tracer = FakeTracer()
+    feedback = BrokenStoreFeedback() if stage == "feedback_store" else BrokenScoreFeedback()
+    result = await map_pipeline(
+        PipelineConfig(
+            name="p", steps=[Step(name="add_one", fn=add_one)],
+            tracer=tracer, feedback=feedback,
+        ),
+        items=[1, 2, 3], batch_grader=FixedGrader(value=0.9),
+    )
+    assert [r.output for r in result.results] == [2, 3, 4]
+    assert result.scores[0].value == 0.9
+    assert isinstance(result.grading, GradingSucceeded)
+    assert isinstance(result.grading.feedback, FeedbackFailed)
+    assert result.grading.feedback.error.stage == stage
+    assert result.grading.feedback.error.type == "RuntimeError"
+    grade_span = next(s for s in tracer.spans if s.name == "batch_grade")
+    assert grade_span.error is None
+    assert grade_span.output["feedback_error"]["stage"] == stage
+    if stage == "feedback_score":
+        assert len(feedback.stored) == 1
+        assert result.grading.feedback.result_id == "r-1"
+        assert grade_span.output["feedback_result_id"] == "r-1"
+    else:
+        assert feedback.stored == []
+        assert result.grading.feedback.result_id is None
+        assert "feedback_result_id" not in grade_span.output
+
+
+async def test_batch_feedback_not_configured_does_not_serialize():
+    def unexpected_serializer(value):
+        raise AssertionError("unconfigured feedback must not serialize")
+
+    result = await map_pipeline(
+        PipelineConfig(
+            name="p", steps=[], tracer=FakeTracer(),
+            feedback_serializer=unexpected_serializer,
+        ),
+        items=[1], batch_grader=FixedGrader(),
+    )
+    assert isinstance(result.grading, GradingSucceeded)
+    assert result.grading.feedback == FeedbackSkipped(reason="not_configured")
+
+
+async def test_batch_feedback_no_scores_does_not_persist():
+    class EmptyGrader(Grader):
+        async def grade(self, input, output, context=None):
+            return []
+
+    feedback = FakeFeedback()
+    result = await map_pipeline(
+        PipelineConfig(name="p", steps=[], tracer=FakeTracer(), feedback=feedback),
+        items=[1], batch_grader=EmptyGrader(),
+    )
+    assert isinstance(result.grading, GradingSucceeded)
+    assert result.grading.feedback == FeedbackSkipped(reason="no_scores")
+    assert result.scores == []
+    assert feedback.stored == []
+    assert feedback.scored == []
+
+
+async def test_batch_without_grader_does_not_persist():
+    feedback = FakeFeedback()
+    result = await map_pipeline(
+        PipelineConfig(name="p", steps=[], tracer=FakeTracer(), feedback=feedback),
+        items=[1],
+    )
+    assert result.grading is None
+    assert feedback.stored == []
+    assert feedback.scored == []
 
 
 async def test_feedback_persistence_failure_after_grading_retains_scores():
@@ -681,6 +825,8 @@ async def test_feedback_persistence_failure_after_grading_retains_scores():
     )
     assert result.scores is not None
     assert result.scores[0].value == 0.9
+    assert isinstance(result.grading, GradingSucceeded)
+    assert isinstance(result.grading.feedback, FeedbackFailed)
 
     grade_span = next(s for s in tracer.spans if s.name == "pipeline_grade")
     assert grade_span.error is None, "feedback persistence failure must not mark the span as errored"
@@ -701,5 +847,6 @@ async def test_successful_grading_still_stores_and_scores_feedback():
         input=1,
     )
     assert result.step_scores["add_one"][0].value == 0.5
+    assert isinstance(result.step_grading["add_one"], GradingSucceeded)
     assert len(feedback.stored) == 1
     assert len(feedback.scored) == 1

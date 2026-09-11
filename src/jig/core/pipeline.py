@@ -4,10 +4,10 @@ import json
 import logging
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Awaitable
 
-from jig.core.grading import grade_and_record
+from jig.core.grading import GradingResult, GradingSucceeded, grade_and_record
 from jig.core.types import FeedbackLoop, Grader, Score, SpanKind, TracingLogger
 
 logger = logging.getLogger(__name__)
@@ -61,6 +61,8 @@ class PipelineResult:
     duration_ms: float
     short_circuited: bool
     error_step: str | None
+    grading: GradingResult | None = None
+    step_grading: dict[str, GradingResult] = field(default_factory=dict)
 
 
 @dataclass
@@ -69,6 +71,7 @@ class MapResult:
     trace_id: str
     duration_ms: float
     scores: list[Score] | None
+    grading: GradingResult | None = None
 
 
 async def run_pipeline(
@@ -105,6 +108,7 @@ async def run_pipeline(
 
     step_outputs: dict[str, Any] = {}
     step_scores: dict[str, list[Score]] = {}
+    step_grading: dict[str, GradingResult] = {}
     short_circuited = False
     error_step: str | None = None
     error_detail: str | None = None
@@ -178,12 +182,14 @@ async def run_pipeline(
                     feedback_input_text=_serialize_for_feedback(input, config.feedback_serializer),
                     feedback_metadata=step_meta,
                 )
-                if step_outcome.scores is not None:
+                step_grading[step.name] = step_outcome
+                if isinstance(step_outcome, GradingSucceeded):
                     step_scores[step.name] = step_outcome.scores
 
         # 4. Pipeline-level grading — fail-soft: a grading failure does not
         # fail run_pipeline.
         pipeline_scores: list[Score] | None = None
+        pipeline_outcome: GradingResult | None = None
         if config.grader and not short_circuited:
             # Flush so trajectory graders see all step spans via
             # get_trace. End-step spans are already terminal; the
@@ -211,7 +217,8 @@ async def run_pipeline(
                 feedback_input_text=_serialize_for_feedback(input, config.feedback_serializer),
                 feedback_metadata=pl_meta,
             )
-            pipeline_scores = pipeline_outcome.scores
+            if isinstance(pipeline_outcome, GradingSucceeded):
+                pipeline_scores = pipeline_outcome.scores
 
     except Exception as exc:
         config.tracer.end_span(root.id, error=f"{type(exc).__name__}: {exc}")
@@ -242,6 +249,8 @@ async def run_pipeline(
         duration_ms=duration,
         short_circuited=short_circuited,
         error_step=error_step,
+        grading=pipeline_outcome,
+        step_grading=step_grading,
     )
 
 
@@ -271,9 +280,20 @@ async def map_pipeline(
         # Batch grading — fail-soft: a batch grading failure does not
         # discard completed item results.
         batch_scores: list[Score] | None = None
+        batch_outcome: GradingResult | None = None
         if batch_grader:
             await config.tracer.flush()
             all_outputs = [r.output for r in results]
+            batch_meta: dict[str, Any] = {
+                "kind": "pipeline_batch_result",
+                "pipeline_name": config.name,
+                "trace_id": parent.trace_id,
+                "item_count": len(items),
+            }
+            if config.metadata:
+                for _k in ("source", "tags", "model"):
+                    if _k in config.metadata:
+                        batch_meta[_k] = config.metadata[_k]
             batch_outcome = await grade_and_record(
                 tracer=config.tracer,
                 parent_span_id=parent.id,
@@ -282,8 +302,19 @@ async def map_pipeline(
                 grade_input=items,
                 grade_output=all_outputs,
                 grade_context={"raw_output": all_outputs, "trace_id": parent.trace_id},
+                feedback=config.feedback,
+                feedback_content=(
+                    _serialize_for_feedback(all_outputs, config.feedback_serializer)
+                    if config.feedback is not None else None
+                ),
+                feedback_input_text=(
+                    _serialize_for_feedback(items, config.feedback_serializer)
+                    if config.feedback is not None else None
+                ),
+                feedback_metadata=batch_meta,
             )
-            batch_scores = batch_outcome.scores
+            if isinstance(batch_outcome, GradingSucceeded):
+                batch_scores = batch_outcome.scores
 
         duration = (time.time() - start) * 1000
         config.tracer.end_span(parent.id, output={"item_count": len(results)})
@@ -297,6 +328,7 @@ async def map_pipeline(
             trace_id=parent.trace_id,
             duration_ms=duration,
             scores=batch_scores,
+            grading=batch_outcome,
         )
     except Exception as exc:
         config.tracer.end_span(parent.id, error=f"{type(exc).__name__}: {exc}")
