@@ -284,6 +284,16 @@ async def map_pipeline(
         if batch_grader:
             await config.tracer.flush()
             all_outputs = [r.output for r in results]
+            batch_meta: dict[str, Any] = {
+                "kind": "pipeline_batch_result",
+                "pipeline_name": config.name,
+                "trace_id": parent.trace_id,
+                "item_count": len(items),
+            }
+            if config.metadata:
+                for _k in ("source", "tags", "model"):
+                    if _k in config.metadata:
+                        batch_meta[_k] = config.metadata[_k]
             batch_outcome = await grade_and_record(
                 tracer=config.tracer,
                 parent_span_id=parent.id,
@@ -292,6 +302,16 @@ async def map_pipeline(
                 grade_input=items,
                 grade_output=all_outputs,
                 grade_context={"raw_output": all_outputs, "trace_id": parent.trace_id},
+                feedback=config.feedback,
+                feedback_content=(
+                    _serialize_for_feedback(all_outputs, config.feedback_serializer)
+                    if config.feedback is not None else None
+                ),
+                feedback_input_text=(
+                    _serialize_for_feedback(items, config.feedback_serializer)
+                    if config.feedback is not None else None
+                ),
+                feedback_metadata=batch_meta,
             )
             if isinstance(batch_outcome, GradingSucceeded):
                 batch_scores = batch_outcome.scores

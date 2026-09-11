@@ -148,6 +148,13 @@ Each step receives a context dict (`ctx`) and returns anything. The framework:
 
 Runs `run_pipeline` per item with a shared parent trace. Optionally grades the batch.
 
+With a `batch_grader` and configured `PipelineConfig.feedback`, batch scores are
+stored separately from per-item scores. The feedback serializer receives the
+whole input sequence and output list. Batch metadata includes
+`kind="pipeline_batch_result"`, pipeline name, trace ID, item count, and configured
+source/tags/model. `result.grading` reports grading and feedback outcomes;
+feedback failures preserve completed item results and computed scores.
+
 ```python
 from jig import map_pipeline
 

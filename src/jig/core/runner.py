@@ -337,7 +337,8 @@ class AgentResult[T]:
     finalize_reason: str | None = None
     # Independent result of the optional grading stage. A worker can succeed
     # while grading or feedback persistence fails, so this must not be folded
-    # into ``error``. None means grading was not requested.
+    # into ``error``. None means grading did not run (either no grader was
+    # requested or execution terminated before the grading stage).
     grading: GradingResult | None = None
 
 

@@ -174,7 +174,10 @@ async def grade_and_record(
     span_output: dict[str, Any] = {
         "scores": [{"dimension": s.dimension, "value": s.value} for s in scores],
     }
-    if isinstance(feedback_result, FeedbackStored):
+    if (
+        isinstance(feedback_result, (FeedbackStored, FeedbackFailed))
+        and feedback_result.result_id is not None
+    ):
         span_output["feedback_result_id"] = feedback_result.result_id
     if feedback_error is not None:
         span_output["feedback_error"] = {
