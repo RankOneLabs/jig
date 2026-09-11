@@ -1,20 +1,15 @@
 """Shared fail-soft grading policy for run_agent, pipelines, and batches.
 
-Grading (and the feedback persistence that follows a successful grade) must
-never turn a successful execution into a failed one. This module is the one
-place that policy is implemented, so run_agent, per-step pipeline grading,
-pipeline-level grading, and map_pipeline batch grading can't drift from each
-other.
-
-Only ``Exception`` is caught — never ``BaseException``. Cancellation,
-``KeyboardInterrupt``, and process-control signals are not grading failures
-and must keep propagating.
+Grading and feedback persistence are intermediate stages. Expected failures are
+returned as typed results: they never erase a successful worker output, and they
+never disappear into logs or tracing alone. Cancellation, ``KeyboardInterrupt``,
+and other process-control ``BaseException`` values continue to propagate.
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from jig.core.types import FeedbackLoop, Grader, Score, SpanKind, TracingLogger
 from jig.feedback.validation import validate_scores
@@ -22,20 +17,77 @@ from jig.feedback.validation import validate_scores
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class GradingOutcome:
-    """Result of :func:`grade_and_record`.
+@dataclass(frozen=True, slots=True)
+class StageError:
+    """Serializable identity of an expected intermediate-stage exception."""
 
-    ``scores`` is ``None`` when grading itself failed (grader raised, or
-    returned scores that failed validation) — distinct from a real empty
-    list, which means the grader ran successfully and assigned no scores.
-    ``feedback_result_id`` is ``None`` whenever feedback persistence did not
-    complete, whether because grading failed, there was nothing to store, or
-    storage itself failed.
-    """
+    stage: Literal["grade", "validate", "feedback_store", "feedback_score"]
+    type: str
+    message: str
 
-    scores: list[Score] | None
-    feedback_result_id: str | None
+
+@dataclass(frozen=True, slots=True)
+class FeedbackStored:
+    result_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class FeedbackSkipped:
+    reason: Literal["not_configured", "no_scores"]
+
+
+@dataclass(frozen=True, slots=True)
+class FeedbackFailed:
+    error: StageError
+    # store_result may succeed before score fails. Preserve that partial
+    # success instead of pretending no feedback row was created.
+    result_id: str | None = None
+
+
+type FeedbackResult = FeedbackStored | FeedbackSkipped | FeedbackFailed
+
+
+@dataclass(frozen=True, slots=True)
+class GradingSucceeded:
+    scores: list[Score]
+    feedback: FeedbackResult
+
+
+@dataclass(frozen=True, slots=True)
+class GradingFailed:
+    error: StageError
+
+
+type GradingResult = GradingSucceeded | GradingFailed
+
+
+def _stage_error(
+    stage: Literal["grade", "validate", "feedback_store", "feedback_score"],
+    exc: Exception,
+) -> StageError:
+    return StageError(stage=stage, type=type(exc).__name__, message=str(exc))
+
+
+def _record_grading_failure(
+    *,
+    tracer: TracingLogger,
+    span_id: str,
+    error: StageError,
+) -> GradingFailed:
+    logger.exception("grading failed (non-fatal, execution output preserved)")
+    tracer.end_span(
+        span_id,
+        output={
+            "scores": [],
+            "grading_error": {
+                "stage": error.stage,
+                "type": error.type,
+                "message": error.message,
+            },
+        },
+        error=f"{error.type}: {error.message}",
+    )
+    return GradingFailed(error=error)
 
 
 async def grade_and_record(
@@ -51,24 +103,26 @@ async def grade_and_record(
     feedback_content: str | None = None,
     feedback_input_text: str | None = None,
     feedback_metadata: dict[str, Any] | None = None,
-) -> GradingOutcome:
-    """Grade, then (if configured) persist the result — fail-soft throughout.
+) -> GradingResult:
+    """Grade and optionally persist feedback, returning every stage outcome.
 
-    Starts and closes one GRADING span. A grader exception or invalid score
-    output logs the failure, records ``grading_error`` (type + message) as
-    the span output, sets the span error, and returns ``scores=None`` —
-    execution output the caller already produced is untouched.
-
-    A feedback persistence failure (``store_result``/``score`` raising)
-    after a successful grade does not discard the scores already computed:
-    it's recorded as ``feedback_error`` on the span (which is not marked as
-    an error span), ``feedback_result_id`` is omitted, and the real scores
-    are still returned.
+    A grader exception or invalid score result returns :class:`GradingFailed`.
+    Feedback persistence happens only after successful grading and is represented
+    independently inside :class:`GradingSucceeded`, including partial success
+    when ``store_result`` succeeded but ``score`` failed.
     """
     grade_span = tracer.start_span(parent_span_id, SpanKind.GRADING, span_name)
 
     try:
         scores = await grader.grade(grade_input, grade_output, grade_context)
+    except Exception as exc:
+        return _record_grading_failure(
+            tracer=tracer,
+            span_id=grade_span.id,
+            error=_stage_error("grade", exc),
+        )
+
+    try:
         if not isinstance(scores, list):
             raise TypeError(
                 f"grader returned {type(scores).__name__}, expected list[Score]"
@@ -76,41 +130,71 @@ async def grade_and_record(
         if scores:
             validate_scores(scores)
     except Exception as exc:
-        logger.exception("grading failed (non-fatal, execution output preserved)")
-        tracer.end_span(
-            grade_span.id,
-            output={
-                "scores": [],
-                "grading_error": {"type": type(exc).__name__, "message": str(exc)},
-            },
-            error=f"{type(exc).__name__}: {exc}",
+        return _record_grading_failure(
+            tracer=tracer,
+            span_id=grade_span.id,
+            error=_stage_error("validate", exc),
         )
-        return GradingOutcome(scores=None, feedback_result_id=None)
 
+    feedback_result: FeedbackResult
+    feedback_error: StageError | None = None
     feedback_result_id: str | None = None
-    feedback_error: dict[str, str] | None = None
-    if feedback is not None and scores:
+    if feedback is None:
+        feedback_result = FeedbackSkipped(reason="not_configured")
+    elif not scores:
+        feedback_result = FeedbackSkipped(reason="no_scores")
+    else:
         try:
             feedback_result_id = await feedback.store_result(
                 feedback_content if feedback_content is not None else "",
                 feedback_input_text if feedback_input_text is not None else "",
                 feedback_metadata,
             )
-            await feedback.score(feedback_result_id, scores)
         except Exception as exc:
             logger.exception(
                 "feedback persistence failed after successful grading (non-fatal)"
             )
-            feedback_result_id = None
-            feedback_error = {"type": type(exc).__name__, "message": str(exc)}
+            feedback_error = _stage_error("feedback_store", exc)
+            feedback_result = FeedbackFailed(error=feedback_error)
+        else:
+            try:
+                await feedback.score(feedback_result_id, scores)
+            except Exception as exc:
+                logger.exception(
+                    "feedback persistence failed after successful grading (non-fatal)"
+                )
+                feedback_error = _stage_error("feedback_score", exc)
+                feedback_result = FeedbackFailed(
+                    error=feedback_error,
+                    result_id=feedback_result_id,
+                )
+            else:
+                feedback_result = FeedbackStored(result_id=feedback_result_id)
 
     span_output: dict[str, Any] = {
         "scores": [{"dimension": s.dimension, "value": s.value} for s in scores],
     }
-    if feedback_result_id is not None:
-        span_output["feedback_result_id"] = feedback_result_id
+    if isinstance(feedback_result, FeedbackStored):
+        span_output["feedback_result_id"] = feedback_result.result_id
     if feedback_error is not None:
-        span_output["feedback_error"] = feedback_error
+        span_output["feedback_error"] = {
+            "stage": feedback_error.stage,
+            "type": feedback_error.type,
+            "message": feedback_error.message,
+        }
     tracer.end_span(grade_span.id, output=span_output)
 
-    return GradingOutcome(scores=scores, feedback_result_id=feedback_result_id)
+    return GradingSucceeded(scores=scores, feedback=feedback_result)
+
+
+__all__ = [
+    "FeedbackFailed",
+    "FeedbackResult",
+    "FeedbackSkipped",
+    "FeedbackStored",
+    "GradingFailed",
+    "GradingResult",
+    "GradingSucceeded",
+    "StageError",
+    "grade_and_record",
+]

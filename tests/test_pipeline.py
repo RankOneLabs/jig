@@ -4,6 +4,9 @@ from datetime import datetime
 from typing import Any
 
 from jig import (
+    FeedbackFailed,
+    GradingFailed,
+    GradingSucceeded,
     PipelineConfig,
     Score,
     ScoreSource,
@@ -12,8 +15,14 @@ from jig import (
     map_pipeline,
     run_pipeline,
 )
-from jig.core.types import EvalCase, FeedbackLoop, Grader, ScoredResult, Span, TracingLogger
-
+from jig.core.types import (
+    EvalCase,
+    FeedbackLoop,
+    Grader,
+    ScoredResult,
+    Span,
+    TracingLogger,
+)
 
 # --- Fakes ---
 
@@ -481,6 +490,7 @@ async def test_pipeline_flushes_tracer_on_success():
     completed spans without a separate flush call."""
     import os
     import tempfile
+
     from jig.tracing import SQLiteTracer
 
     with tempfile.TemporaryDirectory() as d:
@@ -508,6 +518,7 @@ async def test_pipeline_flushes_tracer_on_exception():
     """run_pipeline flushes and closes the root span even when a step raises."""
     import os
     import tempfile
+
     from jig.tracing import SQLiteTracer
 
     async def boom(ctx: dict[str, Any]) -> str:
@@ -545,6 +556,7 @@ async def test_map_pipeline_closes_parent_on_exception():
     """map_pipeline closes the parent batch span and flushes on exception."""
     import os
     import tempfile
+
     from jig.tracing import SQLiteTracer
 
     async def boom(ctx: dict[str, Any]) -> str:
@@ -618,6 +630,8 @@ async def test_per_step_grading_failure_does_not_stop_later_steps():
     )
     assert result.step_outputs == {"add_one": 2, "double": 4, "to_string": "4"}
     assert "add_one" not in result.step_scores
+    assert isinstance(result.step_grading["add_one"], GradingFailed)
+    assert result.step_grading["add_one"].error.stage == "grade"
     assert not result.short_circuited
     assert result.error_step is None
 
@@ -653,6 +667,7 @@ async def test_pipeline_level_grading_failure_does_not_fail_run_pipeline():
     )
     assert result.output == 2
     assert result.scores is None
+    assert isinstance(result.grading, GradingFailed)
 
 
 async def test_batch_grading_failure_does_not_discard_item_results():
@@ -664,6 +679,7 @@ async def test_batch_grading_failure_does_not_discard_item_results():
     )
     assert [r.output for r in result.results] == [2, 3, 4]
     assert result.scores is None
+    assert isinstance(result.grading, GradingFailed)
 
 
 async def test_feedback_persistence_failure_after_grading_retains_scores():
@@ -681,6 +697,8 @@ async def test_feedback_persistence_failure_after_grading_retains_scores():
     )
     assert result.scores is not None
     assert result.scores[0].value == 0.9
+    assert isinstance(result.grading, GradingSucceeded)
+    assert isinstance(result.grading.feedback, FeedbackFailed)
 
     grade_span = next(s for s in tracer.spans if s.name == "pipeline_grade")
     assert grade_span.error is None, "feedback persistence failure must not mark the span as errored"
@@ -701,5 +719,6 @@ async def test_successful_grading_still_stores_and_scores_feedback():
         input=1,
     )
     assert result.step_scores["add_one"][0].value == 0.5
+    assert isinstance(result.step_grading["add_one"], GradingSucceeded)
     assert len(feedback.stored) == 1
     assert len(feedback.scored) == 1

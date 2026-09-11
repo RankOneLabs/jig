@@ -24,7 +24,7 @@ from jig.core.errors import (
     JigLLMError,
     UnsupportedResponseFormatError,
 )
-from jig.core.grading import grade_and_record
+from jig.core.grading import GradingResult, GradingSucceeded, grade_and_record
 from jig.core.prompt import build_human_feedback_section, build_system_message
 from jig.core.types import (
     CompletionParams,
@@ -40,12 +40,12 @@ from jig.core.types import (
     Role,
     RunControl,
     Score,
-    ScoreSource,
     ScoredResult,
+    ScoreSource,
     SpanKind,
     ToolCall,
-    ToolExecutionContext,
     ToolDefinition,
+    ToolExecutionContext,
     TracingLogger,
     current_tool_context,
 )
@@ -335,6 +335,10 @@ class AgentResult[T]:
     # paths alike — the single ``AgentResult(`` construction site below
     # always sets it.
     finalize_reason: str | None = None
+    # Independent result of the optional grading stage. A worker can succeed
+    # while grading or feedback persistence fails, so this must not be folded
+    # into ``error``. None means grading was not requested.
+    grading: GradingResult | None = None
 
 
 def _validate_output_schema(schema: type) -> None:
@@ -674,6 +678,7 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
     parsed: T | None = None
     structured_complete: Any | None = None
     scores: list[Score] | None = None
+    grading: GradingResult | None = None
     agent_error: AgentError | None = None
     total_usage: dict[str, Any] = {
         "total_input_tokens": 0,
@@ -1321,7 +1326,7 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                     fb_meta["session_id"] = config.session_id
                 if memory_id is not None:
                     fb_meta["memory_id"] = memory_id
-                outcome = await grade_and_record(
+                grading = await grade_and_record(
                     tracer=config.tracer,
                     parent_span_id=trace.id,
                     span_name="auto_grade",
@@ -1334,7 +1339,8 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
                     feedback_input_text=input,
                     feedback_metadata=fb_meta,
                 )
-                scores = outcome.scores
+                if isinstance(grading, GradingSucceeded):
+                    scores = grading.scores
     finally:
         # Always close the root span + flush the tracer, even if an
         # exception propagates mid-run. Buffered tracers (SQLiteTracer)
@@ -1353,4 +1359,5 @@ async def run_agent[T](config: AgentConfig[T], input: str) -> AgentResult[T]:
         parsed=parsed,
         error=agent_error,
         finalize_reason=finalize_reason,
+        grading=grading,
     )

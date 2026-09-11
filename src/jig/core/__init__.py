@@ -17,6 +17,16 @@ from jig.core.errors import (
     UnsupportedReasoningError,
     UnsupportedResponseFormatError,
 )
+from jig.core.grading import (
+    FeedbackFailed,
+    FeedbackResult,
+    FeedbackSkipped,
+    FeedbackStored,
+    GradingFailed,
+    GradingResult,
+    GradingSucceeded,
+    StageError,
+)
 from jig.core.pipeline import MapResult, PipelineConfig, PipelineResult, Step
 from jig.core.types import (
     CompletionParams,
@@ -58,8 +68,15 @@ __all__ = [
     "EffectiveScoreFilter",
     "EvalCase",
     "FeedbackLoop",
+    "FeedbackFailed",
+    "FeedbackResult",
+    "FeedbackSkipped",
+    "FeedbackStored",
     "FeedbackQuery",
     "Grader",
+    "GradingFailed",
+    "GradingResult",
+    "GradingSucceeded",
     "HumanExample",
     "HumanExampleDimension",
     "HumanExampleSet",
@@ -95,6 +112,7 @@ __all__ = [
     "Span",
     "SpanKind",
     "Step",
+    "StageError",
     "Tool",
     "ToolCall",
     "ToolDefinition",
