@@ -11,6 +11,12 @@ import pytest
 from jig import DispatchError, JobTimeoutError, dispatch_run
 from jig.core.errors import JigLLMError
 from jig.core.types import Tool, ToolCall, ToolDefinition
+from jig.dispatch import (
+    cancel_job,
+    cancel_or_fence,
+    get_job,
+    get_job_by_idempotency_key,
+)
 from jig.dispatch.client import _PollConfig
 from jig.tools import ToolRegistry
 
@@ -40,6 +46,129 @@ def _cancel_resp(status_code: int = 200):
     r.status_code = status_code
     r.raise_for_status = MagicMock()
     return r
+
+
+def _job_api_resp(data: Any, status_code: int = 200):
+    r = MagicMock(spec=httpx.Response)
+    r.status_code = status_code
+    r.text = str(data)
+    r.json.return_value = data
+    if status_code >= 400:
+        r.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "job API error", request=MagicMock(), response=r,
+        )
+    else:
+        r.raise_for_status = MagicMock()
+    return r
+
+
+@pytest.mark.asyncio
+class TestPublicJobAPI:
+    async def test_get_job_returns_wire_response(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        expected = {"job_id": "j-1", "status": "running", "machine": "frink"}
+        http.get.return_value = _job_api_resp(expected)
+
+        result = await get_job(
+            "j-1", dispatch_url="http://localhost:8900/", http=http,
+        )
+
+        assert result == expected
+        http.get.assert_awaited_once_with("http://localhost:8900/jobs/j-1")
+
+    async def test_get_job_maps_missing_job(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.get.return_value = _job_api_resp(
+            {"detail": "Job not found"}, status_code=404,
+        )
+
+        with pytest.raises(DispatchError) as raised:
+            await get_job("missing", http=http)
+
+        assert raised.value.job_id == "missing"
+        assert raised.value.status == "not_found"
+        assert raised.value.retryable is False
+
+    async def test_cancel_job_returns_acknowledged_state(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        expected = {"job_id": "j-1", "status": "cancelled"}
+        http.delete.return_value = _job_api_resp(expected)
+
+        result = await cancel_job(
+            "j-1", dispatch_url="http://localhost:8900", http=http,
+        )
+
+        assert result == expected
+        http.delete.assert_awaited_once_with("http://localhost:8900/jobs/j-1")
+
+    @pytest.mark.parametrize(
+        ("code", "status", "retryable"),
+        [(404, "not_found", False), (409, "already_terminal", False), (503, None, True)],
+    )
+    async def test_cancel_job_preserves_smithers_failure_semantics(
+        self, code, status, retryable,
+    ):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.delete.return_value = _job_api_resp({"detail": "no"}, status_code=code)
+
+        with pytest.raises(DispatchError) as raised:
+            await cancel_job("j-1", http=http)
+
+        assert raised.value.status == status
+        assert raised.value.retryable is retryable
+
+    async def test_get_job_by_idempotency_key_encodes_one_path_segment(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        expected = {"job_id": "j-1", "status": "running"}
+        http.get.return_value = _job_api_resp(expected)
+
+        result = await get_job_by_idempotency_key(
+            "attempt/7 retry", dispatch_url="http://localhost:8900/", http=http,
+        )
+
+        assert result == expected
+        http.get.assert_awaited_once_with(
+            "http://localhost:8900/jobs/by-idempotency/attempt%2F7%20retry",
+        )
+
+    async def test_get_job_by_idempotency_key_maps_not_found(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.get.return_value = _job_api_resp(
+            {"detail": "Job not found"}, status_code=404,
+        )
+
+        with pytest.raises(DispatchError) as raised:
+            await get_job_by_idempotency_key("missing", http=http)
+
+        assert raised.value.status == "not_found"
+        assert raised.value.retryable is False
+
+    @pytest.mark.parametrize("code", [200, 409])
+    async def test_cancel_or_fence_returns_durable_fence_outcome(self, code):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        expected = {"status": "cancelled", "job_id": "j-1"}
+        http.delete.return_value = _job_api_resp(expected, status_code=code)
+
+        result = await cancel_or_fence(
+            "attempt/7", dispatch_url="http://localhost:8900", http=http,
+        )
+
+        assert result == expected
+        http.delete.assert_awaited_once_with(
+            "http://localhost:8900/jobs/by-idempotency/attempt%2F7",
+        )
+
+    async def test_cancel_or_fence_503_is_retryable(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.delete.return_value = _job_api_resp(
+            {"detail": "Worker cancellation was not acknowledged"},
+            status_code=503,
+        )
+
+        with pytest.raises(DispatchError) as raised:
+            await cancel_or_fence("attempt-7", http=http)
+
+        assert raised.value.retryable is True
 
 
 @pytest.mark.asyncio
@@ -731,16 +860,43 @@ class TestOnSubmittedHook:
 
         assert seen == []
 
-    async def test_hook_exception_does_not_break_dispatch(self):
+    async def test_hook_exception_cancels_job_and_propagates(self):
         http = AsyncMock(spec=httpx.AsyncClient)
         http.post.return_value = _submit_resp()
-        http.get.return_value = _poll_resp(status="complete", result={"value": "ok"})
+        http.delete.return_value = _job_api_resp(
+            {"job_id": "j-1", "status": "cancelled"},
+        )
 
         def boom(job_id: str) -> None:
             raise RuntimeError("hook exploded")
 
+        with pytest.raises(RuntimeError, match="hook exploded"):
+            await dispatch_run(
+                "m:f", http=http, poll_interval=0.01, on_submitted=boom,
+            )
+
+        http.delete.assert_awaited_once_with(
+            "http://localhost:8900/jobs/j-1", timeout=10.0,
+        )
+
+    async def test_async_hook_is_awaited_before_polling(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        registered = False
+
+        async def register(job_id: str) -> None:
+            nonlocal registered
+            await asyncio.sleep(0)
+            registered = job_id == "j-1"
+
+        def poll_response(*args, **kwargs):
+            assert registered
+            return _poll_resp(status="complete", result={"value": "ok"})
+
+        http.get.side_effect = poll_response
+
         out = await dispatch_run(
-            "m:f", http=http, poll_interval=0.01, on_submitted=boom,
+            "m:f", http=http, poll_interval=0.01, on_submitted=register,
         )
 
         assert out == "ok"

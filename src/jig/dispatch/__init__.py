@@ -17,9 +17,12 @@ from jig.dispatch.client import (
     DispatchError,
     JobTimeoutError,
     aclose,
+    cancel_job,
+    cancel_or_fence,
+    get_job,
+    get_job_by_idempotency_key,
     run,
 )
-
 
 #: Reserved result key marking a dispatched function's business failure.
 #: Single source of truth for the wire contract — ``tool_error`` writes it
@@ -84,13 +87,17 @@ def __getattr__(name: str):
 
 
 __all__ = [
+    "TOOL_ERROR_KEY",
     "CallbackListener",
     "DispatchBusinessError",
     "DispatchError",
     "JobTimeoutError",
     "ListenerError",
-    "TOOL_ERROR_KEY",
     "aclose",
+    "cancel_job",
+    "cancel_or_fence",
+    "get_job",
+    "get_job_by_idempotency_key",
     "listen",
     "run",
     "stop",
