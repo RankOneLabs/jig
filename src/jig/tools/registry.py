@@ -388,10 +388,9 @@ class ToolRegistry:
             # Runs outside the execute_timeout wait_for above: that
             # budget is for the remote job, and local reconciliation
             # (e.g. persisting a completion row) must not be clipped by
-            # it. Unlike on_dispatch_submitted, exceptions here are NOT
-            # swallowed — a failed reconciliation means downstream state
-            # is unrecorded, and the model must not proceed as if the
-            # result were usable.
+            # it. Exceptions here are NOT swallowed — a failed
+            # reconciliation means downstream state is unrecorded, and the
+            # model must not proceed as if the result were usable.
             try:
                 replacement = on_dispatch_result(result, tool_context)
                 if inspect.isawaitable(replacement):

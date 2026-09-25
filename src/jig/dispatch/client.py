@@ -112,6 +112,40 @@ class _PollConfig:
     poll_max_interval: float = 5.0
 
 
+async def _delete_remote_job(
+    http: httpx.AsyncClient,
+    url: str,
+    job_id: str,
+) -> None:
+    """Cancel one job by id, raising when the cancellation is unacknowledged.
+
+    Smithers waits for its worker cancellation before marking the job
+    cancelled, so awaiting this endpoint also creates the ordering guarantee
+    callers need before they submit a retry. A terminal or missing job (409 /
+    404) is already safe. Anything else is reported as a
+    :class:`DispatchError` so the caller can decide whether an unacknowledged
+    cancellation matters on its path.
+    """
+    try:
+        response = await http.delete(f"{url}/jobs/{job_id}", timeout=10.0)
+        if response.status_code in (404, 409):
+            return
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code
+        raise DispatchError(
+            f"Dispatch job {job_id} cancellation failed: {code} {exc.response.text}",
+            job_id=job_id,
+            retryable=code >= 500,
+        ) from exc
+    except Exception as exc:
+        raise DispatchError(
+            f"Dispatch job {job_id} cancellation failed: {exc}",
+            job_id=job_id,
+            retryable=True,
+        ) from exc
+
+
 async def _cancel_remote_job(
     http: httpx.AsyncClient,
     url: str,
@@ -119,19 +153,69 @@ async def _cancel_remote_job(
 ) -> None:
     """Best-effort cancellation for a request/response caller that gave up.
 
-    Smithers waits for its worker cancellation before marking the job
-    cancelled, so awaiting this endpoint also creates the ordering guarantee
-    callers need before they submit a retry. A terminal or missing job is
-    already safe; transport failures are logged because cancellation must not
-    replace the original timeout/cancellation exception.
+    Transport failures are logged rather than raised because on the timeout
+    and caller-cancellation paths the cancellation must not replace the
+    original timeout/cancellation exception. Paths where an unacknowledged
+    cancellation is itself a correctness problem use
+    :func:`_fence_rejected_submission` instead.
     """
     try:
-        response = await http.delete(f"{url}/jobs/{job_id}", timeout=10.0)
-        if response.status_code in (404, 409):
-            return
-        response.raise_for_status()
-    except Exception as exc:
+        await _delete_remote_job(http, url, job_id)
+    except DispatchError as exc:
         logger.warning("Could not cancel dispatch job %s: %s", job_id, exc)
+
+
+# A rejected registration is rare and the retry is cheap, so spend a few
+# attempts on a retryable cancellation before giving up and reporting it.
+_FENCE_ATTEMPTS = 3
+_FENCE_RETRY_SECONDS = 0.5
+
+
+async def _fence_rejected_submission(
+    *,
+    http: httpx.AsyncClient,
+    url: str,
+    job_id: str,
+    idempotency_key: str | None,
+) -> DispatchError | None:
+    """Durably stop an accepted job whose registration hook rejected it.
+
+    Returns ``None`` once cancellation is acknowledged, or the last
+    :class:`DispatchError` when it never was. The caller attaches that error
+    to the hook exception rather than swallowing it: an unacknowledged
+    cancellation means the job may still be running, so a retry under the
+    same idempotency key can reuse live work — exactly what the
+    record-or-cancel boundary exists to prevent.
+
+    ``cancel_or_fence`` is preferred when the submission carried an
+    idempotency key, because smithers records a tombstone against the key
+    even when no job is visible yet. The per-job ``DELETE`` only speaks to
+    the attempt in hand.
+    """
+    last_error: DispatchError | None = None
+    for attempt in range(1, _FENCE_ATTEMPTS + 1):
+        try:
+            if idempotency_key is not None:
+                await cancel_or_fence(
+                    idempotency_key, dispatch_url=url, http=http,
+                )
+            else:
+                await _delete_remote_job(http, url, job_id)
+            return None
+        except DispatchError as exc:
+            last_error = exc
+            if not exc.retryable or attempt == _FENCE_ATTEMPTS:
+                break
+            logger.warning(
+                "Cancellation of dispatch job %s unacknowledged "
+                "(attempt %d/%d): %s",
+                job_id,
+                attempt,
+                _FENCE_ATTEMPTS,
+                exc,
+            )
+            await asyncio.sleep(_FENCE_RETRY_SECONDS)
+    return last_error
 
 
 async def _wait_for_terminal(
@@ -313,7 +397,11 @@ async def _submit_and_poll(
     The hook may be synchronous or asynchronous.  It completes before Jig
     begins waiting for the result.  If it rejects, Jig cancels the accepted
     remote job before propagating the hook exception, providing a safe
-    record-or-cancel boundary for durable correlation stores.
+    record-or-cancel boundary for durable correlation stores.  That
+    cancellation goes through the durable idempotency-key fence when the
+    submission carried a key, and a cancellation smithers never acknowledges
+    is retried and then reported as a note on the propagated hook exception
+    — never silently swallowed, because the job may still be running.
 
     When ``listener`` is provided (and its health check passes), the wait
     is an ``asyncio.Future`` resolved by a smithers HTTP callback —
@@ -414,12 +502,34 @@ async def _submit_and_poll(
             hook_result = on_submitted(job_id)
             if inspect.isawaitable(hook_result):
                 await hook_result
-        except BaseException:
+        except BaseException as hook_error:
             # Acceptance already happened.  Do not leave uncorrelated work
             # running when its durable registration fence rejects.
-            await asyncio.shield(_cancel_remote_job(http, url, job_id))
+            cancel_error = await asyncio.shield(
+                _fence_rejected_submission(
+                    http=http,
+                    url=url,
+                    job_id=job_id,
+                    idempotency_key=idempotency_key,
+                ),
+            )
             if listener is not None and callback_nonce is not None:
                 listener.unregister(callback_nonce)
+            if cancel_error is not None:
+                # The hook failure stays the raised exception — it is what the
+                # caller asked about — but it must not read as a clean
+                # record-or-cancel rejection when the job may still be live.
+                logger.error(
+                    "Dispatch job %s may still be running after its "
+                    "on_submitted hook rejected it: %s",
+                    job_id,
+                    cancel_error,
+                )
+                hook_error.add_note(
+                    f"Dispatch job {job_id} was not confirmed cancelled after "
+                    f"this hook rejected it and may still be running: "
+                    f"{cancel_error}",
+                )
             raise
     wait_timeout_seconds = max(
         0.0,

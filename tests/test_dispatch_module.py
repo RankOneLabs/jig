@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -877,6 +877,107 @@ class TestOnSubmittedHook:
 
         http.delete.assert_awaited_once_with(
             "http://localhost:8900/jobs/j-1", timeout=10.0,
+        )
+
+    async def test_hook_exception_fences_by_idempotency_key(self):
+        """With a key in play, the rejection path uses the durable fence —
+        a per-job DELETE only speaks to the attempt in hand."""
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.delete.return_value = _job_api_resp(
+            {"job_id": "j-1", "status": "cancelled"},
+        )
+
+        def boom(job_id: str) -> None:
+            raise RuntimeError("hook exploded")
+
+        with pytest.raises(RuntimeError, match="hook exploded"):
+            await dispatch_run(
+                "m:f",
+                http=http,
+                poll_interval=0.01,
+                on_submitted=boom,
+                idempotency_key="attempt-7",
+            )
+
+        http.delete.assert_awaited_once_with(
+            "http://localhost:8900/jobs/by-idempotency/attempt-7",
+        )
+
+    async def test_unacknowledged_cancellation_is_reported_on_hook_error(self):
+        """A 503 fence must not read as a clean record-or-cancel rejection —
+        the job may still be running."""
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.delete.return_value = _job_api_resp({"detail": "not acked"}, 503)
+
+        def boom(job_id: str) -> None:
+            raise RuntimeError("hook exploded")
+
+        with (
+            patch("jig.dispatch.client._FENCE_RETRY_SECONDS", 0),
+            pytest.raises(RuntimeError, match="hook exploded") as caught,
+        ):
+            await dispatch_run(
+                "m:f",
+                http=http,
+                poll_interval=0.01,
+                on_submitted=boom,
+                idempotency_key="attempt-7",
+            )
+
+        assert any(
+            "may still be running" in note
+            for note in getattr(caught.value, "__notes__", [])
+        )
+
+    async def test_unacknowledged_cancellation_is_retried(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.delete.side_effect = [
+            _job_api_resp({"detail": "not acked"}, 503),
+            _job_api_resp({"job_id": "j-1", "status": "cancelled"}),
+        ]
+
+        def boom(job_id: str) -> None:
+            raise RuntimeError("hook exploded")
+
+        with (
+            patch("jig.dispatch.client._FENCE_RETRY_SECONDS", 0),
+            pytest.raises(RuntimeError, match="hook exploded") as caught,
+        ):
+            await dispatch_run(
+                "m:f",
+                http=http,
+                poll_interval=0.01,
+                on_submitted=boom,
+                idempotency_key="attempt-7",
+            )
+
+        assert http.delete.await_count == 2
+        assert not getattr(caught.value, "__notes__", [])
+
+    async def test_non_retryable_cancellation_failure_is_not_retried(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.delete.return_value = _job_api_resp({"detail": "bad key"}, 400)
+
+        def boom(job_id: str) -> None:
+            raise RuntimeError("hook exploded")
+
+        with pytest.raises(RuntimeError, match="hook exploded") as caught:
+            await dispatch_run(
+                "m:f",
+                http=http,
+                poll_interval=0.01,
+                on_submitted=boom,
+                idempotency_key="attempt-7",
+            )
+
+        assert http.delete.await_count == 1
+        assert any(
+            "may still be running" in note
+            for note in getattr(caught.value, "__notes__", [])
         )
 
     async def test_async_hook_is_awaited_before_polling(self):

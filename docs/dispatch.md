@@ -126,14 +126,23 @@ duck-typed — define the method to opt in, omit it and nothing changes.
 | hook | when | raising |
 |---|---|---|
 | `pre_dispatch(arguments, context)` | before `dispatch_payload_extra`, before anything ships | rejects the call; message becomes `ToolResult.error` prefixed `gate:` |
-| `on_dispatch_submitted(job_id)` | after the job is accepted, before the terminal wait | logged and swallowed |
+| `on_dispatch_submitted(job_id)` | after the job is accepted, before the terminal wait | cancels the accepted job, then propagates — **not** swallowed |
 | `on_dispatch_result(result, context)` | after the job returns successfully | becomes `ToolResult.error` — **not** swallowed |
 | `on_dispatch_error(error, context)` | after the job fails | logged and swallowed |
 
-`pre_dispatch`, `on_dispatch_result`, and `on_dispatch_error` may be sync
-or async; the registry awaits an awaitable return. `on_dispatch_submitted`
-is called synchronously by the dispatch client and its return value is
-never awaited, so defining it `async` silently does nothing.
+All four hooks may be sync or async; an awaitable return is awaited —
+`pre_dispatch`, `on_dispatch_result` and `on_dispatch_error` by the
+registry, `on_dispatch_submitted` by the dispatch client, which completes
+it before the terminal wait begins.
+
+`on_dispatch_submitted` is the durable-correlation fence, so its exceptions
+are **not** swallowed: the job is already accepted, and work nobody recorded
+must not keep running. The client cancels the accepted job — through the
+idempotency-key fence when the submission carried a key, otherwise by job id
+— and then re-raises the hook's exception. When smithers never acknowledges
+that cancellation, the client retries and then attaches a note to the
+propagated exception saying the job may still be running; it is never
+reported as a clean rejection.
 
 `pre_dispatch` shares `dispatch_payload_extra`'s flexible calling
 convention: its parameters may be named `context`/`tool_context`/`ctx` and
