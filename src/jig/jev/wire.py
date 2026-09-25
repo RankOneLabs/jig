@@ -95,6 +95,8 @@ def parse_response(
         question = requested.get(question_id)
         if question is None:
             continue
+        if not isinstance(question, (NoulQuestion, ChoiceQuestion, ScoreQuestion)):
+            raise ValueError(f"unknown question type {type(question).__name__}")
         prefix = f"answer {question_id!r}"
         if not isinstance(raw_answer, dict):
             violations.append(f"{prefix} must be an object")
@@ -114,8 +116,7 @@ def parse_response(
             _check_distribution(raw_answer.get("probabilities"), set(question.criteria),
                                 f"{prefix}.probabilities", violations)
             _check_unit(raw_answer.get("confidence"), f"{prefix}.confidence", violations)
-        else:
-            assert isinstance(question, ScoreQuestion)
+        elif isinstance(question, ScoreQuestion):
             score = raw_answer.get("score")
             if not _finite_number(score) or not 0 <= score <= len(question.criteria) - 1:
                 violations.append(f"{prefix}.score must be within level range")
@@ -126,8 +127,8 @@ def parse_response(
             if legend is not None:
                 if not isinstance(legend, dict):
                     violations.append(f"{prefix}.legend must be an object or null")
-                elif set(legend) != level_keys:
-                    violations.append(f"{prefix}.legend levels must match requested levels")
+                elif any(not isinstance(key, str) for key in legend):
+                    violations.append(f"{prefix}.legend keys must be strings")
             _check_unit(raw_answer.get("confidence"), f"{prefix}.confidence", violations)
 
     if violations:
@@ -148,11 +149,13 @@ def parse_response(
                 question_id, raw_answer["choice"], raw_answer["probabilities"],
                 raw_answer["confidence"],
             )
-        else:
+        elif isinstance(question, ScoreQuestion):
             answers[question_id] = ScoreAnswer(
                 question_id, raw_answer["score"], raw_answer["probabilities"],
                 raw_answer.get("legend"), raw_answer["confidence"],
             )
+        else:
+            raise ValueError(f"unknown question type {type(question).__name__}")
     return JevResult(
         model=model, answers=answers,
         usage=JevUsage(raw_usage["input_tokens"], raw_usage["output_tokens"]),

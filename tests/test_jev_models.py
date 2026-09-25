@@ -1,4 +1,6 @@
+import ast
 import dataclasses
+from pathlib import Path
 
 import pytest
 
@@ -33,6 +35,21 @@ def test_score_level_bounds_and_order():
     for count in (2, 10):
         levels = [f"level {i}" for i in range(count)]
         assert ScoreQuestion("q", "?", levels).criteria is levels
+    with pytest.raises(ValueError, match="ordered levels"):
+        ScoreQuestion("q", "?", ("low", "high"))
+
+
+def test_protocol_modules_do_not_import_httpx():
+    jev_dir = Path(__file__).resolve().parents[1] / "src" / "jig" / "jev"
+    for name in ("__init__.py", "models.py", "errors.py", "wire.py"):
+        module = ast.parse((jev_dir / name).read_text())
+        for node in ast.walk(module):
+            if isinstance(node, ast.Import):
+                assert all(alias.name != "httpx" and not alias.name.startswith("httpx.")
+                           for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                assert node.module is None or (node.module != "httpx" and
+                                               not node.module.startswith("httpx."))
 
 
 def test_answer_and_usage_field_sets():

@@ -49,7 +49,7 @@ class ScoreQuestion:
     criteria: list[JevJson]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.criteria, (list, tuple)) or not 2 <= len(self.criteria) <= 10:
+        if not isinstance(self.criteria, list) or not 2 <= len(self.criteria) <= 10:
             raise ValueError("Score criteria must contain 2 to 10 ordered levels")
 
 

@@ -58,6 +58,24 @@ def test_parse_realistic_response_and_optional_request_id():
     assert parse(payload).provider_request_id is None
 
 
+def test_partial_legend_is_preserved_and_non_string_keys_are_rejected():
+    payload = response()
+    legend = {"0": {"summary": "low"}}
+    payload["answers"]["s"]["legend"] = legend
+    assert parse(payload).answers["s"].legend is legend
+    legend[1] = {"summary": "high"}
+    with pytest.raises(JevError, match="legend keys must be strings"):
+        parse(payload)
+
+
+def test_unknown_question_type_raises_explicitly():
+    class UnknownQuestion:
+        id = "n"
+
+    with pytest.raises(ValueError, match="unknown question type UnknownQuestion"):
+        parse_response(response(), "call-1", 25.0, 2, [UnknownQuestion(), *QUESTIONS[1:]])
+
+
 def test_invalid_distributions():
     for total in (0.5, 1.5):
         payload = response()
