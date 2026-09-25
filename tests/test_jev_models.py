@@ -5,7 +5,8 @@ from pathlib import Path
 import pytest
 
 from jig.jev import (
-    ChoiceQuestion, JevError, JevUsage, NoulAnswer, NoulQuestion, ScoreQuestion,
+    ChoiceQuestion, JevError, JevResult, JevUsage, NoulAnswer, NoulQuestion,
+    ScoreQuestion,
 )
 from jig.jev.errors import JEV_ERROR_DETAIL_MAX_LENGTH
 
@@ -60,6 +61,12 @@ def test_answer_and_usage_field_sets():
         "input_tokens", "output_tokens"
     ]
     assert not hasattr(JevUsage(1, 2), "cost")
+
+
+def test_result_elapsed_alias_preserves_latency_field():
+    result = JevResult("jev-1", {}, JevUsage(1, 2), 37.5, "call-1", None, 2)
+    assert result.elapsed_ms == result.latency_ms == 37.5
+    assert [field.name for field in dataclasses.fields(JevResult)].count("elapsed_ms") == 0
 
 
 def test_error_detail_cap():

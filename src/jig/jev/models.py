@@ -97,3 +97,8 @@ class JevResult:
     call_id: str
     provider_request_id: str | None
     attempts: int
+
+    @property
+    def elapsed_ms(self) -> float:
+        """Total call time, also available as ``latency_ms`` for compatibility."""
+        return self.latency_ms
