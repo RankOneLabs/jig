@@ -165,7 +165,12 @@ def parse_response(
 
 
 def _finite_number(value: Any) -> bool:
-    return type(value) in (int, float) and math.isfinite(value)
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _check_unit(value: Any, path: str, violations: list[str]) -> None:

@@ -91,6 +91,21 @@ def test_invalid_distributions():
         assert caught.value.kind == "invalid_response"
 
 
+def test_huge_json_integers_are_invalid_responses():
+    huge_integer = 10 ** 400
+    for answer_id, field in (("n", "noul"), ("s", "score"),
+                             ("c", "confidence"), ("c", "probabilities")):
+        payload = response()
+        answer = payload["answers"][answer_id]
+        if field == "probabilities":
+            answer[field]["a.b"] = huge_integer
+        else:
+            answer[field] = huge_integer
+        with pytest.raises(JevError) as caught:
+            parse(json.loads(json.dumps(payload)))
+        assert caught.value.kind == "invalid_response"
+
+
 def test_all_answers_validate_before_result():
     payload = response()
     payload["answers"]["extra_good"] = {"type": "noul", "noul": 0.4}
