@@ -156,7 +156,18 @@ class TestPublicJobAPI:
         assert result == expected
         http.delete.assert_awaited_once_with(
             "http://localhost:8900/jobs/by-idempotency/attempt%2F7",
+            timeout=10.0,
         )
+
+    async def test_cancel_or_fence_is_bounded_without_a_client_default(self):
+        """An explicit timeout, so a client built with ``timeout=None`` cannot
+        leave a stalled fence holding the caller's exception indefinitely."""
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.delete.return_value = _job_api_resp({"status": "cancelled"})
+
+        await cancel_or_fence("attempt-7", http=http)
+
+        assert http.delete.await_args.kwargs["timeout"] is not None
 
     async def test_cancel_or_fence_503_is_retryable(self):
         http = AsyncMock(spec=httpx.AsyncClient)
@@ -902,6 +913,7 @@ class TestOnSubmittedHook:
 
         http.delete.assert_awaited_once_with(
             "http://localhost:8900/jobs/by-idempotency/attempt-7",
+            timeout=10.0,
         )
 
     async def test_unacknowledged_cancellation_is_reported_on_hook_error(self):
@@ -977,6 +989,99 @@ class TestOnSubmittedHook:
         assert http.delete.await_count == 1
         assert any(
             "may still be running" in note
+            for note in getattr(caught.value, "__notes__", [])
+        )
+
+    async def test_completed_job_is_not_reported_as_a_clean_cancellation(self):
+        """A 409 fence on a job that already finished means its effects
+        landed — the opposite of what a record-or-cancel rejection claims."""
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.delete.return_value = _job_api_resp(
+            {"job_id": "j-1", "status": "complete"}, status_code=409,
+        )
+
+        def boom(job_id: str) -> None:
+            raise RuntimeError("hook exploded")
+
+        with pytest.raises(RuntimeError, match="hook exploded") as caught:
+            await dispatch_run(
+                "m:f",
+                http=http,
+                poll_interval=0.01,
+                on_submitted=boom,
+                idempotency_key="attempt-7",
+            )
+
+        notes = getattr(caught.value, "__notes__", [])
+        assert any("'complete'" in note for note in notes)
+        assert any("effects landed" in note for note in notes)
+
+    async def test_terminal_fence_without_a_status_still_warns(self):
+        """Terminality of an unknown kind must not silently pass as a clean
+        stop — the caller is told the job reached a terminal state."""
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.delete.return_value = _job_api_resp({}, status_code=409)
+
+        def boom(job_id: str) -> None:
+            raise RuntimeError("hook exploded")
+
+        with pytest.raises(RuntimeError, match="hook exploded") as caught:
+            await dispatch_run(
+                "m:f",
+                http=http,
+                poll_interval=0.01,
+                on_submitted=boom,
+                idempotency_key="attempt-7",
+            )
+
+        assert any(
+            "already terminal" in note
+            for note in getattr(caught.value, "__notes__", [])
+        )
+
+    async def test_cancelled_fence_is_reported_as_clean(self):
+        """The ordinary case still carries no warning at all."""
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.delete.return_value = _job_api_resp(
+            {"job_id": "j-1", "status": "cancelled"}, status_code=409,
+        )
+
+        def boom(job_id: str) -> None:
+            raise RuntimeError("hook exploded")
+
+        with pytest.raises(RuntimeError, match="hook exploded") as caught:
+            await dispatch_run(
+                "m:f",
+                http=http,
+                poll_interval=0.01,
+                on_submitted=boom,
+                idempotency_key="attempt-7",
+            )
+
+        assert not getattr(caught.value, "__notes__", [])
+
+    async def test_keyless_terminal_cancellation_reads_back_the_outcome(self):
+        """Without a key the per-job DELETE answers 409 without saying which
+        terminal state it found, so the client reads the job to find out."""
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.delete.return_value = _job_api_resp({}, status_code=409)
+        http.get.return_value = _job_api_resp({"id": "j-1", "status": "complete"})
+
+        def boom(job_id: str) -> None:
+            raise RuntimeError("hook exploded")
+
+        with pytest.raises(RuntimeError, match="hook exploded") as caught:
+            await dispatch_run(
+                "m:f", http=http, poll_interval=0.01, on_submitted=boom,
+            )
+
+        http.get.assert_awaited_once_with("http://localhost:8900/jobs/j-1")
+        assert any(
+            "'complete'" in note
             for note in getattr(caught.value, "__notes__", [])
         )
 
@@ -1074,6 +1179,28 @@ class TestRegistryOnSubmittedPlumbed:
         await reg.execute(ToolCall(id="c1", name="backtest", arguments={}))
 
         assert "on_submitted" not in captured
+
+    async def test_fence_warning_survives_into_the_tool_result(self, monkeypatch):
+        """The failed-fence warning rides on the exception as a note, and
+        ToolResult.error is built from str(e) — which drops notes. It is the
+        only signal the caller gets that the job may still be running, so it
+        has to survive the registry boundary."""
+        async def fake_run(fn_ref, payload=None, **kwargs):
+            error = RuntimeError("registration rejected")
+            error.add_note("Dispatch job j-9 ... may still be running: 503")
+            raise error
+
+        import jig.dispatch
+        monkeypatch.setattr(jig.dispatch, "run", fake_run)
+
+        reg = ToolRegistry([_DispatchedToolWithHook()])
+        result = await reg.execute(
+            ToolCall(id="c1", name="backtest", arguments={}),
+        )
+
+        assert result.error is not None
+        assert "registration rejected" in result.error
+        assert "may still be running" in result.error
 
 
 class TestStrictToolPayload:

@@ -314,7 +314,7 @@ class ToolRegistry:
             # the only signal, same as a gate rejection has always been.
             # No phase in the fallback: it is already the error's prefix.
             msg = str(e) or "tool raised without message"
-            error = f"{e.phase}: {msg}"
+            error = _with_notes(f"{e.phase}: {msg}", e)
             logger.warning("tool.execute %s error name=%s err=%s", e.phase, call.name, error)
             return ToolResult(call_id=call.id, output="", error=error)
         except asyncio.TimeoutError as e:
@@ -329,6 +329,7 @@ class ToolRegistry:
         except DispatchError as e:
             msg = str(e)
             error = f"{type(e).__name__}: {msg}" if msg else f"{type(e).__name__}: tool raised without message"
+            error = _with_notes(error, e)
             logger.warning("tool.execute dispatch error name=%s err=%s", call.name, error)
             if dispatch_entered:
                 await _fire_dispatch_error_hook(tool, e, tool_context)
@@ -343,6 +344,7 @@ class ToolRegistry:
             # JigToolError lands here with nothing shipped.
             msg = str(e)
             error = f"{type(e).__name__}: {msg}" if msg else f"{type(e).__name__}: tool raised without message"
+            error = _with_notes(error, e)
             logger.warning("tool.execute dispatch error name=%s err=%s", call.name, error, exc_info=True)
             if dispatch_entered:
                 await _fire_dispatch_error_hook(tool, e, tool_context)
@@ -489,6 +491,21 @@ def _schema_validation_error(validator: Any, arguments: dict[str, Any] | None) -
     if hint:
         msg = f"{msg} — {hint}"
     return msg
+
+
+def _with_notes(error: str, exc: BaseException) -> str:
+    """Fold ``BaseException.__notes__`` into a model-visible error message.
+
+    ``str(exc)`` drops notes, and a note is the only carrier the dispatch
+    client has for "this job may still be running" (or "it already ran") after
+    a submission hook rejected it — the one thing a tool caller most needs to
+    know about that failure. Without this the warning dies at the registry
+    boundary. No notes, no change.
+    """
+    notes = getattr(exc, "__notes__", None)
+    if not notes:
+        return error
+    return "; ".join([error, *notes])
 
 
 def _call_context_hook(

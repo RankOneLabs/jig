@@ -139,10 +139,28 @@ it before the terminal wait begins.
 are **not** swallowed: the job is already accepted, and work nobody recorded
 must not keep running. The client cancels the accepted job — through the
 idempotency-key fence when the submission carried a key, otherwise by job id
-— and then re-raises the hook's exception. When smithers never acknowledges
-that cancellation, the client retries and then attaches a note to the
-propagated exception saying the job may still be running; it is never
-reported as a clean rejection.
+— and then re-raises the hook's exception.
+
+Only one of the three ways that cancellation can land is a clean rejection,
+and the other two are reported on the propagated exception as a note (and an
+error-level log), never swallowed:
+
+| cancellation outcome | what the caller is told |
+|---|---|
+| smithers confirms the job stopped | nothing extra — the boundary held |
+| smithers never acknowledges it | retried, then a note saying the job **may still be running** |
+| the job was already terminal for another reason | a note naming the status it reached, because its effects landed |
+
+That last row is the one worth reading twice. A cancellation request against a
+job that already ran answers the same way whether it was cancelled or
+completed, so the client resolves which — from the fence response when the
+submission carried an idempotency key, otherwise with one extra `GET
+/jobs/{id}` — rather than presenting a completed job as cancelled work. A
+status it cannot read is reported as terminal-of-unknown-kind, not as a clean
+stop.
+
+For a dispatched tool these notes are folded into `ToolResult.error`, so the
+warning reaches the model rather than dying at the registry boundary.
 
 `pre_dispatch` shares `dispatch_payload_extra`'s flexible calling
 convention: its parameters may be named `context`/`tool_context`/`ctx` and
