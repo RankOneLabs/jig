@@ -60,6 +60,7 @@ class JevClient:
         started = time.monotonic()
         deadline = started + self.timeout
         attempts = 0
+        last_retryable: tuple[JevErrorKind, int] | None = None
 
         def elapsed_ms() -> float:
             return (time.monotonic() - started) * 1000
@@ -73,6 +74,8 @@ class JevClient:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                if last_retryable is not None:
+                    raise failure(*last_retryable)
                 raise failure("timeout")
             attempts += 1
             try:
@@ -96,6 +99,7 @@ class JevClient:
                 }
                 kind = status_kinds.get(status, "invalid_response")
                 if kind in ("rate_limited", "overloaded") and attempts <= self.max_retries:
+                    last_retryable = (kind, status)
                     remaining = deadline - time.monotonic()
                     if remaining > 0:
                         delay = min(_BACKOFF_SECONDS * (2 ** (attempts - 1)), remaining)

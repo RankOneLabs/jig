@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -83,9 +84,12 @@ async def test_endpoint_override_and_context_manager():
 
 
 async def test_owned_context_closes_transport():
-    async with JevClient(api_key="key") as client:
-        assert not client._http.is_closed
-    assert client._http.is_closed
+    http = mock_client(lambda _request: pytest.fail("unexpected request"))
+    with patch("jig.jev.client.httpx.AsyncClient", return_value=http):
+        async with JevClient(api_key="key") as client:
+            assert client._http is http
+            assert not http.is_closed
+    assert http.is_closed
     await client.aclose()
 
 
@@ -121,9 +125,11 @@ async def test_retry_respects_total_deadline():
         start = time.monotonic()
         with pytest.raises(JevError) as caught:
             await client.evaluate({}, [QUESTION])
-    assert caught.value.kind in ("rate_limited", "timeout")
+        elapsed = time.monotonic() - start
+    assert caught.value.kind == "rate_limited"
+    assert caught.value.status_code == 429
     assert calls <= 2
-    assert time.monotonic() - start < 0.12
+    assert elapsed <= client.timeout + 0.01
 
 
 async def test_cancel_in_flight_request_propagates():

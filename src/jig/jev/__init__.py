@@ -1,4 +1,4 @@
-"""Pure types and wire transforms for TypeSafe Jev evaluations."""
+"""TypeSafe Jev client, protocol types, and wire transforms."""
 
 from jig.jev.errors import JevError, JevErrorKind
 from jig.jev.client import DEFAULT_ENDPOINT, JevClient
