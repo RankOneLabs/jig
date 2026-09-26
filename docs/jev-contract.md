@@ -1,0 +1,14 @@
+# Jev wire contract and evidence
+
+[TypeSafe's documentation](https://docs.typesafe.ai/) defines the provider contract. Where it is silent, the recorded Assay run is the tiebreaker. The fixture in `tests/fixtures/jev/recorded-run/` is a post-text-free excerpt of `typesafe-relevance-primary-2026-09/exported-answers.json` (SHA-256 `0c760d3d77c0016d696bd78a9005bb1d9ffbd6e8717b907266106520e5af3af4`). Its request half is **reconstructed**, with empty state, from the catalogue identified by SHA-256 `27c54ff7daf18383fcee7c947ef11290b81a6e24bfc55c3e1779c1bea590b88e`; it is not a recording of bytes sent to the provider. The recorded response half came from requested `jev-latest`, resolved `jev-1.13.0`, Assay SDK `0.6.0`, and population SHA-256 `6c3d18de02e35f33a432be9f9bda57d36d22478a69fad94c42d924d4ccc9782a`.
+
+## Resolved rules
+
+1. **Probability sum.** A Choice or Score distribution has the requested keys, finite values in `[0, 1]`, and a sum within `PROBABILITY_SUM_TOLERANCE = 0.02` of 1. In the recorded run, 10 of 711 distributions sum to 0.99 after provider rounding. The vendored Score distribution is one of them. Preserve the provider values; do not renormalize.
+2. **Score legend.** `legend` is optional level-keyed JSON, retained verbatim. A recorded level is `{"0": {"summary": "out_of_scope", "signals": ["unrelated content", "hard exclusion applies"]}}`. The provider sends structured objects, so a string-only legend would lose data.
+3. **Unknown top-level fields and request ID.** Ignore unknown response top-level fields for forward compatibility. Accept an optional string `request_id`; all 237 recorded responses have it and all 237 values are distinct, though it is undocumented by the provider. Still validate the known model, answers, and usage fields.
+4. **Choice cardinality.** A Choice question requires at least one option. This follows the provider request shape; peaks requires two in its stricter local schema, but that local restriction is not the Jev wire minimum.
+5. **Identifiers and tracing.** `call_id` is generated locally for each logical evaluation, including retries. `provider_request_id` is the response's `request_id`, if supplied. They are separate values. Use `SpanKind.PROVIDER_CALL` for traces; adding a dedicated Jev span kind later must not change existing provider-call traces or the public enum semantics.
+6. **Retry classification.** `401` is `auth`, `422` is `invalid_request`, `429` is `rate_limited`, `529` is `overloaded`, and other non-200 responses are `invalid_response`. Only `429` and `529` receive bounded retries. Timeouts are `timeout`, transport failures are `transport`, and malformed successful responses are `invalid_response`. A single logical call retains one local ID across retry attempts.
+
+The client accepts Noul, Choice, and Score as separate native answers. A Jev Score is a numeric response plus a distribution and optional legend; `jig.Score` is a different grading dataclass.

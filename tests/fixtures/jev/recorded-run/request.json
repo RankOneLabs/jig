@@ -1,0 +1,97 @@
+{
+  "state": {},
+  "model": "jev-latest",
+  "questions": {
+    "topic_observability": {
+      "type": "noul",
+      "instructions": "Is the post's subject observability for operating agents?",
+      "criteria": {
+        "true": {
+          "what": "Tracing",
+          "logging": null,
+          "monitoring": null,
+          "debugging": null,
+          "telemetry": null,
+          "or diagnosis of running agents.": null
+        },
+        "false": {
+          "what": "No agent observability topic is present."
+        }
+      }
+    },
+    "account_type": {
+      "type": "choice",
+      "instructions": "Classify the author account from name and handle only. This annotation must not affect relevance.",
+      "criteria": {
+        "individual_practitioner": {
+          "what": "A person who builds or operates software themselves."
+        },
+        "brand_or_company": {
+          "what": "A product",
+          "vendor": null,
+          "organization": null,
+          "or company account.": null
+        },
+        "aggregator_or_feed": {
+          "what": "A news feed",
+          "link aggregator": null,
+          "digest": null,
+          "or auto-poster.": null
+        },
+        "executive_or_founder_voice": {
+          "what": "A named executive or founder posting in that capacity."
+        },
+        "bot": {
+          "what": "An automated account with no human author."
+        }
+      }
+    },
+    "band": {
+      "type": "score",
+      "instructions": {
+        "question": "Classify the post's own text into the highest-precedence relevance situation.",
+        "apply_in_order": [
+          "hard exclusion",
+          "substantive point",
+          "on-topic pointer",
+          "general building",
+          "out of scope"
+        ],
+        "note": "Parent context can clarify the post but cannot supply a missing point."
+      },
+      "criteria": [
+        {
+          "summary": "out_of_scope",
+          "signals": [
+            "unrelated content",
+            "hard exclusion applies"
+          ]
+        },
+        {
+          "summary": "building",
+          "signals": [
+            "general agent-building content",
+            "no operational point"
+          ]
+        },
+        {
+          "summary": "pointer",
+          "signals": [
+            "on-topic resource or announcement",
+            "no point of its own"
+          ]
+        },
+        {
+          "summary": "substantive",
+          "signals": [
+            "specific operational claim",
+            "result",
+            "failure",
+            "reasoned practice",
+            "or concrete question in the post text"
+          ]
+        }
+      ]
+    }
+  }
+}
