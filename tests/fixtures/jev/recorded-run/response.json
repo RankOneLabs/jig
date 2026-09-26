@@ -1,0 +1,70 @@
+{
+  "model": "jev-1.13.0",
+  "request_id": "req_01a0b5396c2a724a982748381d750391",
+  "answers": {
+    "topic_observability": {
+      "noul": 0.08,
+      "type": "noul"
+    },
+    "account_type": {
+      "choice": "individual_practitioner",
+      "confidence": 1.0,
+      "probabilities": {
+        "aggregator_or_feed": 0.0,
+        "bot": 0.0,
+        "brand_or_company": 0.0,
+        "executive_or_founder_voice": 0.0,
+        "individual_practitioner": 1.0
+      },
+      "type": "choice"
+    },
+    "band": {
+      "confidence": 0.4,
+      "legend": {
+        "0": {
+          "signals": [
+            "unrelated content",
+            "hard exclusion applies"
+          ],
+          "summary": "out_of_scope"
+        },
+        "1": {
+          "signals": [
+            "general agent-building content",
+            "no operational point"
+          ],
+          "summary": "building"
+        },
+        "2": {
+          "signals": [
+            "on-topic resource or announcement",
+            "no point of its own"
+          ],
+          "summary": "pointer"
+        },
+        "3": {
+          "signals": [
+            "specific operational claim",
+            "result",
+            "failure",
+            "reasoned practice",
+            "or concrete question in the post text"
+          ],
+          "summary": "substantive"
+        }
+      },
+      "probabilities": {
+        "0": 0.0,
+        "1": 0.68,
+        "2": 0.03,
+        "3": 0.28
+      },
+      "score": 1.59,
+      "type": "score"
+    }
+  },
+  "usage": {
+    "input_tokens": 2626,
+    "output_tokens": 446
+  }
+}

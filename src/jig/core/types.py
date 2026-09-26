@@ -368,6 +368,7 @@ class SpanKind(str, Enum):
     PIPELINE_RUN = "pipeline_run"
     PIPELINE_STEP = "pipeline_step"
     LLM_CALL = "llm_call"
+    PROVIDER_CALL = "provider_call"
     TOOL_CALL = "tool_call"
     MEMORY_QUERY = "memory_query"
     GRADING = "grading"

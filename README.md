@@ -258,3 +258,7 @@ src/jig/
 ```bash
 uv run --extra dev --extra callback pytest
 ```
+
+## Jev evaluations
+
+`jig.jev` provides typed Noul, Choice, and Score questions and answers for the TypeSafe Jev API. See the [client guide](docs/jev.md) and [wire contract](docs/jev-contract.md). The optional credentialed check is `uv run python scripts/jev_smoke.py` with `TYPESAFE_API_KEY` set; it prints metadata only.
