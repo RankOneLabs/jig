@@ -1,10 +1,47 @@
 import httpx
 import pytest
 
-from jig.jev import JevClient, JevError, NoulQuestion
+from jig.jev import ChoiceQuestion, JevClient, JevError, NoulQuestion, ScoreQuestion
 
 
 QUESTION = NoulQuestion("n", "check")
+
+
+@pytest.mark.parametrize("question", [
+    ChoiceQuestion("q", "pick", {"0": "low", "1": "high"}),
+    ScoreQuestion("q", "rate", ["low", "high"]),
+])
+@pytest.mark.parametrize(("probability", "valid"), [
+    (1e308, False),
+    (0.49, True),
+    (0.51, True),
+    (0.489999, False),
+    (0.510001, False),
+])
+async def test_probability_validation_at_http_boundary(question, probability, valid):
+    answer = {"probabilities": {"0": probability, "1": probability}, "confidence": 0.5}
+    if isinstance(question, ChoiceQuestion):
+        answer.update(type="choice", choice="0")
+    else:
+        answer.update(type="score", score=0.5)
+    payload = {
+        "model": "jev-1", "request_id": "provider-123",
+        "answers": {"q": answer},
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, json=payload)
+    )) as http:
+        async with JevClient(api_key="key", http=http) as client:
+            if valid:
+                result = await client.evaluate({}, [question])
+                assert result.answers["q"].probabilities == answer["probabilities"]
+            else:
+                with pytest.raises(JevError) as caught:
+                    await client.evaluate({}, [question])
+                assert caught.value.kind == "invalid_response"
+                assert caught.value.status_code == 200
+                assert caught.value.provider_request_id == "provider-123"
 
 
 @pytest.mark.parametrize(

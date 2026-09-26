@@ -188,6 +188,10 @@ def _check_distribution(
         violations.append(f"{path} keys must match requested options/levels")
     for key, probability in value.items():
         _check_unit(probability, f"{path}[{key!r}]", violations)
-    if all(_finite_number(v) for v in value.values()):
-        if abs(math.fsum(value.values()) - 1.0) > PROBABILITY_SUM_TOLERANCE:
+    if all(_finite_number(v) and 0.0 <= v <= 1.0 for v in value.values()):
+        difference = abs(math.fsum(value.values()) - 1.0)
+        # Allow floating-point noise at the inclusive tolerance boundary.
+        if difference > PROBABILITY_SUM_TOLERANCE and not math.isclose(
+            difference, PROBABILITY_SUM_TOLERANCE, rel_tol=0.0, abs_tol=1e-12
+        ):
             violations.append(f"{path} must sum to 1 within {PROBABILITY_SUM_TOLERANCE}")

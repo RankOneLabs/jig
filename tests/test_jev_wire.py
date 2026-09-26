@@ -80,7 +80,7 @@ def test_invalid_distributions():
     for total in (0.5, 1.5):
         payload = response()
         payload["answers"]["s"]["probabilities"] = {"0": 0.0, "1": total}
-        with pytest.raises(JevError, match="sum to 1") as caught:
+        with pytest.raises(JevError) as caught:
             parse(payload)
         assert caught.value.kind == "invalid_response"
     for invalid in (math.nan, math.inf, -0.1, 1.1):

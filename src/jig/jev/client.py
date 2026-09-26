@@ -65,11 +65,16 @@ class JevClient:
         def elapsed_ms() -> float:
             return (time.monotonic() - started) * 1000
 
-        def failure(kind: JevErrorKind, status: int | None = None) -> JevError:
+        def failure(
+            kind: JevErrorKind, status: int | None = None,
+            *, provider_request_id: str | None = None,
+        ) -> JevError:
             # Never interpolate response content, request data, URL, or an
             # httpx exception: each can contain credentials or post content.
             detail = f"{kind} (HTTP {status})" if status is not None else kind
-            return JevError(kind, status, call_id, None, detail, attempts, elapsed_ms())
+            return JevError(
+                kind, status, call_id, provider_request_id, detail, attempts, elapsed_ms()
+            )
 
         while True:
             remaining = deadline - time.monotonic()
@@ -113,10 +118,13 @@ class JevClient:
                 raise failure("invalid_response", status) from None
             try:
                 return parse_response(payload, call_id, elapsed_ms(), attempts, questions)
-            except JevError:
+            except JevError as error:
                 # The protocol validator may include provider supplied IDs
                 # in its diagnostic. Keep that data out of exception text.
-                raise failure("invalid_response", status) from None
+                raise failure(
+                    "invalid_response", status,
+                    provider_request_id=error.provider_request_id,
+                ) from None
 
     async def aclose(self) -> None:
         if self._owns_http:

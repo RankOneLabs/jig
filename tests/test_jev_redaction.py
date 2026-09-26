@@ -34,6 +34,9 @@ async def test_errors_never_reveal_key_or_post(case, caplog):
         with pytest.raises(JevError) as caught:
             await client.evaluate({"post": POST}, [NoulQuestion("n", "check")])
     error = caught.value
+    if case == "bad_contract":
+        # Retain the ID for correlation without including it in error text.
+        assert error.provider_request_id == KEY
     visible = "\n".join((str(error), repr(error),
                          "".join(traceback.format_exception(error)), caplog.text))
     assert KEY not in visible
