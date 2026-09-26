@@ -5,13 +5,13 @@
 ```python jev-example
 from jig.jev import JevClient, NoulQuestion, ChoiceQuestion, ScoreQuestion
 
-async def evaluate_example(http=None):
+async def evaluate_example():
     questions = [
         NoulQuestion("relevant", "Is this about operating agents?"),
         ChoiceQuestion("kind", "Which kind?", {"practice": "Practice", "incident": "Incident"}),
         ScoreQuestion("quality", "Rate its quality", ["low", "high"]),
     ]
-    async with JevClient(api_key="example-key", http=http) as client:
+    async with JevClient(api_key="example-key") as client:
         result = await client.evaluate({"subject": "agent operations"}, questions)
     probability = result.answers["relevant"].noul
     choice = result.answers["kind"].choice

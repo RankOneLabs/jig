@@ -177,6 +177,7 @@ def test_identity_aware_trace_diff_guide_mapping_constructs() -> None:
 
 async def test_jev_documented_example_executes_against_stub():
     """Execute the exact marked block in docs/jev.md through a stub endpoint."""
+    from functools import partial
     import httpx
     from pathlib import Path
 
@@ -201,6 +202,7 @@ async def test_jev_documented_example_executes_against_stub():
         })
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        result, probability, choice, score = await namespace["evaluate_example"](http=http)
+        namespace["JevClient"] = partial(namespace["JevClient"], http=http)
+        result, probability, choice, score = await namespace["evaluate_example"]()
     assert result.model == "jev-1.13.0"
     assert (probability, choice, score) == (0.8, "practice", 1.0)
