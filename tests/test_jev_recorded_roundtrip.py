@@ -1,13 +1,15 @@
 """Round-trip an excerpt of one recorded Assay provider response."""
+import copy
 import json
 import math
 from pathlib import Path
 
 import httpx
+import pytest
 
 from jig.jev import (
     ChoiceAnswer, ChoiceQuestion, JevClient, NoulAnswer, NoulQuestion,
-    ScoreAnswer, ScoreQuestion,
+    ScoreAnswer, ScoreQuestion, parse_response,
 )
 from jig.jev.wire import build_request_body
 
@@ -89,6 +91,41 @@ QUESTIONS = [
                                                 "reasoned practice", "or concrete question in the post text"]}],
     ),
 ]
+
+
+def validate_retained_answers(response):
+    """Allow only typed answer fields and the approved rubric's legend text."""
+    parse_response(response, "fixture-check", 0.0, 1, QUESTIONS)
+    for question in QUESTIONS:
+        answer = response["answers"][question.id]
+        if isinstance(question, NoulQuestion):
+            assert set(answer) == {"type", "noul"}
+        elif isinstance(question, ChoiceQuestion):
+            assert set(answer) == {"type", "choice", "probabilities", "confidence"}
+        else:
+            assert set(answer) == {"type", "score", "probabilities", "confidence", "legend"}
+            assert answer["legend"] == {
+                str(index): level for index, level in enumerate(question.criteria)
+            }
+
+
+def test_recorded_answers_retain_only_approved_fields_and_text():
+    validate_retained_answers(load("response.json"))
+
+
+@pytest.mark.parametrize("question_id", ["topic_observability", "account_type", "band"])
+def test_fixture_rejects_private_text_under_unrecognized_fields(question_id):
+    response = copy.deepcopy(load("response.json"))
+    response["answers"][question_id]["evidence"] = ["SENTINEL PRIVATE POST"]
+    with pytest.raises(AssertionError):
+        validate_retained_answers(response)
+
+
+def test_fixture_rejects_private_text_inside_known_legend_fields():
+    response = copy.deepcopy(load("response.json"))
+    response["answers"]["band"]["legend"]["0"]["signals"].append("SENTINEL PRIVATE POST")
+    with pytest.raises(AssertionError):
+        validate_retained_answers(response)
 
 
 async def test_recorded_roundtrip():

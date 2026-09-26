@@ -175,18 +175,20 @@ def test_identity_aware_trace_diff_guide_mapping_constructs() -> None:
     }
 
 
-async def test_jev_documented_example_executes_against_stub():
+async def test_jev_documented_example_executes_against_stub(monkeypatch):
     """Execute the exact marked block in docs/jev.md through a stub endpoint."""
     from functools import partial
     import httpx
     from pathlib import Path
 
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test-only")
     page = (Path(__file__).resolve().parents[1] / "docs/jev.md").read_text()
     block = page.split("```python jev-example\n", 1)[1].split("\n```", 1)[0]
     namespace: dict[str, Any] = {}
     exec(compile(block, "docs/jev.md", "exec"), namespace)
 
     def handler(request):
+        assert request.headers["Authorization"] == "Bearer test-only"
         assert request.url.path == "/v1/systemone"
         payload = __import__("json").loads(request.content)
         assert set(payload["questions"]) == {"relevant", "kind", "quality"}

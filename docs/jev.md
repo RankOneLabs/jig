@@ -11,7 +11,7 @@ async def evaluate_example():
         ChoiceQuestion("kind", "Which kind?", {"practice": "Practice", "incident": "Incident"}),
         ScoreQuestion("quality", "Rate its quality", ["low", "high"]),
     ]
-    async with JevClient(api_key="example-key") as client:
+    async with JevClient() as client:
         result = await client.evaluate({"subject": "agent operations"}, questions)
     probability = result.answers["relevant"].noul
     choice = result.answers["kind"].choice
