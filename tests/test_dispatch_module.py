@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -11,6 +11,12 @@ import pytest
 from jig import DispatchError, JobTimeoutError, dispatch_run
 from jig.core.errors import JigLLMError
 from jig.core.types import Tool, ToolCall, ToolDefinition
+from jig.dispatch import (
+    cancel_job,
+    cancel_or_fence,
+    get_job,
+    get_job_by_idempotency_key,
+)
 from jig.dispatch.client import _PollConfig
 from jig.tools import ToolRegistry
 
@@ -40,6 +46,140 @@ def _cancel_resp(status_code: int = 200):
     r.status_code = status_code
     r.raise_for_status = MagicMock()
     return r
+
+
+def _job_api_resp(data: Any, status_code: int = 200):
+    r = MagicMock(spec=httpx.Response)
+    r.status_code = status_code
+    r.text = str(data)
+    r.json.return_value = data
+    if status_code >= 400:
+        r.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "job API error", request=MagicMock(), response=r,
+        )
+    else:
+        r.raise_for_status = MagicMock()
+    return r
+
+
+@pytest.mark.asyncio
+class TestPublicJobAPI:
+    async def test_get_job_returns_wire_response(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        expected = {"job_id": "j-1", "status": "running", "machine": "frink"}
+        http.get.return_value = _job_api_resp(expected)
+
+        result = await get_job(
+            "j-1", dispatch_url="http://localhost:8900/", http=http,
+        )
+
+        assert result == expected
+        http.get.assert_awaited_once_with("http://localhost:8900/jobs/j-1")
+
+    async def test_get_job_maps_missing_job(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.get.return_value = _job_api_resp(
+            {"detail": "Job not found"}, status_code=404,
+        )
+
+        with pytest.raises(DispatchError) as raised:
+            await get_job("missing", http=http)
+
+        assert raised.value.job_id == "missing"
+        assert raised.value.status == "not_found"
+        assert raised.value.retryable is False
+
+    async def test_cancel_job_returns_acknowledged_state(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        expected = {"job_id": "j-1", "status": "cancelled"}
+        http.delete.return_value = _job_api_resp(expected)
+
+        result = await cancel_job(
+            "j-1", dispatch_url="http://localhost:8900", http=http,
+        )
+
+        assert result == expected
+        http.delete.assert_awaited_once_with("http://localhost:8900/jobs/j-1")
+
+    @pytest.mark.parametrize(
+        ("code", "status", "retryable"),
+        [(404, "not_found", False), (409, "already_terminal", False), (503, None, True)],
+    )
+    async def test_cancel_job_preserves_smithers_failure_semantics(
+        self, code, status, retryable,
+    ):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.delete.return_value = _job_api_resp({"detail": "no"}, status_code=code)
+
+        with pytest.raises(DispatchError) as raised:
+            await cancel_job("j-1", http=http)
+
+        assert raised.value.status == status
+        assert raised.value.retryable is retryable
+
+    async def test_get_job_by_idempotency_key_encodes_one_path_segment(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        expected = {"job_id": "j-1", "status": "running"}
+        http.get.return_value = _job_api_resp(expected)
+
+        result = await get_job_by_idempotency_key(
+            "attempt/7 retry", dispatch_url="http://localhost:8900/", http=http,
+        )
+
+        assert result == expected
+        http.get.assert_awaited_once_with(
+            "http://localhost:8900/jobs/by-idempotency/attempt%2F7%20retry",
+        )
+
+    async def test_get_job_by_idempotency_key_maps_not_found(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.get.return_value = _job_api_resp(
+            {"detail": "Job not found"}, status_code=404,
+        )
+
+        with pytest.raises(DispatchError) as raised:
+            await get_job_by_idempotency_key("missing", http=http)
+
+        assert raised.value.status == "not_found"
+        assert raised.value.retryable is False
+
+    @pytest.mark.parametrize("code", [200, 409])
+    async def test_cancel_or_fence_returns_durable_fence_outcome(self, code):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        expected = {"status": "cancelled", "job_id": "j-1"}
+        http.delete.return_value = _job_api_resp(expected, status_code=code)
+
+        result = await cancel_or_fence(
+            "attempt/7", dispatch_url="http://localhost:8900", http=http,
+        )
+
+        assert result == expected
+        http.delete.assert_awaited_once_with(
+            "http://localhost:8900/jobs/by-idempotency/attempt%2F7",
+            timeout=10.0,
+        )
+
+    async def test_cancel_or_fence_is_bounded_without_a_client_default(self):
+        """An explicit timeout, so a client built with ``timeout=None`` cannot
+        leave a stalled fence holding the caller's exception indefinitely."""
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.delete.return_value = _job_api_resp({"status": "cancelled"})
+
+        await cancel_or_fence("attempt-7", http=http)
+
+        assert http.delete.await_args.kwargs["timeout"] is not None
+
+    async def test_cancel_or_fence_503_is_retryable(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.delete.return_value = _job_api_resp(
+            {"detail": "Worker cancellation was not acknowledged"},
+            status_code=503,
+        )
+
+        with pytest.raises(DispatchError) as raised:
+            await cancel_or_fence("attempt-7", http=http)
+
+        assert raised.value.retryable is True
 
 
 @pytest.mark.asyncio
@@ -131,6 +271,39 @@ class TestDispatchRun:
             )
 
         http.delete.assert_not_awaited()
+
+    async def test_repeated_caller_cancellation_does_not_abandon_remote_cancel(self):
+        """Once the caller is cancelled mid-wait the remote cancellation is
+        drained, not merely shielded — a second cancel() must not detach it
+        and leave the worker slot occupied behind a retry."""
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.get.return_value = _poll_resp(status="running")
+
+        cancel_started = asyncio.Event()
+        cancel_landed = False
+
+        async def slow_cancel(*args, **kwargs):
+            nonlocal cancel_landed
+            cancel_started.set()
+            await asyncio.sleep(0.05)
+            cancel_landed = True
+            return _job_api_resp({"job_id": "j-1", "status": "cancelled"})
+
+        http.delete.side_effect = slow_cancel
+
+        task = asyncio.create_task(
+            dispatch_run("m:f", http=http, poll_interval=0.01),
+        )
+        await asyncio.sleep(0.03)
+        task.cancel()
+        await cancel_started.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert cancel_landed
 
     async def test_trace_context_in_payload(self):
         """Phase 9 will have workers read this; phase 7+8 just propagates."""
@@ -731,19 +904,380 @@ class TestOnSubmittedHook:
 
         assert seen == []
 
-    async def test_hook_exception_does_not_break_dispatch(self):
+    async def test_hook_exception_cancels_job_and_propagates(self):
         http = AsyncMock(spec=httpx.AsyncClient)
         http.post.return_value = _submit_resp()
-        http.get.return_value = _poll_resp(status="complete", result={"value": "ok"})
+        http.delete.return_value = _job_api_resp(
+            {"job_id": "j-1", "status": "cancelled"},
+        )
 
         def boom(job_id: str) -> None:
             raise RuntimeError("hook exploded")
 
+        with pytest.raises(RuntimeError, match="hook exploded"):
+            await dispatch_run(
+                "m:f", http=http, poll_interval=0.01, on_submitted=boom,
+            )
+
+        http.delete.assert_awaited_once_with(
+            "http://localhost:8900/jobs/j-1", timeout=10.0,
+        )
+
+    async def test_hook_exception_fences_by_idempotency_key(self):
+        """With a key in play, the rejection path uses the durable fence —
+        a per-job DELETE only speaks to the attempt in hand."""
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.delete.return_value = _job_api_resp(
+            {"job_id": "j-1", "status": "cancelled"},
+        )
+
+        def boom(job_id: str) -> None:
+            raise RuntimeError("hook exploded")
+
+        with pytest.raises(RuntimeError, match="hook exploded"):
+            await dispatch_run(
+                "m:f",
+                http=http,
+                poll_interval=0.01,
+                on_submitted=boom,
+                idempotency_key="attempt-7",
+            )
+
+        http.delete.assert_awaited_once_with(
+            "http://localhost:8900/jobs/by-idempotency/attempt-7",
+            timeout=10.0,
+        )
+
+    async def test_unacknowledged_cancellation_is_reported_on_hook_error(self):
+        """A 503 fence must not read as a clean record-or-cancel rejection —
+        the job may still be running."""
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.delete.return_value = _job_api_resp({"detail": "not acked"}, 503)
+
+        def boom(job_id: str) -> None:
+            raise RuntimeError("hook exploded")
+
+        with (
+            patch("jig.dispatch.client._FENCE_RETRY_SECONDS", 0),
+            pytest.raises(RuntimeError, match="hook exploded") as caught,
+        ):
+            await dispatch_run(
+                "m:f",
+                http=http,
+                poll_interval=0.01,
+                on_submitted=boom,
+                idempotency_key="attempt-7",
+            )
+
+        assert any(
+            "may still be running" in note
+            for note in getattr(caught.value, "__notes__", [])
+        )
+
+    async def test_unacknowledged_cancellation_is_retried(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.delete.side_effect = [
+            _job_api_resp({"detail": "not acked"}, 503),
+            _job_api_resp({"job_id": "j-1", "status": "cancelled"}),
+        ]
+
+        def boom(job_id: str) -> None:
+            raise RuntimeError("hook exploded")
+
+        with (
+            patch("jig.dispatch.client._FENCE_RETRY_SECONDS", 0),
+            pytest.raises(RuntimeError, match="hook exploded") as caught,
+        ):
+            await dispatch_run(
+                "m:f",
+                http=http,
+                poll_interval=0.01,
+                on_submitted=boom,
+                idempotency_key="attempt-7",
+            )
+
+        assert http.delete.await_count == 2
+        assert not getattr(caught.value, "__notes__", [])
+
+    async def test_non_retryable_cancellation_failure_is_not_retried(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.delete.return_value = _job_api_resp({"detail": "bad key"}, 400)
+
+        def boom(job_id: str) -> None:
+            raise RuntimeError("hook exploded")
+
+        with pytest.raises(RuntimeError, match="hook exploded") as caught:
+            await dispatch_run(
+                "m:f",
+                http=http,
+                poll_interval=0.01,
+                on_submitted=boom,
+                idempotency_key="attempt-7",
+            )
+
+        assert http.delete.await_count == 1
+        assert any(
+            "may still be running" in note
+            for note in getattr(caught.value, "__notes__", [])
+        )
+
+    async def test_completed_job_is_not_reported_as_a_clean_cancellation(self):
+        """A 409 fence on a job that already finished means it ran unrecorded
+        — the opposite of what a record-or-cancel rejection claims. Smithers'
+        keyed 409 carries only a ``detail`` string, so the status is read
+        back by job id."""
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.delete.return_value = _job_api_resp(
+            {"detail": "Job already complete"}, status_code=409,
+        )
+        http.get.return_value = _job_api_resp({"id": "j-1", "status": "complete"})
+
+        def boom(job_id: str) -> None:
+            raise RuntimeError("hook exploded")
+
+        with pytest.raises(RuntimeError, match="hook exploded") as caught:
+            await dispatch_run(
+                "m:f",
+                http=http,
+                poll_interval=0.01,
+                on_submitted=boom,
+                idempotency_key="attempt-7",
+            )
+
+        http.get.assert_awaited_once_with("http://localhost:8900/jobs/j-1")
+        notes = getattr(caught.value, "__notes__", [])
+        assert any("'complete'" in note for note in notes)
+        assert any("ran unrecorded" in note for note in notes)
+
+    async def test_terminal_fence_without_a_status_still_warns(self):
+        """Terminality of an unknown kind must not silently pass as a clean
+        stop — the caller is told the job reached a terminal state."""
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.delete.return_value = _job_api_resp(
+            {"detail": "Job already failed"}, status_code=409,
+        )
+        http.get.return_value = _job_api_resp({"detail": "unavailable"}, 503)
+
+        def boom(job_id: str) -> None:
+            raise RuntimeError("hook exploded")
+
+        with pytest.raises(RuntimeError, match="hook exploded") as caught:
+            await dispatch_run(
+                "m:f",
+                http=http,
+                poll_interval=0.01,
+                on_submitted=boom,
+                idempotency_key="attempt-7",
+            )
+
+        assert any(
+            "already terminal" in note
+            for note in getattr(caught.value, "__notes__", [])
+        )
+
+    async def test_cancelled_fence_is_reported_as_clean(self):
+        """The ordinary case still carries no warning at all — including the
+        body smithers sends when the tombstone found no job to cancel."""
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.delete.return_value = _job_api_resp(
+            {"idempotency_key": "attempt-7", "status": "cancelled"},
+        )
+
+        def boom(job_id: str) -> None:
+            raise RuntimeError("hook exploded")
+
+        with pytest.raises(RuntimeError, match="hook exploded") as caught:
+            await dispatch_run(
+                "m:f",
+                http=http,
+                poll_interval=0.01,
+                on_submitted=boom,
+                idempotency_key="attempt-7",
+            )
+
+        assert not getattr(caught.value, "__notes__", [])
+
+    async def test_keyless_terminal_cancellation_reads_back_the_outcome(self):
+        """Without a key the per-job DELETE answers 409 without saying which
+        terminal state it found, so the client reads the job to find out."""
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.delete.return_value = _job_api_resp({}, status_code=409)
+        http.get.return_value = _job_api_resp({"id": "j-1", "status": "complete"})
+
+        def boom(job_id: str) -> None:
+            raise RuntimeError("hook exploded")
+
+        with pytest.raises(RuntimeError, match="hook exploded") as caught:
+            await dispatch_run(
+                "m:f", http=http, poll_interval=0.01, on_submitted=boom,
+            )
+
+        http.get.assert_awaited_once_with("http://localhost:8900/jobs/j-1")
+        assert any(
+            "'complete'" in note
+            for note in getattr(caught.value, "__notes__", [])
+        )
+
+    async def test_terminal_status_read_is_bounded(self):
+        """The read-back runs while a hook exception waits to propagate, so a
+        caller client with no timeout must not be able to stall it."""
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.delete.return_value = _job_api_resp({}, status_code=409)
+
+        async def never(*args, **kwargs):
+            await asyncio.sleep(3600)
+
+        http.get.side_effect = never
+
+        def boom(job_id: str) -> None:
+            raise RuntimeError("hook exploded")
+
+        with (
+            patch("jig.dispatch.client._CANCEL_TIMEOUT_SECONDS", 0.01),
+            pytest.raises(RuntimeError, match="hook exploded") as caught,
+        ):
+            await dispatch_run(
+                "m:f", http=http, poll_interval=0.01, on_submitted=boom,
+            )
+
+        assert any(
+            "already terminal" in note
+            for note in getattr(caught.value, "__notes__", [])
+        )
+
+    async def test_cancellation_during_the_fence_does_not_abandon_it(self):
+        """shield protects the fence task, not the await on it. A cancel
+        arriving mid-fence must not detach the fence, skip the listener
+        cleanup, or drop the hook failure on the floor."""
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+
+        fence_landed = False
+        fence_started = asyncio.Event()
+
+        async def slow_fence(*args, **kwargs):
+            nonlocal fence_landed
+            fence_started.set()
+            await asyncio.sleep(0.05)
+            fence_landed = True
+            return _job_api_resp({"job_id": "j-1", "status": "cancelled"})
+
+        http.delete.side_effect = slow_fence
+
+        def boom(job_id: str) -> None:
+            raise RuntimeError("hook exploded")
+
+        task = asyncio.create_task(
+            dispatch_run(
+                "m:f",
+                http=http,
+                poll_interval=0.01,
+                on_submitted=boom,
+                idempotency_key="attempt-7",
+            ),
+        )
+        await fence_started.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+
+        assert fence_landed
+        # Cancellation wins, but the hook failure it interrupted rides along.
+        assert caught.value.__cause__ is not None
+        assert "hook exploded" in str(caught.value.__cause__)
+        assert any(
+            "hook exploded" in note
+            for note in getattr(caught.value, "__notes__", [])
+        )
+
+    async def test_async_hook_is_awaited_before_polling(self):
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        registered = False
+
+        async def register(job_id: str) -> None:
+            nonlocal registered
+            await asyncio.sleep(0)
+            registered = job_id == "j-1"
+
+        def poll_response(*args, **kwargs):
+            assert registered
+            return _poll_resp(status="complete", result={"value": "ok"})
+
+        http.get.side_effect = poll_response
+
         out = await dispatch_run(
-            "m:f", http=http, poll_interval=0.01, on_submitted=boom,
+            "m:f", http=http, poll_interval=0.01, on_submitted=register,
         )
 
         assert out == "ok"
+
+    @pytest.mark.parametrize("cancel_caller", [False, True])
+    async def test_unexpected_fence_error_preserves_hook_and_cleanup(self, cancel_caller):
+        from jig.dispatch.client import _submit_and_poll
+
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        fence_started = asyncio.Event()
+        release_fence = asyncio.Event()
+
+        async def fail_fence(*args, **kwargs):
+            fence_started.set()
+            await release_fence.wait()
+            raise RuntimeError("transport failed unexpectedly")
+
+        http.delete.side_effect = fail_fence
+        listener = MagicMock()
+        listener.health_check = AsyncMock()
+        listener.register.return_value = (
+            "nonce-1", asyncio.get_running_loop().create_future(),
+        )
+        hook_error = ValueError("registration rejected")
+
+        def reject(job_id):
+            raise hook_error
+
+        task = asyncio.create_task(_submit_and_poll(
+            http=http,
+            dispatch_url="http://localhost:8900",
+            task_type="function",
+            payload={},
+            idempotency_key="attempt-7",
+            listener=listener,
+            on_submitted=reject,
+        ))
+        await asyncio.wait_for(fence_started.wait(), timeout=1)
+        if cancel_caller:
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+        release_fence.set()
+
+        expected = asyncio.CancelledError if cancel_caller else ValueError
+        with pytest.raises(expected) as caught:
+            await task
+
+        if cancel_caller:
+            assert caught.value.__cause__ is hook_error
+            assert task.cancelled()
+        else:
+            assert caught.value is hook_error
+        assert any(
+            "may still be running" in note and "transport failed unexpectedly" in note
+            for note in caught.value.__notes__
+        )
+        listener.unregister.assert_called_once_with("nonce-1")
+        http.get.assert_not_awaited()
 
     async def test_success_job_dict_always_carries_job_id(self):
         from jig.dispatch.client import _submit_and_poll
@@ -817,6 +1351,114 @@ class TestRegistryOnSubmittedPlumbed:
         await reg.execute(ToolCall(id="c1", name="backtest", arguments={}))
 
         assert "on_submitted" not in captured
+
+    async def test_fence_warning_survives_into_the_tool_result(self, monkeypatch):
+        """The failed-fence warning rides on the exception as a note, and
+        ToolResult.error is built from str(e) — which drops notes. It is the
+        only signal the caller gets that the job may still be running, so it
+        has to survive the registry boundary."""
+        async def fake_run(fn_ref, payload=None, **kwargs):
+            error = RuntimeError("registration rejected")
+            error.add_note("Dispatch job j-9 ... may still be running: 503")
+            raise error
+
+        import jig.dispatch
+        monkeypatch.setattr(jig.dispatch, "run", fake_run)
+
+        reg = ToolRegistry([_DispatchedToolWithHook()])
+        result = await reg.execute(
+            ToolCall(id="c1", name="backtest", arguments={}),
+        )
+
+        assert result.error is not None
+        assert "registration rejected" in result.error
+        assert "may still be running" in result.error
+
+    async def test_fence_warning_survives_an_execute_timeout(self):
+        """When execute_timeout fires while a rejected submission is being
+        fenced, wait_for raises TimeoutError *from* the CancelledError that
+        carries the fence warning. The warning must still reach the model."""
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.delete.return_value = _job_api_resp({"detail": "not acked"}, 503)
+
+        class _SlowRejectingTool(_DispatchedTool):
+            async def on_dispatch_submitted(self, job_id: str) -> None:
+                await asyncio.sleep(3600)
+
+        reg = ToolRegistry(
+            [_SlowRejectingTool()],
+            dispatch_url="http://localhost:8900",
+            execute_timeout=0.05,
+        )
+        with (
+            patch("jig.dispatch.client._get_shared_http", return_value=http),
+            patch("jig.dispatch.client._FENCE_RETRY_SECONDS", 0),
+        ):
+            result = await reg.execute(
+                ToolCall(id="c1", name="backtest", arguments={}),
+            )
+
+        assert result.error is not None
+        assert result.error.startswith("TimeoutError:")
+        assert "may still be running" in result.error
+
+    @pytest.mark.parametrize("registry_timeout", [False, True])
+    @pytest.mark.parametrize("fence_status", [409, 503])
+    async def test_timeout_preserves_fence_warning(
+        self, monkeypatch, registry_timeout, fence_status,
+    ):
+        import jig.dispatch
+        from jig.dispatch import client
+
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.delete.return_value = _job_api_resp({}, status_code=fence_status)
+        http.get.return_value = _job_api_resp({"status": "complete"})
+        hook_started = asyncio.Event()
+
+        async def reject(job_id):
+            hook_started.set()
+            if registry_timeout:
+                await asyncio.Event().wait()
+            raise TimeoutError("correlation database timed out")
+
+        async def run(*args, **kwargs):
+            return await client.run(*args, http=http, **kwargs)
+
+        monkeypatch.setattr(jig.dispatch, "run", run)
+        monkeypatch.setattr(client, "_FENCE_RETRY_SECONDS", 0)
+        tool = _DispatchedToolWithHook()
+        tool.on_dispatch_submitted = reject
+        timeout = 0.05 if registry_timeout else None
+        reg = ToolRegistry([tool], execute_timeout=timeout)
+        result = await reg.execute(ToolCall(id="c1", name="backtest", arguments={}))
+
+        assert hook_started.is_set()
+        assert result.error.startswith(
+            f"TimeoutError: Dispatched tool backtest timed out after {timeout}s",
+        )
+        warning = "ran unrecorded" if fence_status == 409 else "may still be running"
+        assert warning in result.error
+        assert "j-1" in result.error
+
+    async def test_timeout_deduplicates_notes_from_cancellation(self, monkeypatch):
+        import jig.dispatch
+
+        warning = "Dispatch job j-1 may still be running"
+
+        async def run(*args, **kwargs):
+            cancellation = asyncio.CancelledError()
+            cancellation.add_note(warning)
+            error = TimeoutError()
+            error.add_note(warning)
+            raise error from cancellation
+
+        monkeypatch.setattr(jig.dispatch, "run", run)
+        reg = ToolRegistry([_DispatchedToolWithHook()])
+        result = await reg.execute(ToolCall(id="c1", name="backtest", arguments={}))
+
+        assert result.error.count(warning) == 1
 
 
 class TestStrictToolPayload:

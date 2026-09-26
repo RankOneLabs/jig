@@ -8,11 +8,14 @@ fixes to one path benefit both.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import time
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Literal
+from urllib.parse import quote
 
 import httpx
 
@@ -109,6 +112,113 @@ class _PollConfig:
     poll_max_interval: float = 5.0
 
 
+# Cancellation is the path a caller takes when it has already given up, so it
+# gets an explicit bound rather than inheriting whatever the caller's client
+# was built with — a client with ``timeout=None`` would otherwise let a stalled
+# cancellation hold the caller's exception hostage indefinitely.
+_CANCEL_TIMEOUT_SECONDS = 10.0
+
+# What smithers said when asked to cancel a job by id. "gone" covers a 404:
+# smithers has no such job, so there is nothing left to stop. "already_terminal"
+# is a 409 — the job stopped on its own, and *how* it stopped is a separate
+# question this call does not answer.
+_DeleteOutcome = Literal["accepted", "gone", "already_terminal"]
+
+
+async def _send(
+    request: Callable[..., Awaitable[httpx.Response]],
+    url: str,
+    *,
+    what: str,
+    job_id: str | None = None,
+    error_statuses: Mapping[int, str] | None = None,
+    passthrough: frozenset[int] = frozenset(),
+    timeout: float | None = None,
+) -> httpx.Response:
+    """Send one smithers request, mapping HTTP and transport failures.
+
+    ``what`` names the request for error messages ("Dispatch job j-1
+    cancellation"). Status codes in ``passthrough`` come back as responses
+    rather than raising, for callers that branch on them; any other non-2xx
+    raises a :class:`DispatchError` whose ``status`` is looked up in
+    ``error_statuses`` and which is retryable on 5xx. ``timeout`` is only
+    passed when set, so an unbounded read keeps the client's own default.
+    """
+    kwargs: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
+    try:
+        response = await request(url, **kwargs)
+        if response.status_code not in passthrough:
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code
+        raise DispatchError(
+            f"{what} failed: {code} {exc.response.text}",
+            job_id=job_id,
+            status=(error_statuses or {}).get(code),
+            retryable=code >= 500,
+        ) from exc
+    except httpx.RequestError as exc:
+        raise DispatchError(
+            f"{what} failed: {exc}", job_id=job_id, retryable=True,
+        ) from exc
+    return response
+
+
+def _json_object(
+    response: httpx.Response,
+    *,
+    what: str,
+    job_id: str | None = None,
+) -> dict[str, Any]:
+    """Decode a smithers response body that must be a JSON object."""
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise DispatchError(
+            f"{what} returned malformed JSON", job_id=job_id,
+        ) from exc
+    if not isinstance(data, dict):
+        raise DispatchError(
+            f"{what} returned a non-object response", job_id=job_id,
+        )
+    return data
+
+
+async def _delete_remote_job(
+    http: httpx.AsyncClient,
+    url: str,
+    job_id: str,
+) -> _DeleteOutcome:
+    """Cancel one job by id, raising when the cancellation is unacknowledged.
+
+    Smithers waits for its worker cancellation before marking the job
+    cancelled, so awaiting this endpoint also creates the ordering guarantee
+    callers need before they submit a retry. A terminal or missing job (409 /
+    404) means no work survives this call, which is all a caller that has
+    given up needs to know; callers that must distinguish *cancelled* from
+    *ran to completion* branch on the returned outcome. Anything else is
+    reported as a :class:`DispatchError` so the caller can decide whether an
+    unacknowledged cancellation matters on its path.
+
+    The body of an accepted cancellation is not read: the status code is the
+    acknowledgement, and a malformed body must not turn a cancellation that
+    happened into one reported as failed.
+    """
+    response = await _send(
+        http.delete,
+        f"{url}/jobs/{job_id}",
+        what=f"Dispatch job {job_id} cancellation",
+        job_id=job_id,
+        passthrough=frozenset({404, 409}),
+        timeout=_CANCEL_TIMEOUT_SECONDS,
+    )
+    if response.status_code == 404:
+        return "gone"
+    if response.status_code == 409:
+        return "already_terminal"
+    return "accepted"
+
+
 async def _cancel_remote_job(
     http: httpx.AsyncClient,
     url: str,
@@ -116,19 +226,286 @@ async def _cancel_remote_job(
 ) -> None:
     """Best-effort cancellation for a request/response caller that gave up.
 
-    Smithers waits for its worker cancellation before marking the job
-    cancelled, so awaiting this endpoint also creates the ordering guarantee
-    callers need before they submit a retry. A terminal or missing job is
-    already safe; transport failures are logged because cancellation must not
-    replace the original timeout/cancellation exception.
+    Failures are logged rather than raised because on the timeout and
+    caller-cancellation paths the cancellation must not replace the original
+    timeout/cancellation exception. Paths where an unacknowledged
+    cancellation is itself a correctness problem use
+    :func:`_fence_rejected_submission` instead.
     """
     try:
-        response = await http.delete(f"{url}/jobs/{job_id}", timeout=10.0)
-        if response.status_code in (404, 409):
-            return
-        response.raise_for_status()
+        await _delete_remote_job(http, url, job_id)
     except Exception as exc:
         logger.warning("Could not cancel dispatch job %s: %s", job_id, exc)
+
+
+async def _cancel_remote_job_drained(
+    http: httpx.AsyncClient,
+    url: str,
+    job_id: str,
+) -> asyncio.CancelledError | None:
+    """Run :func:`_cancel_remote_job` to completion, even if cancelled.
+
+    Returns the cancellation that arrived meanwhile, if any, for the caller
+    to re-raise once the cancellation has landed — see :func:`_drain`.
+    """
+    return await _drain(
+        asyncio.create_task(_cancel_remote_job(http, url, job_id)),
+    )
+
+
+# A rejected registration is rare and the retry is cheap, so spend a few
+# attempts on a retryable cancellation before giving up and reporting it.
+_FENCE_ATTEMPTS = 3
+_FENCE_RETRY_SECONDS = 0.5
+
+
+@dataclass(frozen=True)
+class _FenceCancelled:
+    """Smithers confirmed the job stopped before producing an outcome."""
+
+    kind: Literal["cancelled"] = "cancelled"
+
+
+@dataclass(frozen=True)
+class _FenceRanToTerminal:
+    """The job reached a terminal state of its own before cancellation landed.
+
+    Cancelling a job that already finished is a no-op on its *effects*: the
+    worker ran, and whatever it wrote stays written. Reporting that as a clean
+    record-or-cancel rejection would tell the caller the opposite of the truth,
+    so it is its own outcome. ``status`` is the smithers status when it could
+    be read (``complete``, ``failed``) and ``None`` when only the fact of
+    terminality is known.
+    """
+
+    status: str | None
+    kind: Literal["ran_to_terminal"] = "ran_to_terminal"
+
+
+@dataclass(frozen=True)
+class _FenceUnacknowledged:
+    """Smithers never confirmed the cancellation; the job may still run."""
+
+    error: DispatchError
+    kind: Literal["unacknowledged"] = "unacknowledged"
+
+
+_FenceOutcome = _FenceCancelled | _FenceRanToTerminal | _FenceUnacknowledged
+
+# Smithers statuses that mean cancellation did its job. Anything else terminal
+# means the worker got there first.
+_CANCELLED_STATUSES = frozenset({"cancelled", "cancelling"})
+
+
+def _fence_outcome_for_status(
+    status: object,
+    *,
+    when_unknown: _FenceOutcome,
+) -> _FenceOutcome:
+    """Classify the status a fence attempt surfaced.
+
+    ``when_unknown`` is what an absent or unreadable status means on the path
+    that read it: a 200 fence is a cancellation whether or not the body
+    bothers to name a status, while a 409 is terminality of an unknown kind
+    and must not be reported as a clean stop.
+    """
+    if not isinstance(status, str) or not status:
+        return when_unknown
+    if status in _CANCELLED_STATUSES:
+        return _FenceCancelled()
+    return _FenceRanToTerminal(status=status)
+
+
+async def _terminal_outcome_by_job_id(
+    http: httpx.AsyncClient,
+    url: str,
+    job_id: str,
+) -> _FenceOutcome:
+    """Read back why a job was already terminal when cancellation reached it.
+
+    Neither ``DELETE`` names the terminal state behind its 409 in a field —
+    smithers answers both with only a ``detail`` string — so this costs one
+    extra read on a path that only runs when a
+    registration hook has already rejected — rare, and the answer decides
+    whether the caller is told work completed behind its back.
+
+    Bounded for the same reason the cancellation itself is: this runs while a
+    hook exception is waiting to propagate, and ``get_job`` would otherwise
+    inherit a caller client built with ``timeout=None``. A read that times out
+    leaves the outcome terminal-of-unknown-kind, which is what not knowing the
+    status means anywhere else on this path.
+    """
+    try:
+        job = await asyncio.wait_for(
+            get_job(job_id, dispatch_url=url, http=http),
+            timeout=_CANCEL_TIMEOUT_SECONDS,
+        )
+    except (DispatchError, asyncio.TimeoutError) as exc:
+        logger.warning(
+            "Could not read the terminal status of dispatch job %s: %s",
+            job_id,
+            exc,
+        )
+        return _FenceRanToTerminal(status=None)
+    return _fence_outcome_for_status(
+        job.get("status"), when_unknown=_FenceRanToTerminal(status=None),
+    )
+
+
+async def _fence_rejected_submission(
+    *,
+    http: httpx.AsyncClient,
+    url: str,
+    job_id: str,
+    idempotency_key: str | None,
+) -> _FenceOutcome:
+    """Durably stop an accepted job whose registration hook rejected it.
+
+    Returns the outcome rather than a bare success flag, because "cancelled"
+    is only one of three things that can happen and the other two both matter
+    to the caller. An unacknowledged cancellation means the job may still be
+    running, so a retry under the same idempotency key can reuse live work —
+    exactly what the record-or-cancel boundary exists to prevent. A job that
+    ran to a terminal state ran with nobody recording it, and whatever effects
+    it had stand — which the caller must not read as a clean rejection either.
+
+    ``cancel_or_fence`` is preferred when the submission carried an
+    idempotency key, because smithers records a tombstone against the key
+    even when no job is visible yet. The per-job ``DELETE`` only speaks to
+    the attempt in hand.
+    """
+    last_error: DispatchError | None = None
+    for attempt in range(1, _FENCE_ATTEMPTS + 1):
+        try:
+            if idempotency_key is not None:
+                was_terminal, fenced = await _cancel_or_fence_detailed(
+                    idempotency_key, dispatch_url=url, http=http,
+                )
+                if was_terminal and not fenced.get("status"):
+                    # Smithers answers a keyed 409 with only a ``detail``
+                    # string, so which terminal state the fence hit has to
+                    # be read back — by the job id already in hand.
+                    return await _terminal_outcome_by_job_id(
+                        http, url, job_id,
+                    )
+                return _fence_outcome_for_status(
+                    fenced.get("status"), when_unknown=_FenceCancelled(),
+                )
+            outcome = await _delete_remote_job(http, url, job_id)
+            if outcome == "already_terminal":
+                return await _terminal_outcome_by_job_id(http, url, job_id)
+            return _FenceCancelled()
+        except DispatchError as exc:
+            last_error = exc
+            if not exc.retryable or attempt == _FENCE_ATTEMPTS:
+                break
+            logger.warning(
+                "Cancellation of dispatch job %s unacknowledged "
+                "(attempt %d/%d): %s",
+                job_id,
+                attempt,
+                _FENCE_ATTEMPTS,
+                exc,
+            )
+            await asyncio.sleep(_FENCE_RETRY_SECONDS)
+    if last_error is None:
+        # Only reachable with _FENCE_ATTEMPTS configured to zero: nothing was
+        # attempted, so nothing was fenced, and saying so beats reporting a
+        # cancellation that never happened.
+        last_error = DispatchError(
+            f"Dispatch job {job_id} cancellation was never attempted",
+            job_id=job_id,
+        )
+    return _FenceUnacknowledged(error=last_error)
+
+
+def _fence_warning(job_id: str, outcome: _FenceOutcome) -> str | None:
+    """The one-line caller-visible warning for a fence that wasn't clean."""
+    if isinstance(outcome, _FenceCancelled):
+        return None
+    if isinstance(outcome, _FenceRanToTerminal):
+        reached = (
+            f"reached status {outcome.status!r}"
+            if outcome.status is not None
+            else "was already terminal"
+        )
+        return (
+            f"Dispatch job {job_id} {reached} before it could be cancelled, so "
+            f"it ran unrecorded and any effects it had stand even though this "
+            f"hook rejected it."
+        )
+    return (
+        f"Dispatch job {job_id} was not confirmed cancelled after this hook "
+        f"rejected it and may still be running: {outcome.error}"
+    )
+
+
+async def _drain(task: asyncio.Task[Any]) -> asyncio.CancelledError | None:
+    """Await ``task`` to completion, surviving repeated cancellation.
+
+    ``asyncio.shield`` keeps a task running when its awaiter is cancelled,
+    but it does not protect the ``await`` on it — a single ``cancel()`` would
+    otherwise abandon the task mid-flight, skip the awaiter's cleanup, and
+    leave a detached task to outlive the HTTP client it is still using. So a
+    cancellation arriving here is recorded and the wait resumed; the caller
+    decides what to do with it once the task has actually landed, and should
+    re-raise it — absorbing a cancellation tells the canceller this coroutine
+    stopped when it did not.
+
+    The caller also owns inspecting the completed task for failures. Draining
+    retains any caller cancellation even when the task itself raises.
+    """
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+        except Exception:
+            # shield propagates task failures too. Leave their interpretation
+            # to the caller, retaining any cancellation already received.
+            break
+    return cancellation
+
+
+async def _await_fence(
+    fence_task: asyncio.Task[_FenceOutcome],
+    job_id: str,
+) -> tuple[_FenceOutcome, asyncio.CancelledError | None]:
+    """Drain a fence to its outcome, plus any cancellation that arrived.
+
+    A fence that fails in some way it did not anticipate is reported as an
+    unacknowledged cancellation rather than raised, because the exception this
+    whole path exists to propagate is the hook's, not this one's.
+    """
+    cancellation = await _drain(fence_task)
+
+    if fence_task.cancelled():
+        # Nothing here cancels the shielded task, so this is the event loop
+        # being torn down underneath it. The fence did not land.
+        return (
+            _FenceUnacknowledged(
+                error=DispatchError(
+                    f"Dispatch job {job_id} cancellation was itself cancelled",
+                    job_id=job_id,
+                    retryable=True,
+                ),
+            ),
+            cancellation,
+        )
+    fence_error = fence_task.exception()
+    if fence_error is not None:
+        return (
+            _FenceUnacknowledged(
+                error=DispatchError(
+                    f"Dispatch job {job_id} cancellation failed: {fence_error}",
+                    job_id=job_id,
+                    retryable=True,
+                ),
+            ),
+            cancellation,
+        )
+    return fence_task.result(), cancellation
 
 
 async def _wait_for_terminal(
@@ -300,15 +677,21 @@ async def _submit_and_poll(
     poll_config: _PollConfig | None = None,
     listener: Any = None,  # CallbackListener | None — typed via Any to keep
                             # jig.dispatch.listener import optional
-    on_submitted: Callable[[str], None] | None = None,
+    on_submitted: Callable[[str], Awaitable[None] | None] | None = None,
 ) -> dict[str, Any]:
     """Submit a job to smithers, wait for a terminal status, return the job data.
 
     ``on_submitted``, when provided, is invoked with the smithers job id
     immediately after submission is accepted — before the terminal wait —
     so callers can durably record the correlation while the job runs.
-    Hook exceptions are logged and swallowed; observing acceptance must
-    never fail the dispatch itself.
+    The hook may be synchronous or asynchronous.  It completes before Jig
+    begins waiting for the result.  If it rejects, Jig cancels the accepted
+    remote job before propagating the hook exception, providing a safe
+    record-or-cancel boundary for durable correlation stores.  That
+    cancellation goes through the durable idempotency-key fence when the
+    submission carried a key, and a cancellation smithers never acknowledges
+    is retried and then reported as a note on the propagated hook exception
+    — never silently swallowed, because the job may still be running.
 
     When ``listener`` is provided (and its health check passes), the wait
     is an ``asyncio.Future`` resolved by a smithers HTTP callback —
@@ -406,13 +789,53 @@ async def _submit_and_poll(
     logger.info("Dispatch job %s submitted (task_type=%s)", job_id, task_type)
     if on_submitted is not None:
         try:
-            on_submitted(job_id)
-        except Exception:
-            logger.warning(
-                "on_submitted hook failed for job %s (dispatch continues)",
-                job_id,
-                exc_info=True,
+            hook_result = on_submitted(job_id)
+            if inspect.isawaitable(hook_result):
+                await hook_result
+        except BaseException as hook_error:
+            # Acceptance already happened.  Do not leave uncorrelated work
+            # running when its durable registration fence rejects.
+            fence_task = asyncio.create_task(
+                _fence_rejected_submission(
+                    http=http,
+                    url=url,
+                    job_id=job_id,
+                    idempotency_key=idempotency_key,
+                ),
             )
+            try:
+                fence_outcome, cancellation = await _await_fence(
+                    fence_task, job_id,
+                )
+            finally:
+                # In a finally so the nonce cannot leak if draining the fence
+                # raises something _await_fence didn't anticipate.
+                if listener is not None and callback_nonce is not None:
+                    listener.unregister(callback_nonce)
+            warning = _fence_warning(job_id, fence_outcome)
+            if warning is not None:
+                # The hook failure stays the raised exception — it is what the
+                # caller asked about — but it must not read as a clean
+                # record-or-cancel rejection when the job may still be live,
+                # or when it already ran.
+                logger.error("%s (on_submitted hook rejected it)", warning)
+                hook_error.add_note(warning)
+            if cancellation is not None:
+                # This caller was cancelled while the fence was in flight.
+                # Cancellation wins: a coroutine that absorbs it and returns
+                # some other exception has told its canceller it stopped when
+                # it did not, which breaks task groups and every other
+                # structured-concurrency caller. The hook failure rides along
+                # as the cause, and the fence warning is restated as a note so
+                # it survives a caller that only reads ``str(exc)``.
+                cancellation.add_note(
+                    f"Cancelled while propagating a rejected on_submitted hook "
+                    f"for dispatch job {job_id}: {hook_error!r}",
+                )
+                if warning is not None:
+                    cancellation.add_note(warning)
+                raise cancellation from hook_error
+            raise
     wait_timeout_seconds = max(
         0.0,
         cfg.timeout_seconds + cfg.cleanup_grace_seconds,
@@ -432,12 +855,17 @@ async def _submit_and_poll(
     except asyncio.CancelledError:
         # The local request/response owner has abandoned the call. Wait for
         # smithers to propagate cancellation to its worker before allowing a
-        # retry to occupy that same worker slot.
-        await asyncio.shield(_cancel_remote_job(http, url, job_id))
+        # retry to occupy that same worker slot. Drained rather than merely
+        # shielded, so a second cancel() cannot abandon it mid-flight.
+        await _cancel_remote_job_drained(http, url, job_id)
         raise
     except JobTimeoutError:
         if cfg.cancel_on_timeout:
-            await asyncio.shield(_cancel_remote_job(http, url, job_id))
+            cancellation = await _cancel_remote_job_drained(http, url, job_id)
+            if cancellation is not None:
+                # Cancelled while cancelling the timed-out job: cancellation
+                # wins, with the timeout as its context.
+                raise cancellation
         raise
     finally:
         if listener is not None and callback_nonce is not None:
@@ -475,6 +903,126 @@ def _get_shared_http() -> httpx.AsyncClient:
         _shared_http = httpx.AsyncClient(timeout=30.0)
         _shared_http_loop = loop
     return _shared_http
+
+
+async def get_job(
+    job_id: str,
+    *,
+    dispatch_url: str | None = None,
+    http: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """Return the current smithers representation of ``job_id``.
+
+    This performs one ``GET`` and does not wait for a terminal state.
+    """
+    transport = http or _get_shared_http()
+    url = (dispatch_url or default_dispatch_url()).rstrip("/")
+    what = f"Dispatch job {job_id} status request"
+    response = await _send(
+        transport.get,
+        f"{url}/jobs/{job_id}",
+        what=what,
+        job_id=job_id,
+        error_statuses={404: "not_found"},
+    )
+    return _json_object(response, what=what, job_id=job_id)
+
+
+async def cancel_job(
+    job_id: str,
+    *,
+    dispatch_url: str | None = None,
+    http: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """Cancel ``job_id`` and return smithers' acknowledged job state.
+
+    Smithers only succeeds after an active worker acknowledges cancellation.
+    A 409 means the job was already terminal; a 503 means it remains active.
+    """
+    transport = http or _get_shared_http()
+    url = (dispatch_url or default_dispatch_url()).rstrip("/")
+    what = f"Dispatch job {job_id} cancellation"
+    response = await _send(
+        transport.delete,
+        f"{url}/jobs/{job_id}",
+        what=what,
+        job_id=job_id,
+        error_statuses={404: "not_found", 409: "already_terminal"},
+    )
+    return _json_object(response, what=what, job_id=job_id)
+
+
+async def get_job_by_idempotency_key(
+    idempotency_key: str,
+    *,
+    dispatch_url: str | None = None,
+    http: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """Return the job associated with ``idempotency_key``.
+
+    This is a single status read. The key is URL-encoded as one path segment;
+    a missing job is reported as ``DispatchError(status="not_found")``.
+    """
+    transport = http or _get_shared_http()
+    url = (dispatch_url or default_dispatch_url()).rstrip("/")
+    what = f"Dispatch idempotency key {idempotency_key!r} status request"
+    response = await _send(
+        transport.get,
+        f"{url}/jobs/by-idempotency/{quote(idempotency_key, safe='')}",
+        what=what,
+        error_statuses={404: "not_found"},
+    )
+    return _json_object(response, what=what)
+
+
+async def cancel_or_fence(
+    idempotency_key: str,
+    *,
+    dispatch_url: str | None = None,
+    http: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """Durably prevent work for ``idempotency_key`` from remaining active.
+
+    Smithers records a cancellation tombstone even when no matching job is
+    visible yet. A 200 response means cancellation completed (and may include
+    a ``job_id``). A 409 means the job was already terminal, but the tombstone
+    is still durable, so its response is also returned as a successful fence.
+    A 503 means worker cancellation was not acknowledged and is retryable.
+
+    Both codes fence, so both are returned the same way here. Callers that
+    must tell "I stopped it" from "it had already finished" — the
+    record-or-cancel boundary is the one that must — use
+    :func:`_cancel_or_fence_detailed`.
+    """
+    _, data = await _cancel_or_fence_detailed(
+        idempotency_key, dispatch_url=dispatch_url, http=http,
+    )
+    return data
+
+
+async def _cancel_or_fence_detailed(
+    idempotency_key: str,
+    *,
+    dispatch_url: str | None = None,
+    http: httpx.AsyncClient | None = None,
+) -> tuple[bool, dict[str, Any]]:
+    """:func:`cancel_or_fence`, plus whether the job was already terminal.
+
+    The flag is the 409, kept separate from the body because a 200 fence is a
+    cancellation whether or not smithers names a status in its response — so
+    the body alone cannot distinguish the two.
+    """
+    transport = http or _get_shared_http()
+    url = (dispatch_url or default_dispatch_url()).rstrip("/")
+    what = f"Dispatch idempotency key {idempotency_key!r} fencing"
+    response = await _send(
+        transport.delete,
+        f"{url}/jobs/by-idempotency/{quote(idempotency_key, safe='')}",
+        what=what,
+        passthrough=frozenset({409}),
+        timeout=_CANCEL_TIMEOUT_SECONDS,
+    )
+    return response.status_code == 409, _json_object(response, what=what)
 
 
 async def aclose() -> None:
@@ -531,13 +1079,14 @@ async def run(
     poll_interval: float = 0.5,
     poll_max_interval: float = 5.0,
     http: httpx.AsyncClient | None = None,
-    on_submitted: Callable[[str], None] | None = None,
+    on_submitted: Callable[[str], Awaitable[None] | None] | None = None,
 ) -> Any:
     """Execute ``fn_ref`` on a smithers worker, await the result.
 
     ``on_submitted``, when provided, receives the smithers job id at
-    acceptance time (before the result wait); hook exceptions are logged,
-    never raised.
+    acceptance time (before the result wait). Async hooks are awaited. If
+    the hook rejects, the accepted job is cancelled before that exception
+    is propagated.
 
     ``idempotency_key`` identifies this logical submission to smithers. If a
     transient response loss makes the caller retry with the same key, smithers

@@ -402,6 +402,31 @@ class TestPreDispatchGate:
         assert dispatch_calls == 0
         assert tool.on_dispatch_error_calls == 0
 
+    async def test_on_dispatch_error_fires_for_jig_tool_error_from_submission_hook(
+        self, monkeypatch,
+    ):
+        """A JigToolError from on_dispatch_submitted arrives after the job
+        was accepted and fenced — a post-dispatch failure, not a gate
+        rejection — so on_dispatch_error must fire for it."""
+        async def fake_run(fn_ref, payload=None, *, on_submitted=None, **kwargs):
+            on_submitted("j-1")
+            return {}
+
+        monkeypatch.setattr(jig.dispatch, "run", fake_run)
+        rejection = JigToolError(
+            "correlation store refused j-1", tool_name="dispatched", phase="dispatch",
+        )
+
+        class _Tool(_OnErrorTool):
+            def on_dispatch_submitted(self, job_id: str) -> None:
+                raise rejection
+
+        tool = _Tool()
+        result = await ToolRegistry([tool]).execute(_call())
+
+        assert result.error == "dispatch: correlation store refused j-1"
+        assert tool.seen == [rejection]
+
     async def test_async_pre_dispatch_is_awaited_and_can_reject(self, monkeypatch):
         dispatch_calls = 0
 

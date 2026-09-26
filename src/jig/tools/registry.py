@@ -306,29 +306,39 @@ class ToolRegistry:
             else:
                 result = await _gate_and_dispatch()
         except JigToolError as e:
-            # Raised by pre_dispatch (normalized to phase="gate" there
-            # unless the tool picked a different phase itself) or by a
-            # tool's own dispatch_payload_extra. Either way nothing was
-            # dispatched, so on_dispatch_error — a *post*-dispatch hook —
-            # deliberately does not fire here; the ToolResult.error is
-            # the only signal, same as a gate rejection has always been.
-            # No phase in the fallback: it is already the error's prefix.
+            # Usually raised by pre_dispatch (normalized to phase="gate"
+            # there unless the tool picked a different phase itself) or by a
+            # tool's own dispatch_payload_extra, with nothing dispatched —
+            # so on_dispatch_error, a *post*-dispatch hook, does not fire.
+            # But on_dispatch_submitted can raise one too, after the job was
+            # accepted and then fenced; that is a post-dispatch failure and
+            # the hook fires. No phase in the fallback: it is already the
+            # error's prefix.
             msg = str(e) or "tool raised without message"
-            error = f"{e.phase}: {msg}"
+            error = _with_notes(f"{e.phase}: {msg}", e)
             logger.warning("tool.execute %s error name=%s err=%s", e.phase, call.name, error)
+            if dispatch_entered:
+                await _fire_dispatch_error_hook(tool, e, tool_context)
             return ToolResult(call_id=call.id, output="", error=error)
         except asyncio.TimeoutError as e:
             logger.warning("tool.execute dispatch timeout name=%s after=%ss", call.name, self._execute_timeout)
             if dispatch_entered:
                 await _fire_dispatch_error_hook(tool, e, tool_context)
+            # A timeout that lands while a rejected on_dispatch_submitted is
+            # being fenced carries the fence warning on its cause — the
+            # CancelledError wait_for converted — which _with_notes follows.
             return ToolResult(
                 call_id=call.id,
                 output="",
-                error=f"TimeoutError: Dispatched tool {call.name} timed out after {self._execute_timeout}s",
+                error=_with_notes(
+                    f"TimeoutError: Dispatched tool {call.name} timed out after {self._execute_timeout}s",
+                    e,
+                ),
             )
         except DispatchError as e:
             msg = str(e)
             error = f"{type(e).__name__}: {msg}" if msg else f"{type(e).__name__}: tool raised without message"
+            error = _with_notes(error, e)
             logger.warning("tool.execute dispatch error name=%s err=%s", call.name, error)
             if dispatch_entered:
                 await _fire_dispatch_error_hook(tool, e, tool_context)
@@ -343,6 +353,7 @@ class ToolRegistry:
             # JigToolError lands here with nothing shipped.
             msg = str(e)
             error = f"{type(e).__name__}: {msg}" if msg else f"{type(e).__name__}: tool raised without message"
+            error = _with_notes(error, e)
             logger.warning("tool.execute dispatch error name=%s err=%s", call.name, error, exc_info=True)
             if dispatch_entered:
                 await _fire_dispatch_error_hook(tool, e, tool_context)
@@ -388,10 +399,9 @@ class ToolRegistry:
             # Runs outside the execute_timeout wait_for above: that
             # budget is for the remote job, and local reconciliation
             # (e.g. persisting a completion row) must not be clipped by
-            # it. Unlike on_dispatch_submitted, exceptions here are NOT
-            # swallowed — a failed reconciliation means downstream state
-            # is unrecorded, and the model must not proceed as if the
-            # result were usable.
+            # it. Exceptions here are NOT swallowed — a failed
+            # reconciliation means downstream state is unrecorded, and the
+            # model must not proceed as if the result were usable.
             try:
                 replacement = on_dispatch_result(result, tool_context)
                 if inspect.isawaitable(replacement):
@@ -490,6 +500,35 @@ def _schema_validation_error(validator: Any, arguments: dict[str, Any] | None) -
     if hint:
         msg = f"{msg} — {hint}"
     return msg
+
+
+def _with_notes(error: str, exc: BaseException) -> str:
+    """Fold ``BaseException.__notes__`` into a model-visible error message.
+
+    ``str(exc)`` drops notes, and a note is the only carrier the dispatch
+    client has for "this job may still be running" (or "it already ran") after
+    a submission hook rejected it — the one thing a tool caller most needs to
+    know about that failure. Without this the warning dies at the registry
+    boundary. No notes, no change.
+
+    Notes are gathered down the ``__cause__`` chain as well, because the
+    exception that reaches the registry is not always the one the note was
+    put on: ``asyncio.wait_for`` raises ``TimeoutError`` *from* the
+    ``CancelledError`` that carried it. A warning restated at more than one
+    link appears once.
+    """
+    notes: list[str] = []
+    seen: set[int] = set()
+    link: BaseException | None = exc
+    while link is not None and id(link) not in seen:
+        seen.add(id(link))
+        for note in getattr(link, "__notes__", ()):
+            if note not in notes:
+                notes.append(note)
+        link = link.__cause__
+    if not notes:
+        return error
+    return "; ".join([error, *notes])
 
 
 def _call_context_hook(

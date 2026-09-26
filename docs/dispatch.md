@@ -126,14 +126,50 @@ duck-typed — define the method to opt in, omit it and nothing changes.
 | hook | when | raising |
 |---|---|---|
 | `pre_dispatch(arguments, context)` | before `dispatch_payload_extra`, before anything ships | rejects the call; message becomes `ToolResult.error` prefixed `gate:` |
-| `on_dispatch_submitted(job_id)` | after the job is accepted, before the terminal wait | logged and swallowed |
+| `on_dispatch_submitted(job_id)` | after the job is accepted, before the terminal wait | cancels the accepted job, then propagates — **not** swallowed |
 | `on_dispatch_result(result, context)` | after the job returns successfully | becomes `ToolResult.error` — **not** swallowed |
 | `on_dispatch_error(error, context)` | after the job fails | logged and swallowed |
 
-`pre_dispatch`, `on_dispatch_result`, and `on_dispatch_error` may be sync
-or async; the registry awaits an awaitable return. `on_dispatch_submitted`
-is called synchronously by the dispatch client and its return value is
-never awaited, so defining it `async` silently does nothing.
+All four hooks may be sync or async; an awaitable return is awaited —
+`pre_dispatch`, `on_dispatch_result` and `on_dispatch_error` by the
+registry, `on_dispatch_submitted` by the dispatch client, which completes
+it before the terminal wait begins.
+
+`on_dispatch_submitted` is the durable-correlation fence, so its exceptions
+are **not** swallowed: the job is already accepted, and work nobody recorded
+must not keep running. The client cancels the accepted job — through the
+idempotency-key fence when the submission carried a key, otherwise by job id
+— and then re-raises the hook's exception.
+
+Only one of the three ways that cancellation can land is a clean rejection,
+and the other two are reported on the propagated exception as a note (and an
+error-level log), never swallowed:
+
+| cancellation outcome | what the caller is told |
+|---|---|
+| smithers confirms the job stopped | nothing extra — the boundary held |
+| smithers never acknowledges it | retried, then a note saying the job **may still be running** |
+| the job was already terminal for another reason | a note naming the status it reached, because it ran unrecorded and any effects it had stand |
+
+That last row is the one worth reading twice. A cancellation request against a
+job that already ran answers the same way whether it was cancelled or
+completed — smithers' 409 carries only a `detail` string, on the keyed fence
+and the per-job `DELETE` alike — so the client resolves which with one extra
+`GET /jobs/{id}` rather than presenting a completed job as cancelled work. A
+status it cannot read is reported as terminal-of-unknown-kind, not as a clean
+stop.
+
+For a dispatched tool these notes are folded into `ToolResult.error`, so the
+warning reaches the model rather than dying at the registry boundary — including
+when the tool's `execute_timeout` fires while the fence is in flight. A
+`JigToolError` raised from `on_dispatch_submitted` is a post-dispatch failure,
+so `on_dispatch_error` fires for it.
+
+Cancelling the caller while that fence is in flight does not abandon it — the
+client waits for the fence to land either way, so a cancelled caller cannot
+leave the job running behind it. The `CancelledError` still wins over the hook
+exception, which is attached to it as the cause along with any of the warnings
+above.
 
 `pre_dispatch` shares `dispatch_payload_extra`'s flexible calling
 convention: its parameters may be named `context`/`tool_context`/`ctx` and
