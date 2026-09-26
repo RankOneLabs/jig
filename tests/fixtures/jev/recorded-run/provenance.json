@@ -1,0 +1,17 @@
+{
+  "source_path": "typesafe-relevance-primary-2026-09/exported-answers.json",
+  "source_sha256": "0c760d3d77c0016d696bd78a9005bb1d9ffbd6e8717b907266106520e5af3af4",
+  "catalogue_sha256": "27c54ff7daf18383fcee7c947ef11290b81a6e24bfc55c3e1779c1bea590b88e",
+  "population_sha256": "6c3d18de02e35f33a432be9f9bda57d36d22478a69fad94c42d924d4ccc9782a",
+  "requested_model": "jev-latest",
+  "resolved_model": "jev-1.13.0",
+  "assay_sdk_version": "0.6.0",
+  "evaluation_id": 46102,
+  "repeat_index": 1,
+  "selected_question_ids": [
+    "topic_observability",
+    "account_type",
+    "band"
+  ],
+  "request_note": "The request half is RECONSTRUCTED from the digest-pinned catalogue with an empty state, not recorded request bytes. The response half is an excerpt of one recorded provider repeat; post text is omitted."
+}
