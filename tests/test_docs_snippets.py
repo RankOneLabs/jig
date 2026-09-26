@@ -173,3 +173,36 @@ def test_identity_aware_trace_diff_guide_mapping_constructs() -> None:
     assert identity_map([definition]) == {
         "update_work_item": ["work_item.id"]
     }
+
+
+async def test_jev_documented_example_executes_against_stub():
+    """Execute the exact marked block in docs/jev.md through a stub endpoint."""
+    from functools import partial
+    import httpx
+    from pathlib import Path
+
+    page = (Path(__file__).resolve().parents[1] / "docs/jev.md").read_text()
+    block = page.split("```python jev-example\n", 1)[1].split("\n```", 1)[0]
+    namespace: dict[str, Any] = {}
+    exec(compile(block, "docs/jev.md", "exec"), namespace)
+
+    def handler(request):
+        assert request.url.path == "/v1/systemone"
+        payload = __import__("json").loads(request.content)
+        assert set(payload["questions"]) == {"relevant", "kind", "quality"}
+        return httpx.Response(200, json={
+            "model": "jev-1.13.0", "request_id": "stub-1",
+            "answers": {
+                "relevant": {"type": "noul", "noul": 0.8},
+                "kind": {"type": "choice", "choice": "practice",
+                         "probabilities": {"practice": 0.9, "incident": 0.1}, "confidence": 0.9},
+                "quality": {"type": "score", "score": 1.0,
+                            "probabilities": {"0": 0.0, "1": 1.0}, "confidence": 1.0},
+            }, "usage": {"input_tokens": 5, "output_tokens": 3},
+        })
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        namespace["JevClient"] = partial(namespace["JevClient"], http=http)
+        result, probability, choice, score = await namespace["evaluate_example"]()
+    assert result.model == "jev-1.13.0"
+    assert (probability, choice, score) == (0.8, "practice", 1.0)

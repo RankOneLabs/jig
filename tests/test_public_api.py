@@ -14,6 +14,17 @@ import importlib
 
 import jig
 
+# Jev is an import-stable submodule, like jig.eval. Keep its names out of
+# top-level jig: jig.Score is already the grading dataclass, and placing
+# ScoreQuestion/ScoreAnswer beside it invites consumers to confuse the types.
+JEV_PUBLIC_NAMES = {"JevClient", "NoulQuestion", "ChoiceQuestion", "ScoreQuestion",
+                    "NoulAnswer", "ChoiceAnswer", "ScoreAnswer", "JevResult",
+                    "JevUsage", "JevError", "JevErrorKind", "to_jig_usage"}
+
+
+def test_jev_names_are_submodule_only():
+    assert JEV_PUBLIC_NAMES.isdisjoint(jig.__all__)
+
 # The ``jig.replay`` submodule is shadowed on the ``jig`` package object by
 # the ``replay()`` function of the same name (both are exported from
 # ``jig/__init__.py``), so submodules under ``jig.replay`` must be reached
