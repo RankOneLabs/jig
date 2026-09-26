@@ -451,6 +451,9 @@ async def _drain(task: asyncio.Task[Any]) -> asyncio.CancelledError | None:
     decides what to do with it once the task has actually landed, and should
     re-raise it — absorbing a cancellation tells the canceller this coroutine
     stopped when it did not.
+
+    The caller also owns inspecting the completed task for failures. Draining
+    retains any caller cancellation even when the task itself raises.
     """
     cancellation: asyncio.CancelledError | None = None
     while not task.done():
@@ -458,6 +461,10 @@ async def _drain(task: asyncio.Task[Any]) -> asyncio.CancelledError | None:
             await asyncio.shield(task)
         except asyncio.CancelledError as exc:
             cancellation = exc
+        except Exception:
+            # shield propagates task failures too. Leave their interpretation
+            # to the caller, retaining any cancellation already received.
+            break
     return cancellation
 
 

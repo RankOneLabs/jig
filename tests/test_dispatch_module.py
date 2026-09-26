@@ -1222,6 +1222,63 @@ class TestOnSubmittedHook:
 
         assert out == "ok"
 
+    @pytest.mark.parametrize("cancel_caller", [False, True])
+    async def test_unexpected_fence_error_preserves_hook_and_cleanup(self, cancel_caller):
+        from jig.dispatch.client import _submit_and_poll
+
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        fence_started = asyncio.Event()
+        release_fence = asyncio.Event()
+
+        async def fail_fence(*args, **kwargs):
+            fence_started.set()
+            await release_fence.wait()
+            raise RuntimeError("transport failed unexpectedly")
+
+        http.delete.side_effect = fail_fence
+        listener = MagicMock()
+        listener.health_check = AsyncMock()
+        listener.register.return_value = (
+            "nonce-1", asyncio.get_running_loop().create_future(),
+        )
+        hook_error = ValueError("registration rejected")
+
+        def reject(job_id):
+            raise hook_error
+
+        task = asyncio.create_task(_submit_and_poll(
+            http=http,
+            dispatch_url="http://localhost:8900",
+            task_type="function",
+            payload={},
+            idempotency_key="attempt-7",
+            listener=listener,
+            on_submitted=reject,
+        ))
+        await asyncio.wait_for(fence_started.wait(), timeout=1)
+        if cancel_caller:
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+        release_fence.set()
+
+        expected = asyncio.CancelledError if cancel_caller else ValueError
+        with pytest.raises(expected) as caught:
+            await task
+
+        if cancel_caller:
+            assert caught.value.__cause__ is hook_error
+            assert task.cancelled()
+        else:
+            assert caught.value is hook_error
+        assert any(
+            "may still be running" in note and "transport failed unexpectedly" in note
+            for note in caught.value.__notes__
+        )
+        listener.unregister.assert_called_once_with("nonce-1")
+        http.get.assert_not_awaited()
+
     async def test_success_job_dict_always_carries_job_id(self):
         from jig.dispatch.client import _submit_and_poll
 
@@ -1345,6 +1402,63 @@ class TestRegistryOnSubmittedPlumbed:
         assert result.error is not None
         assert result.error.startswith("TimeoutError:")
         assert "may still be running" in result.error
+
+    @pytest.mark.parametrize("registry_timeout", [False, True])
+    @pytest.mark.parametrize("fence_status", [409, 503])
+    async def test_timeout_preserves_fence_warning(
+        self, monkeypatch, registry_timeout, fence_status,
+    ):
+        import jig.dispatch
+        from jig.dispatch import client
+
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.delete.return_value = _job_api_resp({}, status_code=fence_status)
+        http.get.return_value = _job_api_resp({"status": "complete"})
+        hook_started = asyncio.Event()
+
+        async def reject(job_id):
+            hook_started.set()
+            if registry_timeout:
+                await asyncio.Event().wait()
+            raise TimeoutError("correlation database timed out")
+
+        async def run(*args, **kwargs):
+            return await client.run(*args, http=http, **kwargs)
+
+        monkeypatch.setattr(jig.dispatch, "run", run)
+        monkeypatch.setattr(client, "_FENCE_RETRY_SECONDS", 0)
+        tool = _DispatchedToolWithHook()
+        tool.on_dispatch_submitted = reject
+        timeout = 0.05 if registry_timeout else None
+        reg = ToolRegistry([tool], execute_timeout=timeout)
+        result = await reg.execute(ToolCall(id="c1", name="backtest", arguments={}))
+
+        assert hook_started.is_set()
+        assert result.error.startswith(
+            f"TimeoutError: Dispatched tool backtest timed out after {timeout}s",
+        )
+        warning = "ran unrecorded" if fence_status == 409 else "may still be running"
+        assert warning in result.error
+        assert "j-1" in result.error
+
+    async def test_timeout_deduplicates_notes_from_cancellation(self, monkeypatch):
+        import jig.dispatch
+
+        warning = "Dispatch job j-1 may still be running"
+
+        async def run(*args, **kwargs):
+            cancellation = asyncio.CancelledError()
+            cancellation.add_note(warning)
+            error = TimeoutError()
+            error.add_note(warning)
+            raise error from cancellation
+
+        monkeypatch.setattr(jig.dispatch, "run", run)
+        reg = ToolRegistry([_DispatchedToolWithHook()])
+        result = await reg.execute(ToolCall(id="c1", name="backtest", arguments={}))
+
+        assert result.error.count(warning) == 1
 
 
 class TestStrictToolPayload:
