@@ -259,10 +259,19 @@ async def _terminal_outcome_by_job_id(
     found, so this costs one extra read on a path that only runs when a
     registration hook has already rejected — rare, and the answer decides
     whether the caller is told work completed behind its back.
+
+    Bounded for the same reason the cancellation itself is: this runs while a
+    hook exception is waiting to propagate, and ``get_job`` would otherwise
+    inherit a caller client built with ``timeout=None``. A read that times out
+    leaves the outcome terminal-of-unknown-kind, which is what not knowing the
+    status means anywhere else on this path.
     """
     try:
-        job = await get_job(job_id, dispatch_url=url, http=http)
-    except DispatchError as exc:
+        job = await asyncio.wait_for(
+            get_job(job_id, dispatch_url=url, http=http),
+            timeout=_CANCEL_TIMEOUT_SECONDS,
+        )
+    except (DispatchError, asyncio.TimeoutError) as exc:
         logger.warning(
             "Could not read the terminal status of dispatch job %s: %s",
             job_id,
@@ -357,6 +366,59 @@ def _fence_warning(job_id: str, outcome: _FenceOutcome) -> str | None:
         f"Dispatch job {job_id} was not confirmed cancelled after this hook "
         f"rejected it and may still be running: {outcome.error}"
     )
+
+
+async def _await_fence(
+    fence_task: asyncio.Task[_FenceOutcome],
+    job_id: str,
+) -> tuple[_FenceOutcome, asyncio.CancelledError | None]:
+    """Await a shielded fence to completion, surviving repeated cancellation.
+
+    ``asyncio.shield`` keeps the fence running when this caller is cancelled,
+    but it does not protect the ``await`` on it — a single ``cancel()`` would
+    otherwise abandon the fence mid-flight, skip the caller's cleanup, replace
+    the hook exception with a bare ``CancelledError``, and leave a detached
+    task to outlive the HTTP client it is still using. So a cancellation
+    arriving here is recorded and the wait resumed; the caller decides what to
+    do with it once the fence has actually landed.
+
+    A fence that fails in some way it did not anticipate is reported as an
+    unacknowledged cancellation rather than raised, because the exception this
+    whole path exists to propagate is the hook's, not this one's.
+    """
+    cancellation: asyncio.CancelledError | None = None
+    while not fence_task.done():
+        try:
+            await asyncio.shield(fence_task)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+
+    if fence_task.cancelled():
+        # Nothing here cancels the shielded task, so this is the event loop
+        # being torn down underneath it. The fence did not land.
+        return (
+            _FenceUnacknowledged(
+                error=DispatchError(
+                    f"Dispatch job {job_id} cancellation was itself cancelled",
+                    job_id=job_id,
+                    retryable=True,
+                ),
+            ),
+            cancellation,
+        )
+    fence_error = fence_task.exception()
+    if fence_error is not None:
+        return (
+            _FenceUnacknowledged(
+                error=DispatchError(
+                    f"Dispatch job {job_id} cancellation failed: {fence_error}",
+                    job_id=job_id,
+                    retryable=True,
+                ),
+            ),
+            cancellation,
+        )
+    return fence_task.result(), cancellation
 
 
 async def _wait_for_terminal(
@@ -646,7 +708,7 @@ async def _submit_and_poll(
         except BaseException as hook_error:
             # Acceptance already happened.  Do not leave uncorrelated work
             # running when its durable registration fence rejects.
-            fence_outcome = await asyncio.shield(
+            fence_task = asyncio.create_task(
                 _fence_rejected_submission(
                     http=http,
                     url=url,
@@ -654,8 +716,15 @@ async def _submit_and_poll(
                     idempotency_key=idempotency_key,
                 ),
             )
-            if listener is not None and callback_nonce is not None:
-                listener.unregister(callback_nonce)
+            try:
+                fence_outcome, cancellation = await _await_fence(
+                    fence_task, job_id,
+                )
+            finally:
+                # In a finally so the nonce cannot leak if draining the fence
+                # raises something _await_fence didn't anticipate.
+                if listener is not None and callback_nonce is not None:
+                    listener.unregister(callback_nonce)
             warning = _fence_warning(job_id, fence_outcome)
             if warning is not None:
                 # The hook failure stays the raised exception — it is what the
@@ -664,6 +733,21 @@ async def _submit_and_poll(
                 # or when it already ran.
                 logger.error("%s (on_submitted hook rejected it)", warning)
                 hook_error.add_note(warning)
+            if cancellation is not None:
+                # This caller was cancelled while the fence was in flight.
+                # Cancellation wins: a coroutine that absorbs it and returns
+                # some other exception has told its canceller it stopped when
+                # it did not, which breaks task groups and every other
+                # structured-concurrency caller. The hook failure rides along
+                # as the cause, and the fence warning is restated as a note so
+                # it survives a caller that only reads ``str(exc)``.
+                cancellation.add_note(
+                    f"Cancelled while propagating a rejected on_submitted hook "
+                    f"for dispatch job {job_id}: {hook_error!r}",
+                )
+                if warning is not None:
+                    cancellation.add_note(warning)
+                raise cancellation from hook_error
             raise
     wait_timeout_seconds = max(
         0.0,

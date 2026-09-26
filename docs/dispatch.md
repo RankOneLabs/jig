@@ -162,6 +162,12 @@ stop.
 For a dispatched tool these notes are folded into `ToolResult.error`, so the
 warning reaches the model rather than dying at the registry boundary.
 
+Cancelling the caller while that fence is in flight does not abandon it — the
+client waits for the fence to land either way, so a cancelled caller cannot
+leave the job running behind it. The `CancelledError` still wins over the hook
+exception, which is attached to it as the cause along with any of the warnings
+above.
+
 `pre_dispatch` shares `dispatch_payload_extra`'s flexible calling
 convention: its parameters may be named `context`/`tool_context`/`ctx` and
 `arguments`/`args`, in either order, or omitted entirely. The other three

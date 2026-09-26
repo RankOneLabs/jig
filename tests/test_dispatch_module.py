@@ -1085,6 +1085,80 @@ class TestOnSubmittedHook:
             for note in getattr(caught.value, "__notes__", [])
         )
 
+    async def test_terminal_status_read_is_bounded(self):
+        """The read-back runs while a hook exception waits to propagate, so a
+        caller client with no timeout must not be able to stall it."""
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+        http.delete.return_value = _job_api_resp({}, status_code=409)
+
+        async def never(*args, **kwargs):
+            await asyncio.sleep(3600)
+
+        http.get.side_effect = never
+
+        def boom(job_id: str) -> None:
+            raise RuntimeError("hook exploded")
+
+        with (
+            patch("jig.dispatch.client._CANCEL_TIMEOUT_SECONDS", 0.01),
+            pytest.raises(RuntimeError, match="hook exploded") as caught,
+        ):
+            await dispatch_run(
+                "m:f", http=http, poll_interval=0.01, on_submitted=boom,
+            )
+
+        assert any(
+            "already terminal" in note
+            for note in getattr(caught.value, "__notes__", [])
+        )
+
+    async def test_cancellation_during_the_fence_does_not_abandon_it(self):
+        """shield protects the fence task, not the await on it. A cancel
+        arriving mid-fence must not detach the fence, skip the listener
+        cleanup, or drop the hook failure on the floor."""
+        http = AsyncMock(spec=httpx.AsyncClient)
+        http.post.return_value = _submit_resp()
+
+        fence_landed = False
+        fence_started = asyncio.Event()
+
+        async def slow_fence(*args, **kwargs):
+            nonlocal fence_landed
+            fence_started.set()
+            await asyncio.sleep(0.05)
+            fence_landed = True
+            return _job_api_resp({"job_id": "j-1", "status": "cancelled"})
+
+        http.delete.side_effect = slow_fence
+
+        def boom(job_id: str) -> None:
+            raise RuntimeError("hook exploded")
+
+        task = asyncio.create_task(
+            dispatch_run(
+                "m:f",
+                http=http,
+                poll_interval=0.01,
+                on_submitted=boom,
+                idempotency_key="attempt-7",
+            ),
+        )
+        await fence_started.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+
+        assert fence_landed
+        # Cancellation wins, but the hook failure it interrupted rides along.
+        assert caught.value.__cause__ is not None
+        assert "hook exploded" in str(caught.value.__cause__)
+        assert any(
+            "hook exploded" in note
+            for note in getattr(caught.value, "__notes__", [])
+        )
+
     async def test_async_hook_is_awaited_before_polling(self):
         http = AsyncMock(spec=httpx.AsyncClient)
         http.post.return_value = _submit_resp()
