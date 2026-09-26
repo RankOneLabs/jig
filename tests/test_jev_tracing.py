@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 
 from jig.core.types import SpanKind
+from jig.jev import to_jig_usage
 from jig.jev.models import JevResult, JevUsage
-from jig.jev.tracing import to_jig_usage
 from jig.tracing import SQLiteTracer
 
 

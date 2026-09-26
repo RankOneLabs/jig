@@ -15,11 +15,12 @@ from jig.jev.models import (
     ScoreAnswer,
     ScoreQuestion,
 )
+from jig.jev.tracing import to_jig_usage
 from jig.jev.wire import PROBABILITY_SUM_TOLERANCE, build_request_body, parse_response
 
 __all__ = [
     "ChoiceAnswer", "ChoiceQuestion", "DEFAULT_ENDPOINT", "JevAnswer", "JevClient", "JevError", "JevErrorKind",
     "JevJson", "JevQuestion", "JevResult", "JevUsage", "NoulAnswer",
     "NoulQuestion", "PROBABILITY_SUM_TOLERANCE", "ScoreAnswer",
-    "ScoreQuestion", "build_request_body", "parse_response",
+    "ScoreQuestion", "build_request_body", "parse_response", "to_jig_usage",
 ]
