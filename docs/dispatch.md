@@ -149,18 +149,21 @@ error-level log), never swallowed:
 |---|---|
 | smithers confirms the job stopped | nothing extra — the boundary held |
 | smithers never acknowledges it | retried, then a note saying the job **may still be running** |
-| the job was already terminal for another reason | a note naming the status it reached, because its effects landed |
+| the job was already terminal for another reason | a note naming the status it reached, because it ran unrecorded and any effects it had stand |
 
 That last row is the one worth reading twice. A cancellation request against a
 job that already ran answers the same way whether it was cancelled or
-completed, so the client resolves which — from the fence response when the
-submission carried an idempotency key, otherwise with one extra `GET
-/jobs/{id}` — rather than presenting a completed job as cancelled work. A
+completed — smithers' 409 carries only a `detail` string, on the keyed fence
+and the per-job `DELETE` alike — so the client resolves which with one extra
+`GET /jobs/{id}` rather than presenting a completed job as cancelled work. A
 status it cannot read is reported as terminal-of-unknown-kind, not as a clean
 stop.
 
 For a dispatched tool these notes are folded into `ToolResult.error`, so the
-warning reaches the model rather than dying at the registry boundary.
+warning reaches the model rather than dying at the registry boundary — including
+when the tool's `execute_timeout` fires while the fence is in flight. A
+`JigToolError` raised from `on_dispatch_submitted` is a post-dispatch failure,
+so `on_dispatch_error` fires for it.
 
 Cancelling the caller while that fence is in flight does not abandon it — the
 client waits for the fence to land either way, so a cancelled caller cannot
