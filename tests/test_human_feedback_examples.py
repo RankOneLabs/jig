@@ -7,8 +7,16 @@ import pytest
 
 from jig import EffectiveScoreFilter, HumanFeedbackPromptConfig, Score, ScoreSource
 from jig.core.types import HumanExampleSet
-from jig.feedback.loop import SQLiteFeedbackLoop
+from jig.core.types import FeedbackLoop
 from jig.feedback.null import NullFeedbackLoop
+
+from feedback_backends import (
+    BACKENDS,
+    insert_result_row,
+    insert_score_row,
+    open_feedback_loop,
+    set_embedding,
+)
 
 
 def _vec(seed: int) -> np.ndarray:
@@ -21,9 +29,9 @@ def _vec(seed: int) -> np.ndarray:
     return rng.random(128, dtype=np.float32)
 
 
-@pytest.fixture
-async def feedback_db(tmp_path):
-    loop = SQLiteFeedbackLoop(db_path=str(tmp_path / "test.db"))
+@pytest.fixture(params=BACKENDS)
+async def feedback_db(request, tmp_path):
+    loop = open_feedback_loop(request, tmp_path)
     # Default embed: every input maps to the same seed unless overridden by
     # a per-test lookup — see _embed_by_key below.
     loop._embed = _embed_default  # type: ignore[method-assign]
@@ -37,7 +45,7 @@ async def _embed_default(text: str) -> np.ndarray:
     return _vec(abs(hash(("default", text))) % 997)
 
 
-def _use_embedding_map(loop: SQLiteFeedbackLoop, mapping: dict[str, int]) -> None:
+def _use_embedding_map(loop: FeedbackLoop, mapping: dict[str, int]) -> None:
     """Route ``loop._embed`` through an explicit text -> seed lookup.
 
     Lets a test pin exact similarity relationships (including ties)
@@ -51,7 +59,7 @@ def _use_embedding_map(loop: SQLiteFeedbackLoop, mapping: dict[str, int]) -> Non
 
 
 async def _store_human(
-    loop: SQLiteFeedbackLoop,
+    loop: FeedbackLoop,
     *,
     output: str,
     task_input: str,
@@ -68,17 +76,9 @@ async def _store_human(
             *(extra_scores or []),
         ])
     else:
-        from jig._sqlite import json_dumps
-
-        db = await loop._get_db()
-        await loop._ensure_scores_metadata_column(db)
-        await db.execute(
-            "INSERT INTO scores (result_id, dimension, value, source, created_at, metadata) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (rid, dimension, value, ScoreSource.HUMAN.value, created_at,
-             json_dumps({"note": note})),
+        await insert_score_row(
+            loop, rid, dimension, value, ScoreSource.HUMAN.value, created_at, {"note": note},
         )
-        await db.commit()
         if extra_scores:
             await loop.score(rid, extra_scores)
     return rid
@@ -278,13 +278,9 @@ class TestGetHumanExamplesRankingAndLimits:
         from datetime import UTC, datetime
 
         rid = str(uuid.uuid4())
-        db = await feedback_db._get_db()
-        await db.execute(
-            "INSERT INTO results (id, content, input, metadata, embedding, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (rid, "out-a", "in-a", "{}", None, datetime.now(UTC).isoformat()),
+        await insert_result_row(
+            feedback_db, rid, "out-a", "in-a", None, datetime.now(UTC).isoformat(),
         )
-        await db.commit()
         await feedback_db.score(rid, [
             Score("plausibility", 0.9, ScoreSource.HUMAN, metadata={"note": "n"}),
         ])
@@ -426,13 +422,8 @@ class TestGetHumanExamplesEmbeddingDimensionMismatch:
         ])
         # Overwrite the stored embedding with a shorter vector than the
         # 128-dim query embedding _vec produces.
-        db = await feedback_db._get_db()
         short_emb = _vec(1)[:16]
-        await db.execute(
-            "UPDATE results SET embedding = ? WHERE id = ?",
-            (short_emb.tobytes(), rid),
-        )
-        await db.commit()
+        await set_embedding(feedback_db, rid, short_emb.tobytes())
 
         out = await feedback_db.get_human_examples("task", CFG)
         assert out == HumanExampleSet(positive=[], negative=[])

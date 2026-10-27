@@ -7,6 +7,22 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: jig
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      JIG_TEST_POSTGRES_URL: postgresql://postgres:jig@localhost:5432/postgres
+      # A missing server fails the run instead of skipping the PostgreSQL cases.
+      JIG_REQUIRE_POSTGRES_TESTS: "1"
     steps:
       - uses: actions/checkout@v4
 
