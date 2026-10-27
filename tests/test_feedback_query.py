@@ -9,7 +9,9 @@ import numpy as np
 import pytest
 
 from jig import EffectiveScoreFilter, FeedbackQuery, PastResults, Score, ScoreSource
-from jig.feedback.loop import SQLiteFeedbackLoop
+from jig.core.types import FeedbackLoop
+
+from feedback_backends import BACKENDS, insert_score_row, open_feedback_loop
 
 
 async def _fake_embed(text: str) -> np.ndarray:
@@ -26,9 +28,9 @@ async def _fake_embed(text: str) -> np.ndarray:
     return rng.random(128, dtype=np.float32)
 
 
-@pytest.fixture
-async def feedback_db(tmp_path):
-    loop = SQLiteFeedbackLoop(db_path=str(tmp_path / "test.db"))
+@pytest.fixture(params=BACKENDS)
+async def feedback_db(request, tmp_path):
+    loop = open_feedback_loop(request, tmp_path)
     loop._embed = _fake_embed  # type: ignore[method-assign]
     try:
         yield loop
@@ -36,7 +38,7 @@ async def feedback_db(tmp_path):
         await loop.close()
 
 
-async def _seed(loop: SQLiteFeedbackLoop, entries: list[dict]) -> list[str]:
+async def _seed(loop: FeedbackLoop, entries: list[dict]) -> list[str]:
     """Seed the loop with {content, input, metadata, scores} entries."""
     ids = []
     for e in entries:
@@ -403,7 +405,7 @@ class TestFeedbackQueryValidation:
 
 
 async def _insert_score_row(
-    loop: SQLiteFeedbackLoop,
+    loop: FeedbackLoop,
     result_id: str,
     dimension: str,
     value: float,
@@ -413,19 +415,9 @@ async def _insert_score_row(
 ) -> None:
     """Insert a scores row with an explicit created_at, bypassing score()'s
     now()-stamping so tests can control ordering/ties deterministically.
-    Insertion order still drives rowid, the documented tie-breaker.
+    Insertion order still drives the tie-breaker (rowid / identity).
     """
-    from jig._sqlite import json_dumps
-
-    db = await loop._get_db()
-    await loop._ensure_scores_metadata_column(db)
-    await db.execute(
-        "INSERT INTO scores (result_id, dimension, value, source, created_at, metadata) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (result_id, dimension, value, source.value, created_at,
-         json_dumps(metadata) if metadata is not None else None),
-    )
-    await db.commit()
+    await insert_score_row(loop, result_id, dimension, value, source.value, created_at, metadata)
 
 
 @pytest.mark.asyncio

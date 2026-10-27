@@ -10,6 +10,7 @@ A jig holds the pieces while you work on them. It doesn't have opinions about yo
 uv add 'jig @ git+https://github.com/rankonelabs/jig.git'                          # core only
 uv add 'jig[anthropic] @ git+https://github.com/rankonelabs/jig.git'               # + Anthropic adapter
 uv add 'jig[ollama] @ git+https://github.com/rankonelabs/jig.git'                  # + Ollama adapter
+uv add 'jig[postgres] @ git+https://github.com/rankonelabs/jig.git'                # + PostgreSQL tracer / feedback loop
 uv add 'jig[all] @ git+https://github.com/rankonelabs/jig.git'                     # everything
 ```
 
@@ -77,15 +78,24 @@ print(result.output)
 | `LLMClient` | LLM completions | Anthropic, OpenAI, OpenRouter, Gemini, Ollama, Dispatch (optional Smithers backend) |
 | `MemoryStore` | Persistence + session history | Local (SQLite + embeddings), Honcho\*, Zep\* |
 | `Retriever` | Prompt-context strategy | DenseRetriever (embeddings), HonchoMemory\*, ZepMemory\* |
-| `FeedbackLoop` | Score tracking + eval export | SQLite (integration-tested end-to-end) |
+| `FeedbackLoop` | Score tracking + eval export | SQLite (integration-tested end-to-end), PostgreSQL |
 | `Grader` | Auto-score outputs | LLM Judge, Heuristic, Ground Truth, Composite |
-| `TracingLogger` | Structured spans | SQLite, Stdout |
+| `TracingLogger` | Structured spans | SQLite, PostgreSQL, Stdout |
 
 Plus `ToolRegistry` (concrete) and `Tool` (abstract) for tool use.
 
 \* Honcho and Zep adapters exist but are not covered by integration tests in this repo.
 The SQLite path (`LocalMemory`, `SQLiteFeedbackLoop`) is the verified baseline.
 For older feedback databases, see [SQLite feedback maintenance](docs/sqlite-feedback-maintenance.md).
+
+The PostgreSQL backends (`jig[postgres]`) — `jig.tracing.postgres.PostgresTracer` and
+`jig.feedback.postgres.PostgresFeedbackLoop` — run the same contract test suites as their
+SQLite counterparts. Both take a `schema` and a `namespace` (one namespace per trial
+replaces one database file per trial). By default they create their tables on first use;
+a consumer with its own versioned migrator applies `tracer_schema_sql(schema)` /
+`feedback_schema_sql(schema)` there and passes `create_schema=False`. The tracer never
+fails a run on a database error: failed flushes are logged and retried, and its buffer is
+bounded (`max_buffered_spans`), with every eviction counted and logged by trace id.
 
 ## Two execution models
 
@@ -257,6 +267,16 @@ src/jig/
 
 ```bash
 uv run --extra dev --extra callback pytest
+```
+
+The PostgreSQL cases of the backend contract tests need a server; they skip without one.
+Point `JIG_TEST_POSTGRES_URL` at a scratch database (each test makes and drops its own
+schema), and set `JIG_REQUIRE_POSTGRES_TESTS=1` to turn a missing server into a failure:
+
+```bash
+docker run -d --rm --name jig-pg -e POSTGRES_PASSWORD=jig -p 127.0.0.1:55432:5432 postgres:16-alpine
+JIG_TEST_POSTGRES_URL=postgresql://postgres:jig@127.0.0.1:55432/postgres \
+  JIG_REQUIRE_POSTGRES_TESTS=1 uv run --extra dev --extra callback pytest
 ```
 
 ## Jev evaluations
